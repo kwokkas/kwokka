@@ -1,0 +1,36 @@
+# Rust / Cargo
+**/target
+**/*.orig
+
+# Coverage / profiling
+*.profraw
+*.profdata
+/coverage
+perf.data*
+
+# Python
+*.pyc
+__pycache__/
+
+# Env / secrets
+.env
+.env.*
+!.env.example
+
+# Editor / IDE
+.idea/
+.vscode/
+.zed/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Trash-*
+.nfs*
+.directory
