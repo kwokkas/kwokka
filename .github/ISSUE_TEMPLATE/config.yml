@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation
+    url: https://docs.kwokka.dev
+    about: Guides and API reference. Read before opening an issue.
+  - name: Security report
+    url: https://github.com/kwokkas/kwokka/security/advisories/new
+    about: Report vulnerabilities privately via GitHub Security Advisories.
