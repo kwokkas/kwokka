@@ -1,0 +1,24 @@
+# typos guards source and docs against misspellings.
+
+[default]
+# One spelling standard so docs/comments do not drift.
+locale = "en-us"
+# A misspelled module/file name is a real defect under kwokka naming
+# discipline -- check names, not only contents.
+check-filename = true
+# A domain term is allow-listed only once typos actually flags it, so
+# the list never leads real findings.
+
+[default.extend-words]
+# "kwokka" is the project name, a deliberate respelling of "quokka";
+# typos would otherwise flag every occurrence in code and filenames.
+kwokka = "kwokka"
+
+[files]
+# typos skips hidden paths by default -- that would exclude the very
+# infra kwokka hand-writes (.github/, .config/). Scan them. Build
+# output and gitignored tooling dirs stay excluded (ignore-vcs on).
+ignore-hidden = false
+# Cargo.lock is generated; dependency names are not ours to correct.
+# It is committed, so .gitignore does not already cover it.
+extend-exclude = ["*.lock", ".git/"]

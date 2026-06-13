@@ -1,0 +1,21 @@
+# rustfmt is the one formatting contract for every .rs file in the
+# workspace. `cargo fmtck` enforces it on the pinned stable toolchain,
+# so every option here is one a stable rustfmt honors today.
+
+edition = "2024"
+style_edition = "2024"
+
+# 100 columns matches taplo's TOML width, so a file does not reflow
+# when it changes kind.
+max_width = 100
+tab_spaces = 4
+newline_style = "Unix"
+
+use_field_init_shorthand = true
+use_try_shorthand = true
+
+# Import grouping (imports_granularity, group_imports) and doc-comment
+# formatting (wrap_comments, comment_width, format_code_in_doc_comments)
+# are unstable rustfmt options a stable toolchain silently ignores. They
+# return with a nightly fmt job in the CI workflow unit, rather than sit
+# here doing nothing.

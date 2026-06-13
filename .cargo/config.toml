@@ -1,0 +1,22 @@
+# Command vocabulary for the workspace. Each alias is the canonical way
+# to run a check, so CI and local hands invoke the exact same thing
+# (`cargo lint`, `cargo nt`, `cargo audit`) instead of drifting flags.
+
+[alias]
+nt      = "nextest run --workspace --all-features"
+nt-ci   = "nextest run --profile ci --workspace --all-features"
+dt      = "test --doc --workspace --all-features"
+lint    = "clippy --workspace --all-targets --all-features -- -D warnings"
+fmtck   = "fmt --all --check"
+docs    = "doc --workspace --all-features --no-deps"
+msrv    = "check --workspace --all-features"
+hack    = "hack check --each-feature --no-dev-deps --workspace"
+mt      = "miri test --workspace"
+audit   = "deny check"
+unused  = "machete"
+semver  = "semver-checks check-release --workspace --baseline-rev origin/main"
+
+[cargo-new]
+# The workspace is already git-tracked; a new in-tree crate must not
+# initialize a nested repository.
+vcs = "none"
