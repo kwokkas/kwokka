@@ -30,4 +30,6 @@ Parent: <!-- the Epic this is a sub-issue of, if any. Attach it via the Epic's S
 
 <!-- How it lands, and anything non-obvious: a design choice or a tradeoff. The one place long content goes. Delete if the work is mechanical. -->
 
+Decision: *the design choice, and the tradeoff it accepts*
+
 </details>

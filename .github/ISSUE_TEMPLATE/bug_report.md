@@ -19,6 +19,18 @@ type: Bug
 
 <details><summary>Environment and output</summary>
 
-<!-- Crate and version. OS / kernel (for io_uring), rustc version, enabled features. Paste any error, panic, or backtrace. -->
+<!-- Crate version, OS / kernel (for io_uring), and enabled features. -->
+
+`rustc --version --verbose`:
+
+```
+<version>
+```
+
+Error, panic, or backtrace (`RUST_BACKTRACE=1`):
+
+```
+<backtrace>
+```
 
 </details>

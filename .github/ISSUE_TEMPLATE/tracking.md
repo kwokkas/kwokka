@@ -1,7 +1,7 @@
 ---
 name: Tracking issue
 about: A multi-PR series tracked to a milestone (Epic).
-title: "Tracking "
+title: "Tracking for "
 labels: kwokka
 type: Epic
 ---
@@ -28,5 +28,7 @@ issue per question and link it back here.
 <details><summary>History</summary>
 
 <!-- PRs landed so far, newest last. The one place long content goes. -->
+
+- #<pr> *summary*
 
 </details>

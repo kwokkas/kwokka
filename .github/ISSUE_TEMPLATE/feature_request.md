@@ -19,4 +19,6 @@ type: Feature
 
 <!-- Other approaches considered, and any additional context. -->
 
+Alternatives: *the approaches considered, and why this one*
+
 </details>
