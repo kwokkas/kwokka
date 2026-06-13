@@ -1,0 +1,52 @@
+# clippy is the machine half of the workspace lint policy. The
+# disallowed-* lists below mirror the banned ownership, dispatch, and
+# stdio patterns and reject them at compile time. Carve-outs
+# (kwokka-compat, kwokka-macros, tests) are taken per-site via #[allow]
+# / #[expect], named in each reason string.
+
+msrv = "1.85"
+
+# Past these limits a body is a smell, not an error: it surfaces in
+# review rather than blocking the build.
+cognitive-complexity-threshold = 30
+too-many-lines-threshold = 100
+type-complexity-threshold = 350
+
+disallowed-types = [
+  { path = "std::sync::Arc", reason = "atomic refcount; slab + index handle. carve-out: kwokka-compat/kwokka-macros via #[allow]" },
+  { path = "std::sync::Mutex", reason = "lock-free or async sync instead" },
+  { path = "std::sync::RwLock", reason = "lock-free or async sync instead" },
+  { path = "std::sync::Condvar", reason = "sync wait; use async notification" },
+  { path = "std::rc::Rc", reason = "not Send; breaks work-stealing" },
+  { path = "std::boxed::Box", reason = "heap alloc; arena/slab. carve-out: dyn/kwokka-compat/kwokka-macros via #[allow]" },
+  { path = "std::cell::RefCell", reason = "runtime borrow check; rethink ownership" },
+  { path = "std::cell::Cell", reason = "hidden interior mutation" },
+  { path = "std::cell::OnceCell", reason = "use OnceLock or static" },
+  { path = "std::any::Any", reason = "type erasure; Arena + TypeId offset" },
+  { path = "std::collections::LinkedList", reason = "cache-hostile; Vec/VecDeque/arena" },
+]
+
+disallowed-methods = [
+  { path = "std::thread::spawn", reason = "runtime owns thread creation" },
+  { path = "std::thread::sleep", reason = "use async timer primitives" },
+  { path = "std::thread::park", reason = "use async wait primitives" },
+  { path = "std::mem::forget", reason = "memory leak; drop properly" },
+  { path = "std::mem::transmute", reason = "no size check; ptr::cast plus assert" },
+  { path = "std::process::exit", reason = "bypasses graceful shutdown; return Err" },
+  { path = "std::boxed::Box::leak", reason = "intentional leak; OnceLock or static" },
+  { path = "std::boxed::Box::into_raw", reason = "raw heap ptr; FFI only" },
+  { path = "std::boxed::Box::from_raw", reason = "raw heap ptr; FFI only" },
+  { path = "std::boxed::Box::pin", reason = "heap pin; slab-pinned future" },
+  { path = "std::vec::Vec::leak", reason = "intentional leak" },
+  { path = "std::string::String::leak", reason = "intentional leak" },
+]
+
+disallowed-macros = [
+  { path = "std::println", reason = "stdio; emit via kwokka-lens" },
+  { path = "std::print", reason = "stdio; emit via kwokka-lens" },
+  { path = "std::eprintln", reason = "stdio; emit via kwokka-lens" },
+  { path = "std::eprint", reason = "stdio; emit via kwokka-lens" },
+  { path = "std::dbg", reason = "debug stdio; emit via kwokka-lens" },
+  { path = "std::vec", reason = "heap alloc; arena slice. carve-out: kwokka-compat/tests via #[allow]" },
+  { path = "std::thread_local", reason = "TLS unsound across .await under work-stealing; sole permitted site worker/current.rs, exempt via #[expect]" },
+]

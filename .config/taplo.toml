@@ -1,0 +1,28 @@
+# taplo enforces consistent TOML formatting across the workspace --
+# Cargo.toml manifests, tool configs (.config/*.toml), and CI files.
+# `taplo check` runs in CI (hygiene.yml); `taplo fmt` applies locally.
+
+[formatting]
+# Cargo.toml sections are dense enough that aligning = signs hurts
+# readability more than it helps.
+align_entries = false
+# Short arrays stay on one line; long arrays expand automatically.
+array_auto_collapse = true
+array_auto_expand = true
+# Trailing comma in multiline arrays prevents noisy diffs when a new
+# entry is appended.
+array_trailing_comma = true
+# Match the 100-column convention used by rustfmt comment_width.
+column_width = 100
+# 4-space indent, same as rustfmt.
+indent_string = "    "
+# Alphabetical key order makes dependency sections scannable and
+# eliminates merge conflicts from unrelated additions.
+reorder_keys = true
+
+[[rule]]
+include = ["**/Cargo.toml"]
+keys = ["dependencies", "dev-dependencies", "build-dependencies"]
+[rule.formatting]
+# Dependencies sorted alphabetically within each section.
+reorder_keys = true
