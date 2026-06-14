@@ -28,4 +28,4 @@ kwokka-fs = { workspace = true, optional = true }
 workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["kwokka-core"]
+ignored = ["kwokka-core", "kwokka-macros", "kwokka-runtime", "kwokka-net", "kwokka-fs"]
