@@ -1,0 +1,23 @@
+[package]
+name = "kwokka-io"
+version = "0.0.1"
+description = "completion-based I/O driver, buffer pool, and operation types"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["async", "io-uring", "epoll", "kqueue", "kwokka"]
+categories = ["asynchronous", "os"]
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring.workspace = true
+
+[lints]
+workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["libc", "io-uring"]
