@@ -23,3 +23,6 @@ loom.workspace = true
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["crossbeam-deque", "kwokka-core", "kwokka-io"]

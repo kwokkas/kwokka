@@ -26,3 +26,6 @@ kwokka-fs = { workspace = true, optional = true }
 
 [lints]
 workspace = true
+
+[package.metadata.cargo-machete]
+ignored = ["kwokka-core"]
