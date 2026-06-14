@@ -1,0 +1,99 @@
+name: Soundness
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  changes:
+    runs-on: kwokka-runner
+    outputs:
+      miri: ${{ steps.gate.outputs.miri }}
+      loom: ${{ steps.gate.outputs.loom }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v4
+        id: f
+        with:
+          filters: |
+            miri:
+              - 'crates/kwokka-core/**'
+            loom:
+              - 'crates/kwokka-runtime/src/sync/**'
+              - 'crates/kwokka-runtime/src/worker/registry.rs'
+              - 'crates/kwokka-runtime/src/worker/frame.rs'
+              - 'crates/kwokka-runtime/src/worker/wake.rs'
+              - 'crates/kwokka-runtime/src/task/state.rs'
+              - 'crates/kwokka-runtime/src/scheduler/stealing/**'
+              - 'crates/kwokka-runtime/src/runtime/stealing.rs'
+      - id: gate
+        shell: bash
+        env:
+          UNSAFE_LABEL: ${{ contains(github.event.pull_request.labels.*.name, 'unsafe') }}
+          MIRI_PATHS: ${{ steps.f.outputs.miri }}
+          LOOM_PATHS: ${{ steps.f.outputs.loom }}
+        run: |
+          if { [ "$MIRI_PATHS" = "true" ] || [ "$UNSAFE_LABEL" = "true" ]; } && ls crates/*/Cargo.toml >/dev/null 2>&1; then
+            echo "miri=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "miri=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "$LOOM_PATHS" = "true" ] || [ "$UNSAFE_LABEL" = "true" ]; then
+            echo "loom=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "loom=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  miri:
+    needs: changes
+    if: needs.changes.outputs.miri == 'true'
+    runs-on: kwokka-runner
+    env:
+      MIRIFLAGS: -Zmiri-strict-provenance
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      # Per-job sysroot and target dir to avoid a shared-sysroot race and
+      # stale-target reuse on the self-hosted runner. --lib keeps the run on
+      # unit tests; kwokka-core has no integration tests that need a real OS.
+      - run: |
+          export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/miri-target"
+          cargo +nightly miri setup
+          cargo +nightly miri test --lib -p kwokka-core
+
+  loom:
+    needs: changes
+    if: needs.changes.outputs.loom == 'true'
+    runs-on: kwokka-runner
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-env
+      # loom model-checks the lock-free primitives under simulated thread
+      # interleavings. Its targets (sync, stealing, worker wake) arrive with
+      # the runtime stage, so this job stays gate-skipped until they land.
+      - run: cargo test --release -p kwokka-runtime --lib
+      - run: cargo test --release -p kwokka-runtime --lib --features steal
