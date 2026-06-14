@@ -20,4 +20,4 @@ io-uring.workspace = true
 workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["libc", "io-uring"]
+ignored = ["io-uring"]
