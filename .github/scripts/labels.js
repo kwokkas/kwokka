@@ -3,8 +3,9 @@
 // replacing the declarative labeler.yml plus the actions/labeler step.
 //
 //   1. Area `A-*` labels from changed paths (crate, ci, build, docs).
-//   2. `unsafe` when the PR adds an `unsafe` keyword line, or touches
-//      kwokka-runtime / kwokka-core (soundness-bearing crates).
+//   2. `unsafe` when a .rs diff adds a real unsafe construct (unsafe
+//      fn/impl/trait/extern, or an unsafe block). Comment and string
+//      mentions of the word do not count.
 //   3. `kwokka` (a maintainer work unit) when the author is OWNER or MEMBER.
 //   4. Require at least one `A-*` area label, failing the PR otherwise.
 
@@ -45,15 +46,23 @@ module.exports = async ({ github, context, core }) => {
     if (area) labels.add(area);
   }
 
-  const soundnessPath = /^crates\/kwokka-(runtime|core)\//;
+  // Only an added line of real Rust code (not a comment) that uses an
+  // unsafe construct counts. This keeps the label tied to actual unsafe,
+  // not to a crate path or a prose mention of the word.
   const addsUnsafe = (f) =>
     f.filename.endsWith(".rs") &&
-    (f.patch || "")
-      .split("\n")
-      .some(
-        (l) => l.startsWith("+") && !l.startsWith("+++") && /\bunsafe\b/.test(l),
+    (f.patch || "").split("\n").some((l) => {
+      if (!l.startsWith("+") || l.startsWith("+++")) return false;
+      const code = l.slice(1).trimStart();
+      if (code.startsWith("//") || code.startsWith("*") || code.startsWith("/*")) {
+        return false;
+      }
+      return (
+        /\bunsafe\s+(?:fn|impl|trait|extern)\b/.test(code) ||
+        /\bunsafe\s*\{/.test(code)
       );
-  if (files.some((f) => soundnessPath.test(f.filename) || addsUnsafe(f))) {
+    });
+  if (files.some(addsUnsafe)) {
     labels.add("unsafe");
   }
 
