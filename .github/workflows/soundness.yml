@@ -33,6 +33,7 @@ jobs:
           filters: |
             miri:
               - 'crates/kwokka-core/**'
+              - 'crates/kwokka-io/**'
             loom:
               - 'crates/kwokka-runtime/src/sync/**'
               - 'crates/kwokka-runtime/src/worker/registry.rs'
@@ -74,12 +75,13 @@ jobs:
           components: miri
       # Per-job sysroot and target dir to avoid a shared-sysroot race and
       # stale-target reuse on the self-hosted runner. --lib keeps the run on
-      # unit tests; kwokka-core has no integration tests that need a real OS.
+      # unit tests. io_uring syscall tests cannot run under miri; they are
+      # excluded with --skip as they arrive (uring stage).
       - run: |
           export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/miri-target"
           cargo +nightly miri setup
-          cargo +nightly miri test --lib -p kwokka-core
+          cargo +nightly miri test --lib -p kwokka-core -p kwokka-io
 
   loom:
     needs: changes
