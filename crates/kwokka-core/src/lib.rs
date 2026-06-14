@@ -1,5 +1,9 @@
 //! Foundational types shared across the kwokka workspace.
 
+pub mod cancellation;
 pub mod id;
 
+pub use cancellation::{
+    AlreadyCancelledBehavior, CancellationContext, CancellationKind, CancellationPolicy,
+};
 pub use id::{Pip, PipError};
