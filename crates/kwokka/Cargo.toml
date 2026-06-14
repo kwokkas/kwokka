@@ -1,0 +1,28 @@
+[package]
+name = "kwokka"
+version = "0.1.0"
+description = "completion-based async runtime with integrated orchestration"
+readme = "../../README.md"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["async", "runtime", "io-uring", "completion", "kwokka"]
+categories = ["asynchronous", "concurrency"]
+
+[features]
+net = ["dep:kwokka-net"]
+fs = ["dep:kwokka-fs"]
+steal = ["kwokka-runtime/steal"]
+full = ["net", "fs", "steal"]
+
+[dependencies]
+kwokka-core.workspace = true
+kwokka-macros.workspace = true
+kwokka-runtime.workspace = true
+kwokka-net = { workspace = true, optional = true }
+kwokka-fs = { workspace = true, optional = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,20 @@
+[package]
+name = "kwokka-fs"
+version = "0.0.1"
+description = "files, directories, paths, and pipes for the kwokka runtime"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["async", "file", "fs", "io-uring", "kwokka"]
+categories = ["asynchronous", "filesystem"]
+
+[dependencies]
+kwokka-io.workspace = true
+
+[dev-dependencies]
+kwokka-runtime.workspace = true
+
+[lints]
+workspace = true

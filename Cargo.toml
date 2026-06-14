@@ -1,0 +1,95 @@
+# kwokka workspace root. The facade crate `kwokka` is the only stable,
+# user-facing surface; every other crate is an implementation detail
+# reached through it.
+[workspace]
+resolver = "3"
+members = [
+    "crates/kwokka",
+    "crates/kwokka-core",
+    "crates/kwokka-fs",
+    "crates/kwokka-io",
+    "crates/kwokka-macros",
+    "crates/kwokka-net",
+    "crates/kwokka-runtime",
+]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/kwokkas/kwokka"
+homepage = "https://kwokka.dev"
+documentation = "https://docs.kwokka.dev"
+
+# Version policy: the facade ships at 0.1.0 (a stable public surface);
+# the internal crates ship at 0.0.x so semver-checks treats every change
+# as breaking, leaving the implementation free to evolve behind the
+# facade. Do not raise an internal crate to 0.1.x without promoting it to
+# a supported surface.
+[workspace.dependencies]
+kwokka = { path = "crates/kwokka", version = "0.1.0" }
+kwokka-core = { path = "crates/kwokka-core", version = "0.0.1" }
+kwokka-fs = { path = "crates/kwokka-fs", version = "0.0.1" }
+kwokka-io = { path = "crates/kwokka-io", version = "0.0.1" }
+kwokka-macros = { path = "crates/kwokka-macros", version = "0.0.1" }
+kwokka-net = { path = "crates/kwokka-net", version = "0.0.1" }
+kwokka-runtime = { path = "crates/kwokka-runtime", version = "0.0.1" }
+# External dependencies. Each is pulled by a single concern so the
+# dependency surface stays auditable.
+crossbeam-deque = "0.8.6"
+io-uring = "0.7.4"
+libc = "0.2"
+loom = "0.7"
+proc-macro2 = "1"
+quote = "1"
+# syn parses whole items (ItemFn) at macro expansion, hence the full feature.
+syn = { version = "2", features = ["full"] }
+trybuild = "1"
+
+# Workspace-wide lint policy, enforced through clippy's config surface.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_docs = "warn"
+unreachable_pub = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)'] }
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+# Internal crates surface through the facade and carry no per-crate README;
+# the facade README is the project entry point.
+cargo_common_metadata = "allow"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+multiple_crate_versions = "allow"
+dbg_macro = "deny"
+print_stdout = "deny"
+exit = "deny"
+self_named_module_files = "deny"
+allow_attributes_without_reason = "deny"
+todo = "warn"
+unimplemented = "warn"
+clone_on_ref_ptr = "warn"
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.dev.package."*"]
+opt-level = 3
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = "line-tables-only"
+strip = "debuginfo"
+incremental = false
+
+[profile.bench]
+inherits = "release"
+debug = "full"
+strip = "none"
