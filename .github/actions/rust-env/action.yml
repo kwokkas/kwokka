@@ -1,0 +1,21 @@
+name: rust-env
+description: Rust toolchain and dependency cache.
+inputs:
+  toolchain:
+    description: Rust toolchain channel or version.
+    default: "1.95"
+  components:
+    description: Comma-separated rustup components.
+    default: ""
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ inputs.toolchain }}
+        components: ${{ inputs.components }}
+    - uses: Swatinem/rust-cache@v2
+      with:
+        cache-targets: false
+    - shell: bash
+      run: command -v sccache >/dev/null 2>&1 && sccache --version || echo "sccache not present on this runner; skipping"
