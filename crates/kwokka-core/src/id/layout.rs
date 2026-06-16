@@ -3,7 +3,7 @@
 //! ```text
 //! [127..80] seq      - 48 bits, monotonic sequence number
 //! [ 79..64] depth    - 16 bits, parent-child nesting depth
-//! [ 63..48] kind     - 16 bits, reserved for future use (task/conductor/stage tag)
+//! [ 63..48] kind     - 16 bits, reserved for future use (entity-kind tag)
 //! [ 47..40] version  -  8 bits, layout version
 //! [ 39.. 2] worker   - 38 bits, originating worker / routing hint
 //! [  1.. 0] flags    -  2 bits, reserved for future use

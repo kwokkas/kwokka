@@ -82,7 +82,7 @@ impl Pip {
     /// Create a detached `Pip` with no parent relationship.
     ///
     /// Equivalent in effect to [`Self::root`]; the distinct name documents
-    /// intent at the call site (e.g., a task spawned outside any conductor).
+    /// intent at the call site (e.g., a task with no parent relationship).
     #[inline]
     pub fn detached() -> Self {
         Self::root()
