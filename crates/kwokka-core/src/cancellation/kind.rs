@@ -4,13 +4,12 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum CancellationKind {
-    /// Direct cancel - explicit user or system request via
-    /// `conductor.cancel(pip, ...)`.
+    /// Direct, explicit cancellation requested by the task's owner.
     Hard,
-    /// Deadline expired - originated from `Advisor::guard().timeout(dur)`
-    /// and auto-propagated to the inner task.
+    /// A deadline expired. Mechanism-free: the kind records that a timeout
+    /// fired, not which timer or layer fired it.
     Timeout,
-    /// Propagated from a sibling or dependency failure in a Conductor DAG.
+    /// An upstream parent or dependency failed and propagated the cancel.
     Failed,
 }
 

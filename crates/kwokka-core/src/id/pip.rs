@@ -4,9 +4,8 @@ use crate::id::layout::{DEPTH_MASK, DEPTH_SHIFT, SEQ_MASK, SEQ_SHIFT, WORKER_MAS
 
 /// A generational, bit-packed 128-bit task identifier.
 ///
-/// `Pip` is the observability primitive for tasks, conductor stages, chain
-/// steps, and other first-class entities. It is `Copy`, zero-allocation, and
-/// carries no heap state.
+/// `Pip` is the identity primitive for tasks and other first-class runtime
+/// entities. It is `Copy`, zero-allocation, and carries no heap state.
 ///
 /// Distinct from `TaskRef`, which is a separate 64-bit slab handle for
 /// runtime task lookup (defined in `kwokka-runtime`).
