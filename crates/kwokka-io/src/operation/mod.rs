@@ -2,6 +2,7 @@
 
 pub(crate) mod completion;
 pub(crate) mod core;
+pub(crate) mod future;
 pub(crate) mod request;
 
 pub use completion::{Completion, CqeFlags};
