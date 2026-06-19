@@ -12,7 +12,10 @@
 //! - [`Namespace`] - logical task scope
 //! - [`Slab`], [`SlabKey`], [`SlabError`] - generational slab allocator
 //! - [`Generation`] - wrapping generation counter shared by slab and arena
+//! - [`BumpAllocator`], [`BumpAllocatorBuilder`], [`ArenaError`], [`ArenaPhase`] - fixed-capacity
+//!   bump allocator
 
+pub mod arena;
 pub mod cancellation;
 pub mod flat;
 pub mod generation;
@@ -21,6 +24,9 @@ pub mod id;
 pub mod namespace;
 pub mod slab;
 
+pub use arena::{
+    ArenaError, ArenaPhase, BumpAllocator, BumpAllocatorBuilder, DEFAULT_BYTES, DEFAULT_DROP_SLOTS,
+};
 pub use cancellation::{
     AlreadyCancelledBehavior, CancellationContext, CancellationKind, CancellationPolicy,
 };
