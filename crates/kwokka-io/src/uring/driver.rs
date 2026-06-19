@@ -62,7 +62,7 @@ const REGISTER_CHUNK: usize = 256;
 ///
 /// Created via [`UringDriver::new`] which probes the kernel for the best
 /// available setup tier. Implements [`IoDriver`] for integration with the
-/// `DriverType` enum dispatch.
+/// [`DriverType`](crate::DriverType) enum dispatch.
 pub struct UringDriver {
     ring: UnsafeCell<IoUring>,
     capabilities: CapabilityMatrix,

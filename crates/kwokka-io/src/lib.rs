@@ -9,13 +9,17 @@
 //! [`SubmitToken`]: operation::SubmitToken
 
 pub mod addr;
+pub mod boundary;
 pub mod buffer;
 pub mod capability;
+mod dispatch;
 mod driver;
 pub mod operation;
 #[cfg(target_os = "linux")]
 pub mod uring;
+pub mod wake;
 
 pub use addr::{AddrError, AddressFamily, SockAddr, UnixAddr};
 pub use capability::{CapabilityMatrix, KernelVersion};
+pub use dispatch::DriverType;
 pub use driver::{CancelError, IoDriver, RegisterError};

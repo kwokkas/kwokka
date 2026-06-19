@@ -7,11 +7,6 @@
 //! completion therefore cannot lose a wake -- at worst, back-to-back
 //! signals coalesce into one CQE, and the woken worker drains its whole
 //! inbox regardless.
-#![allow(
-    dead_code,
-    unreachable_pub,
-    reason = "consumed by the top-level wake re-export landing with the dispatch seam"
-)]
 
 use std::io;
 
