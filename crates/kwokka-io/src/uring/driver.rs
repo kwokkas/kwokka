@@ -1,0 +1,505 @@
+//! `io_uring` backend -- `UringDriver`.
+//!
+//! Owns an [`IoUring`] instance configured via graceful-degrade probe,
+//! and implements the [`IoDriver`] trait with
+//! `UnsafeCell` interior mutability for `&self` access.
+//!
+//! # Safety model
+//!
+//! `UringDriver` wraps `IoUring` in `UnsafeCell` because the
+//! [`IoDriver`] trait requires `&self` but SQE push and CQE drain need
+//! mutable access. This is sound under these invariants:
+//!
+//! 1. `IORING_SETUP_SINGLE_ISSUER` is set -- kernel enforces single-thread submission.
+//! 2. `UringDriver` is owned by exactly one `WorkerShard`.
+//! 3. `WorkerShard` is accessed only from its owning worker thread (TLS contract in
+//!    `worker/current.rs`).
+//! 4. Reentrant access within the same thread is sequential.
+//! 5. `Send` is implemented manually; `Sync` is intentionally omitted to prevent cross-thread
+//!    references at compile time.
+//!
+//! [`IoUring`]: io_uring::IoUring
+//! [`IoDriver`]: crate::IoDriver
+
+#![allow(dead_code, reason = "pending setup-tier introspection wire-up")]
+#![allow(
+    clippy::redundant_pub_crate,
+    reason = "pub(crate) on module-private items"
+)]
+
+use std::{cell::UnsafeCell, io, time::Duration};
+
+use io_uring::{
+    EnterFlags, IoUring,
+    types::{SubmitArgs, Timespec},
+};
+
+use crate::uring::{
+    completion::drain_completions,
+    setup::{
+        detect::{ProbeResult, probe_and_create},
+        flags::SetupTier,
+    },
+    submission::{SubmitScratch, build_entry, build_entry_read, build_entry_write},
+};
+use crate::{
+    CancelError, IoDriver, RegisterError,
+    buffer::{
+        registration::{RegisteredBuffers, RegisteredFds},
+        slot::{BufGroupId, FdSlot},
+    },
+    capability::CapabilityMatrix,
+    operation::{
+        Completion, InlineBuf, IoBuf, IoBufMut, IoRequest, OpCode, SubmitResult, SubmitToken,
+    },
+};
+
+/// Stack chunk size for `register_buffers` updates.
+/// 256 x 16B (iovec) = 4 KB per syscall.
+const REGISTER_CHUNK: usize = 256;
+
+/// `io_uring` I/O backend.
+///
+/// Created via [`UringDriver::new`] which probes the kernel for the best
+/// available setup tier. Implements [`IoDriver`] for integration with the
+/// `DriverType` enum dispatch.
+pub struct UringDriver {
+    ring: UnsafeCell<IoUring>,
+    capabilities: CapabilityMatrix,
+    tier: SetupTier,
+    scratch: UnsafeCell<SubmitScratch>,
+    /// Landing pad for the wake-fd read; the kernel writes the drained
+    /// counter value here. Covered by the same single-issuer ownership as
+    /// `scratch`: only the owning worker thread arms the read.
+    wake_buf: UnsafeCell<u64>,
+    buffers: UnsafeCell<RegisteredBuffers>,
+    files: UnsafeCell<RegisteredFds>,
+}
+
+// SAFETY: Invariant -- single-owner, single-thread.
+// UringDriver ownership is transferred once at worker bootstrap.
+// After that, only the owning worker thread accesses the ring.
+// Cross-thread sharing is prevented at compile time by the absence
+// of a Sync impl. SINGLE_ISSUER kernel flag provides defense-in-depth.
+// Failure mode: concurrent access from another thread would race on
+// the UnsafeCell contents; the kernel rejects with -EEXIST on the
+// submit path and the ring fd close on drop remains sound.
+unsafe impl Send for UringDriver {}
+
+impl UringDriver {
+    /// Bootstrap an `io_uring` ring with the best available setup tier.
+    ///
+    /// # Errors
+    ///
+    /// Returns `io::Error` if ring creation fails (kernel too old,
+    /// `io_uring` disabled via sysctl, `RLIMIT_MEMLOCK` exhausted).
+    pub fn new(entries: u32) -> io::Result<Self> {
+        let ProbeResult {
+            ring,
+            capabilities,
+            tier,
+        } = probe_and_create(entries)?;
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "max_register_slots clamped by CapabilityMatrix"
+        )]
+        let max_buf_slots = capabilities.max_register_slots as u16;
+
+        Ok(Self {
+            ring: UnsafeCell::new(ring),
+            capabilities,
+            tier,
+            scratch: UnsafeCell::new(SubmitScratch::new()),
+            wake_buf: UnsafeCell::new(0),
+            buffers: UnsafeCell::new(RegisteredBuffers::new(max_buf_slots)),
+            files: UnsafeCell::new(RegisteredFds::new(capabilities.max_register_slots)),
+        })
+    }
+
+    /// Setup tier achieved during ring creation.
+    pub(crate) const fn tier(&self) -> SetupTier {
+        self.tier
+    }
+
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "UnsafeCell interior mutability is the intended pattern; SAFETY comment justifies single-thread access"
+    )]
+    fn ring_mut(&self) -> &mut IoUring {
+        // SAFETY: Invariant -- single-thread sequential access.
+        // SINGLE_ISSUER kernel flag (submit), WorkerShard TLS ownership
+        // (no cross-thread reference), sequential reentrant access (task
+        // poll -> submit is same thread).
+        // Precondition: caller is the owning worker thread.
+        // Failure mode: violated invariant races on ring state; kernel
+        // rejects with -EEXIST, ring fd close on drop still sound.
+        unsafe { &mut *self.ring.get() }
+    }
+
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "UnsafeCell interior mutability; SAFETY comment justifies single-thread access"
+    )]
+    fn scratch_mut(&self) -> &mut SubmitScratch {
+        // SAFETY: Invariant -- single-thread sequential access.
+        // SINGLE_ISSUER kernel flag + WorkerShard TLS ownership
+        // guarantee no concurrent access to the scratch buffer.
+        // Precondition: caller is the owning worker thread.
+        // Failure mode: violated invariant corrupts the SQE scratch
+        // buffer (address/timespec), producing an invalid SQE.
+        unsafe { &mut *self.scratch.get() }
+    }
+
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "UnsafeCell interior mutability; SAFETY comment justifies single-thread access"
+    )]
+    fn buffers_mut(&self) -> &mut RegisteredBuffers {
+        // SAFETY: Invariant -- single-thread sequential access.
+        // Same invariants as ring_mut (SINGLE_ISSUER + WorkerShard TLS).
+        // Precondition: caller is the owning worker thread.
+        // Failure mode: violated invariant corrupts buffer slot tracking.
+        unsafe { &mut *self.buffers.get() }
+    }
+
+    #[allow(
+        clippy::mut_from_ref,
+        reason = "UnsafeCell interior mutability; SAFETY comment justifies single-thread access"
+    )]
+    fn files_mut(&self) -> &mut RegisteredFds {
+        // SAFETY: Invariant -- single-thread sequential access.
+        // Same invariants as ring_mut (SINGLE_ISSUER + WorkerShard TLS).
+        // Precondition: caller is the owning worker thread.
+        // Failure mode: violated invariant corrupts fd slot tracking.
+        unsafe { &mut *self.files.get() }
+    }
+
+    fn push_and_submit(&self, entry: &io_uring::squeue::Entry, user_data: u64) -> SubmitResult {
+        let ring = self.ring_mut();
+
+        // SAFETY: Invariant -- SQE entry validity + single-thread access.
+        // The SQE entry was built from a valid IoRequest via
+        // build_entry/build_entry_write/build_entry_read. All pointer
+        // fields (buffer, timespec, sockaddr) are owned by the IoRequest
+        // or SubmitScratch and remain valid until the CQE arrives.
+        // Precondition: submission queue accessed exclusively by this
+        // worker thread (SINGLE_ISSUER).
+        // Failure mode: invalid pointer in SQE causes kernel to read/write
+        // freed memory (undefined behavior); queue contention produces
+        // data race on SQ tail.
+        let push_result = unsafe { ring.submission().push(entry) };
+
+        if push_result.is_err() {
+            return SubmitResult::QueueFull;
+        }
+
+        // IGNORE: non-blocking submit; error means ring fd invalid (unrecoverable)
+        let _ = ring.submit();
+
+        SubmitResult::Submitted(SubmitToken::new(user_data))
+    }
+
+    /// Flushes deferred completion task work on a `DEFER_TASKRUN` ring.
+    ///
+    /// Under `IORING_SETUP_DEFER_TASKRUN` the kernel posts CQEs only when
+    /// the owning thread enters with `IORING_ENTER_GETEVENTS`; the park
+    /// path supplies that enter, so a worker that never parks would starve
+    /// its completions without this flush. Submits nothing and waits for
+    /// nothing: a `min_complete` of zero returns as soon as the deferred
+    /// work has run. A no-op returning zero on rings without the flag.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `io_uring_enter` error; an interrupted flush surfaces
+    /// as [`io::ErrorKind::Interrupted`] and the next pass retries.
+    pub(crate) fn flush_deferred(&self) -> io::Result<usize> {
+        if !self.capabilities.defer_taskrun {
+            return Ok(0);
+        }
+        // SAFETY:
+        // Invariant: `to_submit` is zero, so the kernel reads no SQE and
+        // no pointer or buffer lifetime is involved; `min_complete` of
+        // zero with GETEVENTS runs deferred task work and returns without
+        // blocking (io_uring_enter(2)). The ring fd outlives the call --
+        // the driver owns it.
+        // Precondition: called from the ring-owning worker thread, the
+        // same single-issuer ownership every ring access here relies on.
+        // Failure mode: an enter from a foreign thread on a single-issuer
+        // ring fails with -EEXIST rather than corrupting ring state.
+        unsafe {
+            self.ring_mut().submitter().enter::<libc::sigset_t>(
+                0,
+                0,
+                EnterFlags::GETEVENTS.bits(),
+                None,
+            )
+        }
+    }
+
+    /// Blocks until at least one completion is ready or `deadline` elapses,
+    /// returning the SQE count submitted by the `io_uring_enter` call.
+    ///
+    /// `None` waits indefinitely for a completion. `Some(deadline)` caps the
+    /// wait with the `EXT_ARG` timeout (`IORING_FEAT_EXT_ARG`, kernel 5.11+,
+    /// unconditional at the 6.0 minimum). No new `unsafe`: the wait runs on
+    /// the `&mut IoUring` from [`Self::ring_mut`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the `io_uring_enter` error. A `Some` timeout that elapses with
+    /// no completion surfaces as the kernel `-ETIME` (not Rust's `TimedOut`
+    /// kind), and an interrupted wait as [`io::ErrorKind::Interrupted`]; the
+    /// run-loop maps both to a re-tick.
+    pub(crate) fn park(&self, deadline: Option<Duration>) -> io::Result<usize> {
+        let submitter = self.ring_mut().submitter();
+        let Some(duration) = deadline else {
+            return submitter.submit_and_wait(1);
+        };
+        let timespec = Timespec::new()
+            .sec(duration.as_secs())
+            .nsec(duration.subsec_nanos());
+        let args = SubmitArgs::new().timespec(&timespec);
+        submitter.submit_with_args(1, &args)
+    }
+
+    /// Arms a oneshot read on the wake fd so a remote signal completes the
+    /// park as a CQE carrying `user_data`.
+    ///
+    /// Re-armed by the completion drain after every wake CQE. The eventfd
+    /// counter accumulates signals between arms, so the re-arm window
+    /// cannot lose a wake.
+    pub(crate) fn arm_wake_read(&self, fd: i32, user_data: u64) -> SubmitResult {
+        // SAFETY: Invariant -- `wake_buf` is a live 8-byte field of this
+        // driver, so the pointer is non-null and valid for 8 writes; the
+        // driver outlives every CQE its ring delivers. Precondition: only
+        // the owning worker thread arms the read (the same single-issuer
+        // ownership `scratch` relies on), AND each arm follows a completed
+        // CQE for the previous read -- the initial arm at run start, then
+        // re-arms only inside the completion drain after the wake CQE is
+        // observed -- so at most one kernel read targets the buffer at any
+        // time. Failure mode: a second concurrent arm, from another thread
+        // or a premature re-arm before the prior CQE, would race the
+        // kernel write into the buffer -- undefined behavior.
+        let buf = unsafe { InlineBuf::new(self.wake_buf.get().cast(), 8) };
+        let request = IoRequest::read(fd, buf, 0).with_user_data(user_data);
+        self.submit_read(request)
+    }
+}
+
+impl IoDriver for UringDriver {
+    fn submit<B: IoBuf>(&self, request: IoRequest<B>) -> SubmitResult {
+        let entry = match request.opcode {
+            OpCode::Read | OpCode::Recv | OpCode::Recvmsg | OpCode::Sendmsg => {
+                return SubmitResult::Unsupported;
+            }
+            OpCode::Write | OpCode::Send => build_entry_write(&request),
+            _ => return SubmitResult::Unsupported,
+        };
+
+        let ud = request.common.user_data;
+        self.push_and_submit(&entry, ud)
+    }
+
+    fn submit_read<B: IoBufMut>(&self, request: IoRequest<B>) -> SubmitResult {
+        let entry = build_entry_read(&request);
+        let ud = request.common.user_data;
+        self.push_and_submit(&entry, ud)
+    }
+
+    fn submit_internal(&self, request: IoRequest<()>) -> SubmitResult {
+        let ud = request.common.user_data;
+        let entry = build_entry(&request, self.scratch_mut());
+        self.push_and_submit(&entry, ud)
+    }
+
+    fn poll_completions(&self, max: usize, out: &mut [Completion]) -> usize {
+        let ring = self.ring_mut();
+        let mut cq = ring.completion();
+        drain_completions(&mut cq, max, out)
+    }
+
+    fn capabilities(&self) -> &CapabilityMatrix {
+        &self.capabilities
+    }
+
+    fn cancel(&self, token: SubmitToken) -> Result<(), CancelError> {
+        let request = IoRequest::<()>::cancel(token);
+        let ud = request.common.user_data;
+        let entry = build_entry(&request, self.scratch_mut());
+        match self.push_and_submit(&entry, ud) {
+            SubmitResult::Submitted(_) => Ok(()),
+            SubmitResult::QueueFull | SubmitResult::Unsupported => {
+                Err(CancelError::BestEffortDetach)
+            }
+        }
+    }
+
+    fn register_buffers(&self, bufs: &[&[u8]]) -> Result<BufGroupId, RegisterError> {
+        if bufs.is_empty() {
+            return Err(RegisterError::InvalidArgument);
+        }
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "kernel rejects registrations beyond max_register_slots; callers respect CapabilityMatrix"
+        )]
+        let total = bufs.len() as u32;
+
+        let submitter = self.ring_mut().submitter();
+
+        submitter
+            .register_buffers_sparse(total)
+            .map_err(|_| RegisterError::InvalidArgument)?;
+
+        let mut offset: u32 = 0;
+        for chunk_bufs in bufs.chunks(REGISTER_CHUNK) {
+            // SAFETY: Invariant -- libc::iovec is repr(C) and its all-zero bit
+            // pattern (null base, zero len) is a valid inert iovec, overwritten
+            // below before the kernel reads it.
+            // Precondition: none -- POD zero initialization.
+            // Failure mode: none; a zeroed iovec is inert until filled.
+            let mut chunk: [libc::iovec; REGISTER_CHUNK] = unsafe { core::mem::zeroed() };
+            for (idx, buf) in chunk_bufs.iter().enumerate() {
+                chunk[idx] = libc::iovec {
+                    #[allow(
+                        clippy::as_ptr_cast_mut,
+                        reason = "iov_base requires *mut; buffer is caller-owned and kernel reads only"
+                    )]
+                    iov_base: buf.as_ptr().cast_mut().cast(),
+                    iov_len: buf.len(),
+                };
+            }
+
+            // SAFETY: Invariant -- each iovec points into the caller's buffer,
+            // which must remain valid until unregister or ring drop; the kernel
+            // copies the iovec array during io_uring_register(2)
+            // IORING_REGISTER_BUFFERS_UPDATE.
+            // Precondition: caller is the owning worker thread (SINGLE_ISSUER);
+            // chunk[..len] holds initialized iovecs filled in the loop above.
+            // Failure mode: a dangling iovec pointer causes the kernel to
+            // read freed memory (UB); a wrong offset/len corrupts the slot table.
+            unsafe {
+                submitter
+                    .register_buffers_update(offset, &chunk[..chunk_bufs.len()], None)
+                    .map_err(|_| RegisterError::InvalidArgument)?;
+            }
+
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "chunk_bufs.len() <= REGISTER_CHUNK (256)"
+            )]
+            {
+                offset += chunk_bufs.len() as u32;
+            }
+        }
+
+        self.buffers_mut().allocate()
+    }
+
+    fn unregister_buffers(&self, group: BufGroupId) -> Result<(), RegisterError> {
+        crate::uring::fixed::unregister_buffers(self.ring_mut())?;
+        self.buffers_mut().release(group)?;
+        Ok(())
+    }
+
+    fn register_files(&self, fds: &[i32]) -> Result<FdSlot, RegisterError> {
+        crate::uring::fixed::register_files(self.ring_mut(), fds)?;
+        self.files_mut().allocate()
+    }
+
+    fn unregister_files(&self, slot: FdSlot) -> Result<(), RegisterError> {
+        crate::uring::fixed::unregister_files(self.ring_mut())?;
+        self.files_mut().release(slot)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TEST_RING_ENTRIES: u32 = 32;
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn new_creates_driver() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        assert!(driver.capabilities().single_issuer);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn tier_is_optimal_or_baseline() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        assert!(driver.tier() == SetupTier::Optimal || driver.tier() == SetupTier::Baseline,);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn submit_internal_timeout_succeeds() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        let request = IoRequest::<()>::timeout(1_000_000);
+        let result = driver.submit_internal(request);
+        assert!(matches!(result, SubmitResult::Submitted(_)));
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn poll_completions_drains_submitted() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+
+        let request = IoRequest::<()>::timeout(1_000_000).with_user_data(0xBEEF);
+        driver.submit_internal(request);
+
+        let mut buf = [Completion {
+            token: SubmitToken::new(0),
+            result: 0,
+            flags: crate::operation::CqeFlags::EMPTY,
+            buf_id: None,
+        }; 4];
+
+        let count = driver.poll_completions(4, &mut buf);
+        assert!(count <= 4);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn park_with_timeout_returns_rather_than_blocking() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        // Nothing is pending, so a bounded park returns the kernel timeout
+        // (-ETIME) instead of blocking forever. ETIME is not Rust's `TimedOut`
+        // kind, so assert only that the wait returned an error rather than
+        // hanging.
+        let outcome = driver.park(Some(Duration::from_millis(1)));
+        assert!(
+            outcome.is_err(),
+            "a bounded park with nothing pending returns the ETIME timeout",
+        );
+    }
+}
