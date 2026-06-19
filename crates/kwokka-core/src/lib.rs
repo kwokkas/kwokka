@@ -10,17 +10,23 @@
 //! - [`Pip`] - 128-bit tree-structured task identifier
 //! - [`PipError`] - errors from [`Pip`] operations
 //! - [`Namespace`] - logical task scope
+//! - [`Slab`], [`SlabKey`], [`SlabError`] - generational slab allocator
+//! - [`Generation`] - wrapping generation counter shared by slab and arena
 
 pub mod cancellation;
 pub mod flat;
+pub mod generation;
 pub mod hint;
 pub mod id;
 pub mod namespace;
+pub mod slab;
 
 pub use cancellation::{
     AlreadyCancelledBehavior, CancellationContext, CancellationKind, CancellationPolicy,
 };
 pub use flat::FlatLayout;
+pub use generation::Generation;
 pub use hint::{AffinityHint, SchedulingHint};
 pub use id::{Pip, PipError};
 pub use namespace::Namespace;
+pub use slab::{Slab, SlabError, SlabKey};
