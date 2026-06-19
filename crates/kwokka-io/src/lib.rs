@@ -13,6 +13,8 @@ pub mod buffer;
 pub mod capability;
 mod driver;
 pub mod operation;
+#[cfg(target_os = "linux")]
+pub mod uring;
 
 pub use addr::{AddrError, AddressFamily, SockAddr, UnixAddr};
 pub use capability::{CapabilityMatrix, KernelVersion};
