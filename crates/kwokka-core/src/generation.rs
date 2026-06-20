@@ -48,6 +48,17 @@ impl Generation {
     pub const fn next(self) -> Self {
         Self(self.0.wrapping_add(1) & Self::MAX)
     }
+
+    /// Reconstructs a generation from a raw value, such as the bits
+    /// unpacked from a packed handle like `TaskRef`.
+    ///
+    /// The caller supplies a value already masked to [`Self::MAX`]; this
+    /// does not re-mask, so [`get`](Self::get) stays the canonical reader.
+    #[inline]
+    #[must_use]
+    pub const fn from_raw(raw: u32) -> Self {
+        Self(raw)
+    }
 }
 
 impl fmt::Debug for Generation {
