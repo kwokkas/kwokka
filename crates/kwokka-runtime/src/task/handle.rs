@@ -1,6 +1,6 @@
 //! Phantom-typed handle to a spawned task.
 //!
-//! This module locks the public type, layout, and trait bounds. `nid` is an
+//! This module locks the public type, layout, and trait bounds. `pip` is an
 //! inline field read, `cancel` routes through the owning worker's poll frame,
 //! and `Future::poll` resolves the join through that frame. The scope spawn
 //! entry links children through the Pip-tree rather than returning handles, so
@@ -42,13 +42,13 @@ use crate::{
 /// unconditionally, which matches the handle's behavior: the handle is
 /// transferable whenever the mode permits, regardless of `T`.
 ///
-/// The [`Pip`] is held inline so `nid()` is a pure field read; storage
+/// The [`Pip`] is held inline so `pip()` is a pure field read; storage
 /// indirection is reserved for `cancel` and `Future::poll`, both of
 /// which the runtime's worker layer wires later.
 #[must_use = "TaskHandle dropped without await detaches the task"]
 pub struct TaskHandle<T, M: Mode> {
     task_ref: TaskRef,
-    nid: Pip,
+    pip: Pip,
     _output: PhantomData<fn() -> T>,
     _mode: PhantomData<M>,
 }
@@ -57,10 +57,10 @@ impl<T, M: Mode> TaskHandle<T, M> {
     /// Constructs a handle over an existing slab/arena entry.
     ///
     /// Crate-internal: only spawn entry points construct handles.
-    pub(crate) const fn new(task_ref: TaskRef, nid: Pip) -> Self {
+    pub(crate) const fn new(task_ref: TaskRef, pip: Pip) -> Self {
         Self {
             task_ref,
-            nid,
+            pip,
             _output: PhantomData,
             _mode: PhantomData,
         }
@@ -69,8 +69,8 @@ impl<T, M: Mode> TaskHandle<T, M> {
     /// Returns the task's [`Pip`] for tracing and observability.
     ///
     /// Pure field read held inline at construction.
-    pub const fn nid(&self) -> Pip {
-        self.nid
+    pub const fn pip(&self) -> Pip {
+        self.pip
     }
 
     /// Cancels the task.
@@ -166,10 +166,10 @@ mod tests {
     }
 
     #[test]
-    fn nid_returns_stored_value() {
-        let nid = Pip::detached();
-        let handle: TaskHandle<u32, Stealing> = TaskHandle::new(task_ref_fixture(), nid);
-        assert_eq!(handle.nid(), nid);
+    fn pip_returns_stored_value() {
+        let pip = Pip::detached();
+        let handle: TaskHandle<u32, Stealing> = TaskHandle::new(task_ref_fixture(), pip);
+        assert_eq!(handle.pip(), pip);
     }
 
     #[test]

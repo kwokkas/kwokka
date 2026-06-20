@@ -75,7 +75,7 @@ impl WakeData {
 /// # Field semantics
 ///
 /// * `state` -- atomic CAS-based lifecycle (see [`AtomicTaskState`]).
-/// * `nid` -- observability identity, propagated to children via `Pip::child`.
+/// * `pip` -- observability identity, propagated to children via `Pip::child`.
 /// * `namespace` -- logical scope; the per-process interning is decided at the call site, not here.
 /// * `first_child` / `next_sibling` -- intrusive children list, manipulated by helpers in the
 ///   `children` module. Both are [`Option<TaskRef>`] so absence is type-level rather than encoded
@@ -88,7 +88,7 @@ impl WakeData {
 #[repr(C)]
 pub(crate) struct TaskHeader {
     pub(crate) state: AtomicTaskState,
-    pub(crate) nid: Pip,
+    pub(crate) pip: Pip,
     pub(crate) namespace: Namespace,
     pub(crate) first_child: Option<TaskRef>,
     pub(crate) next_sibling: Option<TaskRef>,
@@ -128,10 +128,10 @@ impl TaskHeader {
     /// Constructs a new header in `Sleeping` with no children.
     #[cfg(not(loom))]
     #[inline]
-    pub(crate) const fn new(nid: Pip, namespace: Namespace, vtable: &'static TaskVTable) -> Self {
+    pub(crate) const fn new(pip: Pip, namespace: Namespace, vtable: &'static TaskVTable) -> Self {
         Self {
             state: AtomicTaskState::new(),
-            nid,
+            pip,
             namespace,
             first_child: None,
             next_sibling: None,
@@ -149,10 +149,10 @@ impl TaskHeader {
     /// under `--cfg loom`.
     #[cfg(loom)]
     #[inline]
-    pub(crate) fn new(nid: Pip, namespace: Namespace, vtable: &'static TaskVTable) -> Self {
+    pub(crate) fn new(pip: Pip, namespace: Namespace, vtable: &'static TaskVTable) -> Self {
         Self {
             state: AtomicTaskState::new(),
-            nid,
+            pip,
             namespace,
             first_child: None,
             next_sibling: None,
@@ -182,14 +182,14 @@ impl TaskHeader {
         self.in_flight_ops = self.in_flight_ops.saturating_sub(1);
     }
 
-    /// Stamps `nid` into the header.
+    /// Stamps `pip` into the header.
     ///
     /// The worker mints the id at drain time and stamps it here before the
     /// freshly spawned child is linked under its parent. The child cell is
     /// built with a detached id at spawn-request time, when the issuing
     /// worker counter is not in reach.
-    pub(crate) const fn set_nid(&mut self, nid: Pip) {
-        self.nid = nid;
+    pub(crate) const fn set_pip(&mut self, pip: Pip) {
+        self.pip = pip;
     }
 }
 
@@ -299,10 +299,10 @@ impl<F: Future> Slot<F> {
     /// Caller is responsible for placing the resulting value into a
     /// slab or arena slot -- this helper does not allocate.
     #[cfg(not(loom))]
-    pub(crate) const fn new(nid: Pip, namespace: Namespace, future: F) -> Self {
+    pub(crate) const fn new(pip: Pip, namespace: Namespace, future: F) -> Self {
         let () = Self::SIZE_OK;
         Self {
-            header: TaskHeader::new(nid, namespace, &Self::VTABLE),
+            header: TaskHeader::new(pip, namespace, &Self::VTABLE),
             cell: TaskCell {
                 output: MaybeUninit::uninit(),
                 future,
@@ -313,10 +313,10 @@ impl<F: Future> Slot<F> {
 
     /// Loom variant of [`Slot::new`].
     #[cfg(loom)]
-    pub(crate) fn new(nid: Pip, namespace: Namespace, future: F) -> Self {
+    pub(crate) fn new(pip: Pip, namespace: Namespace, future: F) -> Self {
         let () = Self::SIZE_OK;
         Self {
-            header: TaskHeader::new(nid, namespace, &Self::VTABLE),
+            header: TaskHeader::new(pip, namespace, &Self::VTABLE),
             cell: TaskCell {
                 output: MaybeUninit::uninit(),
                 future,
@@ -888,7 +888,7 @@ mod tests {
     fn header_field_order_unchanged() {
         use core::mem::offset_of;
         let state_off = offset_of!(TaskHeader, state);
-        let nid_off = offset_of!(TaskHeader, nid);
+        let pip_off = offset_of!(TaskHeader, pip);
         let namespace_off = offset_of!(TaskHeader, namespace);
         let first_child_off = offset_of!(TaskHeader, first_child);
         let next_sibling_off = offset_of!(TaskHeader, next_sibling);
@@ -896,8 +896,8 @@ mod tests {
         let in_flight_ops_off = offset_of!(TaskHeader, in_flight_ops);
         let next_runnable_off = offset_of!(TaskHeader, next_runnable);
         let vtable_off = offset_of!(TaskHeader, vtable);
-        assert!(state_off < nid_off);
-        assert!(nid_off < namespace_off);
+        assert!(state_off < pip_off);
+        assert!(pip_off < namespace_off);
         assert!(namespace_off < first_child_off);
         assert!(first_child_off < next_sibling_off);
         assert!(next_sibling_off < wake_data_off);

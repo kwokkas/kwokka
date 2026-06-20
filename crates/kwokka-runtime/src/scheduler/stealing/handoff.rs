@@ -273,8 +273,8 @@ mod tests {
         }
     }
 
-    fn seed<F: Future>(slab: &mut Slab<TaskSlot>, nid: Pip, future: F) -> SlabKey {
-        let cell = Slot::new(nid, Namespace::ROOT, future).into_erased();
+    fn seed<F: Future>(slab: &mut Slab<TaskSlot>, pip: Pip, future: F) -> SlabKey {
+        let cell = Slot::new(pip, Namespace::ROOT, future).into_erased();
         let Ok(key) = slab.insert(cell) else {
             panic!("insert into a fresh slab must succeed");
         };
@@ -304,9 +304,9 @@ mod tests {
 
     #[test]
     fn the_first_stealable_resident_ships() {
-        let nid = Pip::issue(3, 7);
+        let pip = Pip::issue(3, 7);
         let mut victim = Slab::<TaskSlot>::new(2);
-        let key = seed(&mut victim, nid, Inert);
+        let key = seed(&mut victim, pip, Inert);
         let mut forward = ForwardTable::new(2);
         let origins = ForwardOrigin::new(2);
         let request = request_for(1);
@@ -320,7 +320,7 @@ mod tests {
         };
         assert_eq!(dest, request.dest);
         assert_eq!(victim_id, 0);
-        assert_eq!(task.nid(), nid);
+        assert_eq!(task.pip(), pip);
         assert_eq!(
             forward.lookup(key),
             Some(request.dest),
@@ -394,10 +394,10 @@ mod tests {
 
     #[test]
     fn a_delivery_installs_and_records_the_origin() {
-        let nid = Pip::issue(2, 5);
+        let pip = Pip::issue(2, 5);
         let mut victim = Slab::<TaskSlot>::new(1);
         let mut thief = Slab::<TaskSlot>::new(1);
-        let victim_key = seed(&mut victim, nid, Inert);
+        let victim_key = seed(&mut victim, pip, Inert);
         let mut forward = ForwardTable::new(1);
         let victim_origins = ForwardOrigin::new(1);
         let mut origins = ForwardOrigin::new(1);
@@ -413,7 +413,7 @@ mod tests {
         let Some(slot) = thief.get(SlabKey::new(task_ref.index(), task_ref.generation())) else {
             panic!("the resident must resolve under the promised key");
         };
-        assert_eq!(slot.header().nid, nid);
+        assert_eq!(slot.header().pip, pip);
         let Some(origin) = origins.take(task_ref.index()) else {
             panic!("the origin must be recorded at install");
         };

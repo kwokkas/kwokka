@@ -39,9 +39,9 @@ pub(crate) struct WorkerShard {
     pub(crate) id: WorkerId,
     /// Next sequence number stamped into an issued `Pip`. Starts at 1 so the
     /// first id is never the reserved `Pip`(0). Single-writer, no atomic.
-    /// Advanced by [`Self::issue_nid`] and by the run-loop spawn drain, which
+    /// Advanced by [`Self::issue_pip`] and by the run-loop spawn drain, which
     /// issues child ids from the same per-worker counter.
-    pub(crate) nid_seq: u64,
+    pub(crate) pip_seq: u64,
     /// I/O backend for SQE submission and CQE polling.
     pub(crate) driver: DriverType,
     /// Per-worker generational slab holding task headers and futures.
@@ -88,7 +88,7 @@ impl WorkerShard {
         let timer = TimerWheel::new(SystemClock::new(), task_capacity);
         Self {
             id,
-            nid_seq: 1,
+            pip_seq: 1,
             driver,
             tasks: Slab::new(task_capacity),
             timer,
@@ -111,9 +111,9 @@ impl WorkerShard {
     /// Stamps the issuing worker id and a per-worker sequence number, then
     /// advances the counter. Single-writer, so no atomic. The id records the
     /// ISSUING worker; a stolen task keeps it after migrating to another.
-    pub(crate) fn issue_nid(&mut self) -> Pip {
-        let seq = self.nid_seq;
-        self.nid_seq += 1;
+    pub(crate) fn issue_pip(&mut self) -> Pip {
+        let seq = self.pip_seq;
+        self.pip_seq += 1;
         Pip::issue(u64::from(self.id.raw()), seq)
     }
 }
