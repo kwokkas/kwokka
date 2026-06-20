@@ -652,7 +652,7 @@ mod tests {
         };
         assert_eq!(replied, dest);
         assert_eq!(victim_id, 16);
-        assert_eq!(task.nid(), Pip::issue(16, 1));
+        assert_eq!(task.pip(), Pip::issue(16, 1));
         assert_eq!(task.victim_key().index(), key.index());
         assert!(pop_handoff(worker(17)).is_none());
 

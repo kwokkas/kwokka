@@ -37,7 +37,7 @@ pub(crate) enum PollOutcome {
 
 /// Builds a task for `future` and inserts it into the per-worker slab.
 ///
-/// The `nid` is supplied by the caller; minting it (the worker counter and
+/// The `pip` is supplied by the caller; minting it (the worker counter and
 /// issuing policy) is wired separately. The returned [`TaskRef`] is a
 /// slab-path handle routed to `worker_id`. The freshly inserted task is
 /// `Sleeping` and is not enqueued -- initial schedulability is the caller's
@@ -50,14 +50,14 @@ pub(crate) enum PollOutcome {
 pub(crate) fn spawn_insert<F>(
     tasks: &mut Slab<TaskSlot>,
     worker_id: u8,
-    nid: Pip,
+    pip: Pip,
     namespace: Namespace,
     future: F,
 ) -> Result<TaskRef, SlabError>
 where
     F: Future,
 {
-    let cell = Slot::new(nid, namespace, future).into_erased();
+    let cell = Slot::new(pip, namespace, future).into_erased();
     let key = tasks.insert(cell)?;
     Ok(TaskRef::from_slab(worker_id, key))
 }

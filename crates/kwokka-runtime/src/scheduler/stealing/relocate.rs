@@ -45,7 +45,7 @@ pub(crate) struct StolenTask {
     /// Steal-stable identity, read from the relocated header. Identity
     /// never changes across a move; the location route is keyed by
     /// [`StolenTask::victim_key`], not by id.
-    nid: Pip,
+    pip: Pip,
     /// Source slot key, for the victim-side release.
     victim_key: SlabKey,
     /// Suppresses the erased cell's accidental auto-`Send` so the explicit
@@ -56,8 +56,8 @@ pub(crate) struct StolenTask {
 
 impl StolenTask {
     /// Steal-stable identity of the relocated task.
-    pub(crate) const fn nid(&self) -> Pip {
-        self.nid
+    pub(crate) const fn pip(&self) -> Pip {
+        self.pip
     }
 
     /// Source slot awaiting the victim-side
@@ -174,10 +174,10 @@ pub(crate) fn move_out(slot: &TaskSlot, key: SlabKey) -> Option<StolenTask> {
     }
     let mut cell = copy_cell(slot);
     cell.header_mut().state = AtomicTaskState::new();
-    let nid = cell.header().nid;
+    let pip = cell.header().pip;
     Some(StolenTask {
         cell,
-        nid,
+        pip,
         victim_key: key,
         send_guard: PhantomData,
     })
@@ -229,7 +229,7 @@ pub(crate) fn move_in(
 ) -> Option<StolenTask> {
     let StolenTask {
         cell,
-        nid,
+        pip,
         victim_key,
         send_guard,
     } = stolen;
@@ -238,7 +238,7 @@ pub(crate) fn move_in(
     };
     Some(StolenTask {
         cell,
-        nid,
+        pip,
         victim_key,
         send_guard,
     })
@@ -352,8 +352,8 @@ mod tests {
         }
     }
 
-    fn seed<F: Future>(slab: &mut Slab<TaskSlot>, nid: Pip, future: F) -> SlabKey {
-        let cell = Slot::new(nid, Namespace::ROOT, future).into_erased();
+    fn seed<F: Future>(slab: &mut Slab<TaskSlot>, pip: Pip, future: F) -> SlabKey {
+        let cell = Slot::new(pip, Namespace::ROOT, future).into_erased();
         let Ok(key) = slab.insert(cell) else {
             panic!("insert into a fresh slab must succeed");
         };
@@ -430,14 +430,14 @@ mod tests {
 
     #[test]
     fn identity_survives_the_move() {
-        let nid = Pip::issue(3, 7);
+        let pip = Pip::issue(3, 7);
         let mut victim = Slab::<TaskSlot>::new(1);
         let mut thief = Slab::<TaskSlot>::new(1);
-        let key = seed(&mut victim, nid, Inert);
+        let key = seed(&mut victim, pip, Inert);
         let Some(stolen) = steal(&victim, key) else {
             panic!("a sleeping task must relocate");
         };
-        assert_eq!(stolen.nid(), nid);
+        assert_eq!(stolen.pip(), pip);
         let Ok(dest) = thief.reserve() else {
             panic!("reserve on a fresh slab must succeed");
         };
@@ -448,7 +448,7 @@ mod tests {
         let Some(slot) = thief.get(dest) else {
             panic!("the relocated task must resolve");
         };
-        assert_eq!(slot.header().nid, nid);
+        assert_eq!(slot.header().pip, pip);
     }
 
     #[test]

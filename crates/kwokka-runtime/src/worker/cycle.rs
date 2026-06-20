@@ -132,19 +132,19 @@ pub(crate) fn tick<C: Clock>(
 /// Driver-free, like [`tick`]: the blocking run-loop composes it around the
 /// tick, after the poll borrow on the inbox has ended. The child cell was built
 /// with a detached id at spawn-request time; the issuing worker stamps the real
-/// id here from `nid_seq`, the same per-worker counter `WorkerShard::issue_nid`
+/// id here from `pip_seq`, the same per-worker counter `WorkerShard::issue_pip`
 /// advances, so the issuing worker id stays embedded across a later steal.
 pub(crate) fn drain_spawns(
     tasks: &mut Slab<TaskSlot>,
     run_queue: &mut LocalRunQueue,
     spawn_inbox: &mut SpawnInbox<SPAWN_INBOX_CAPACITY>,
     worker_id: WorkerId,
-    nid_seq: &mut u64,
+    pip_seq: &mut u64,
 ) {
     while let Some(mut pending) = spawn_inbox.pop() {
-        let nid = Pip::issue(u64::from(worker_id.raw()), *nid_seq);
-        *nid_seq += 1;
-        pending.cell.header_mut().set_nid(nid);
+        let pip = Pip::issue(u64::from(worker_id.raw()), *pip_seq);
+        *pip_seq += 1;
+        pending.cell.header_mut().set_pip(pip);
         let Ok(key) = tasks.insert(pending.cell) else {
             // TODO(pablo): 0.1.0 treats a full worker task slab as a
             // configuration error and aborts rather than silently dropping the
@@ -336,7 +336,7 @@ mod tests {
         let mut tasks = Slab::<TaskSlot>::new(4);
         let mut run_queue = LocalRunQueue::new();
         let mut spawn_inbox = SpawnInbox::<SPAWN_INBOX_CAPACITY>::new();
-        let mut nid_seq = 1_u64;
+        let mut pip_seq = 1_u64;
 
         // A parent task plus a pending child spawn that names it as parent.
         let Ok(parent) = spawn_insert(&mut tasks, 0, Pip::detached(), Namespace::ROOT, Ready)
@@ -354,13 +354,13 @@ mod tests {
             &mut run_queue,
             &mut spawn_inbox,
             worker(0),
-            &mut nid_seq,
+            &mut pip_seq,
         );
 
         assert!(spawn_inbox.is_empty(), "the drain consumes the inbox");
         assert_eq!(run_queue.len(), 1, "the child is woken onto the run queue");
         assert_eq!(
-            nid_seq, 2,
+            pip_seq, 2,
             "issuing the child advanced the per-worker counter"
         );
 
@@ -377,7 +377,7 @@ mod tests {
             panic!("the child must resolve");
         };
         assert_eq!(
-            child_slot.header().nid,
+            child_slot.header().pip,
             Pip::issue(0, 1),
             "the child is stamped with the issued id, not the detached placeholder",
         );
