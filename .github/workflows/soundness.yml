@@ -35,6 +35,12 @@ jobs:
               - 'crates/kwokka-core/**'
               - 'crates/kwokka-io/**'
               - 'crates/kwokka-runtime/src/sync/**'
+              - 'crates/kwokka-runtime/src/task/header.rs'
+              - 'crates/kwokka-runtime/src/task/waker.rs'
+              - 'crates/kwokka-runtime/src/task/io.rs'
+              - 'crates/kwokka-runtime/src/worker/frame.rs'
+              - 'crates/kwokka-runtime/src/worker/registry.rs'
+              - 'crates/kwokka-runtime/src/scheduler/stealing/**'
             loom:
               - 'crates/kwokka-runtime/src/sync/**'
               - 'crates/kwokka-runtime/src/worker/registry.rs'
@@ -79,12 +85,16 @@ jobs:
       # unit tests. io_uring syscall tests cannot run under miri; they are
       # excluded with --skip as they arrive (uring stage). The mpsc
       # concurrent_producers test spawns OS threads over a 15k-iteration body,
-      # too slow for miri; loom model-checks those interleavings instead.
+      # too slow for miri; loom model-checks those interleavings instead. The
+      # steal-feature pass names the relocate/handoff/registry suites explicitly:
+      # crossbeam-epoch behind the deque/injector/steal modules is not Stacked
+      # Borrows clean, so the filter must not widen to scheduler::stealing.
       - run: |
           export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/miri-target"
           cargo +nightly miri setup
           cargo +nightly miri test --lib -p kwokka-core -p kwokka-io -p kwokka-runtime -- --skip concurrent_producers
+          cargo +nightly miri test --lib -p kwokka-runtime --features steal -- relocate handoff registry
 
   loom:
     needs: changes
