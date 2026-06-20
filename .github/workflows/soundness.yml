@@ -34,6 +34,7 @@ jobs:
             miri:
               - 'crates/kwokka-core/**'
               - 'crates/kwokka-io/**'
+              - 'crates/kwokka-runtime/src/sync/**'
             loom:
               - 'crates/kwokka-runtime/src/sync/**'
               - 'crates/kwokka-runtime/src/worker/registry.rs'
@@ -76,12 +77,14 @@ jobs:
       # Per-job sysroot and target dir to avoid a shared-sysroot race and
       # stale-target reuse on the self-hosted runner. --lib keeps the run on
       # unit tests. io_uring syscall tests cannot run under miri; they are
-      # excluded with --skip as they arrive (uring stage).
+      # excluded with --skip as they arrive (uring stage). The mpsc
+      # concurrent_producers test spawns OS threads over a 15k-iteration body,
+      # too slow for miri; loom model-checks those interleavings instead.
       - run: |
           export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/miri-target"
           cargo +nightly miri setup
-          cargo +nightly miri test --lib -p kwokka-core -p kwokka-io
+          cargo +nightly miri test --lib -p kwokka-core -p kwokka-io -p kwokka-runtime -- --skip concurrent_producers
 
   loom:
     needs: changes
