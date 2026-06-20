@@ -99,8 +99,7 @@ impl Future for TimerFuture {
 // The e2e test needs a real io_uring ring: Miri cannot run the syscalls, and the
 // loom build drives loom atomics outside a model. The submit_internal unsafe
 // deref is covered by the static SAFETY argument instead.
-// TODO(pablo): re-enable with the runtime bootstrap (#71 follow-up); these tests drive a real Runtime.
-#[cfg(any())]
+#[cfg(not(any(miri, loom)))]
 mod tests {
     use super::*;
     use crate::runtime::Runtime;
