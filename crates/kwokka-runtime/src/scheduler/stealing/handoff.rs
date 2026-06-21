@@ -164,24 +164,37 @@ pub(crate) fn serve_steal(
     HandoffMsg::Declined { dest: request.dest }
 }
 
-/// Cheap pre-filter ahead of the `move_out` interlock: sleeping, not
-/// pinned, no linked children, no in-flight I/O, and not itself a
-/// relocated resident.
+/// Cheap pre-filter ahead of the `move_out` interlock: sleeping and polled
+/// at least once, not pinned, no linked children, no in-flight I/O, and not
+/// itself a relocated resident.
+///
+/// The `has_polled` gate matches `is_woken_candidate`: a task is never stolen
+/// before its first poll, so its first poll always runs on the worker that
+/// spawned it. This keeps an in-flight op submitted on its issuing worker.
 fn is_sleeping_candidate(slot: &TaskSlot, origins: &ForwardOrigin, key: SlabKey) -> bool {
     let header = slot.header();
     header.state.load() == TaskState::Sleeping
+        && header.has_polled
+        && !header.io_bound
         && !header.is_pinned
         && header.first_child.is_none()
         && header.in_flight_ops == 0
         && !origins.is_relocated(key.index())
 }
 
-/// Cheap pre-filter ahead of the `move_out_woken` interlock: woken, not
-/// pinned, no linked children, no in-flight I/O, and not itself a
-/// relocated resident.
+/// Cheap pre-filter ahead of the `move_out_woken` interlock: woken and
+/// polled at least once, not pinned, no linked children, no in-flight I/O,
+/// and not itself a relocated resident.
+///
+/// The `has_polled` gate leaves a freshly woken task that has never run for
+/// its owning worker: relocating it before its first poll would move that
+/// first poll to the thief, which a future relying on a steal-driven second
+/// poll cannot survive.
 fn is_woken_candidate(slot: &TaskSlot, origins: &ForwardOrigin, key: SlabKey) -> bool {
     let header = slot.header();
     header.state.load() == TaskState::Woken
+        && header.has_polled
+        && !header.io_bound
         && !header.is_pinned
         && header.first_child.is_none()
         && header.in_flight_ops == 0
@@ -331,6 +344,12 @@ mod tests {
         let Ok(key) = slab.insert(cell) else {
             panic!("insert into a fresh slab must succeed");
         };
+        // The steal predicates offer only polled tasks; mark the seeded task
+        // polled so candidate tests exercise the steal path, not the
+        // fresh-task guard.
+        if let Some(slot) = slab.get_mut(key) {
+            slot.header_mut().has_polled = true;
+        }
         key
     }
 
