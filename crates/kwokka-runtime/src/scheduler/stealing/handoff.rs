@@ -8,8 +8,9 @@
 //! every step testable over plain slabs and keeps this module independent
 //! of the worker registry.
 
+use crate::scheduler::queue::LocalRunQueue;
 use crate::scheduler::stealing::relocate::{
-    ForwardTable, HandoffMsg, StealRequest, move_in, move_out,
+    ForwardTable, HandoffMsg, StealRequest, move_in, move_out, move_out_woken,
 };
 use crate::task::{TaskRef, slot::TaskSlot, state::TaskState};
 use kwokka_core::slab::{Slab, SlabKey};
@@ -63,7 +64,7 @@ impl ForwardOrigin {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the Woken serve path landing in the follow-up PR"
+            reason = "consumed only in test assertions; the settle report path lands in a later PR"
         )
     )]
     pub(crate) fn take(&mut self, index: u32) -> Option<Origin> {
@@ -95,26 +96,35 @@ pub(crate) fn prepare_steal(tasks: &mut Slab<TaskSlot>, thief_id: u8) -> Option<
 }
 
 /// Serves one steal request against the victim's own slab: retires the
-/// first stealable sleeping resident out and records the forwarding
-/// route in the same straight-line step.
+/// first stealable resident out and records the forwarding route in the
+/// same straight-line step.
 ///
 /// Returns the reply for the thief's handoff ring. The husk left behind
 /// stays `Retired` under its live generation -- its release belongs to
 /// the reap path once the settled note lands, never to this step.
 ///
-/// A candidate that loses the `move_out` interlock (a concurrent wake or
-/// cancel) is skipped, not retried; the sweep continues to the next
+/// Pass 1 (Sleeping): sweeps the slab for a sleeping candidate via
+/// [`move_out`]. A candidate that loses the `move_out` interlock (a
+/// concurrent wake or cancel) is skipped; the sweep continues to the next
 /// resident. A resident that already relocated here once is skipped too,
 /// keeping every route single-hop until chained forwarding lands.
+///
+/// Pass 2 (Woken): when pass 1 finds nothing, drains one candidate at a
+/// time from `run_queue` and attempts [`move_out_woken`]. A task that fails
+/// the stealability guards or loses the retire CAS is pushed back to the
+/// run queue so it is not silently dropped; the caller sees a `Declined`
+/// and the victim's queue is restored with at most minor FIFO reordering
+/// (one rotate per failed candidate), which is correctness-harmless.
 pub(crate) fn serve_steal(
-    tasks: &Slab<TaskSlot>,
+    tasks: &mut Slab<TaskSlot>,
     forward: &mut ForwardTable,
     origins: &ForwardOrigin,
+    run_queue: &mut LocalRunQueue,
     victim_id: u8,
     request: StealRequest,
 ) -> HandoffMsg {
     for (key, slot) in tasks.iter() {
-        if !is_candidate(slot, origins, key) {
+        if !is_sleeping_candidate(slot, origins, key) {
             continue;
         }
         let Some(task) = move_out(slot, key) else {
@@ -127,15 +137,51 @@ pub(crate) fn serve_steal(
             task,
         };
     }
+    let len = run_queue.len();
+    for _ in 0..len {
+        let Some(candidate_ref) = run_queue.pop(tasks) else {
+            break;
+        };
+        let key = SlabKey::new(candidate_ref.index(), candidate_ref.generation());
+        let qualifies = tasks
+            .get(key)
+            .is_some_and(|slot| is_woken_candidate(slot, origins, key));
+        if !qualifies {
+            run_queue.push(candidate_ref, tasks);
+            continue;
+        }
+        let outcome = tasks.get(key).and_then(|slot| move_out_woken(slot, key));
+        if let Some(task) = outcome {
+            forward.record(task.victim_key(), request.dest);
+            return HandoffMsg::Delivered {
+                dest: request.dest,
+                victim_id,
+                task,
+            };
+        }
+        run_queue.push(candidate_ref, tasks);
+    }
     HandoffMsg::Declined { dest: request.dest }
 }
 
 /// Cheap pre-filter ahead of the `move_out` interlock: sleeping, not
 /// pinned, no linked children, no in-flight I/O, and not itself a
 /// relocated resident.
-fn is_candidate(slot: &TaskSlot, origins: &ForwardOrigin, key: SlabKey) -> bool {
+fn is_sleeping_candidate(slot: &TaskSlot, origins: &ForwardOrigin, key: SlabKey) -> bool {
     let header = slot.header();
     header.state.load() == TaskState::Sleeping
+        && !header.is_pinned
+        && header.first_child.is_none()
+        && header.in_flight_ops == 0
+        && !origins.is_relocated(key.index())
+}
+
+/// Cheap pre-filter ahead of the `move_out_woken` interlock: woken, not
+/// pinned, no linked children, no in-flight I/O, and not itself a
+/// relocated resident.
+fn is_woken_candidate(slot: &TaskSlot, origins: &ForwardOrigin, key: SlabKey) -> bool {
+    let header = slot.header();
+    header.state.load() == TaskState::Woken
         && !header.is_pinned
         && header.first_child.is_none()
         && header.in_flight_ops == 0
@@ -297,13 +343,19 @@ mod tests {
 
     #[test]
     fn an_empty_slab_declines() {
-        let victim = Slab::<TaskSlot>::new(1);
+        let mut victim = Slab::<TaskSlot>::new(1);
         let mut forward = ForwardTable::new(1);
         let origins = ForwardOrigin::new(1);
+        let mut run_queue = LocalRunQueue::new();
         let request = request_for(1);
-        let HandoffMsg::Declined { dest } =
-            serve_steal(&victim, &mut forward, &origins, 0, request)
-        else {
+        let HandoffMsg::Declined { dest } = serve_steal(
+            &mut victim,
+            &mut forward,
+            &origins,
+            &mut run_queue,
+            0,
+            request,
+        ) else {
             panic!("an empty slab must decline");
         };
         assert_eq!(dest, request.dest);
@@ -316,12 +368,20 @@ mod tests {
         let key = seed(&mut victim, pip, Inert);
         let mut forward = ForwardTable::new(2);
         let origins = ForwardOrigin::new(2);
+        let mut run_queue = LocalRunQueue::new();
         let request = request_for(1);
         let HandoffMsg::Delivered {
             dest,
             victim_id,
             task,
-        } = serve_steal(&victim, &mut forward, &origins, 0, request)
+        } = serve_steal(
+            &mut victim,
+            &mut forward,
+            &origins,
+            &mut run_queue,
+            0,
+            request,
+        )
         else {
             panic!("a sleeping resident must ship");
         };
@@ -366,10 +426,18 @@ mod tests {
 
         let mut forward = ForwardTable::new(3);
         let origins = ForwardOrigin::new(3);
+        let mut run_queue = LocalRunQueue::new();
         let request = request_for(1);
         assert!(
             matches!(
-                serve_steal(&victim, &mut forward, &origins, 0, request),
+                serve_steal(
+                    &mut victim,
+                    &mut forward,
+                    &origins,
+                    &mut run_queue,
+                    0,
+                    request
+                ),
                 HandoffMsg::Declined { .. }
             ),
             "no unstealable resident may ship",
@@ -389,10 +457,18 @@ mod tests {
                 victim_key: SlabKey::new(5, Generation::from_raw(1)),
             },
         );
+        let mut run_queue = LocalRunQueue::new();
         let request = request_for(1);
         assert!(
             matches!(
-                serve_steal(&victim, &mut forward, &origins, 0, request),
+                serve_steal(
+                    &mut victim,
+                    &mut forward,
+                    &origins,
+                    &mut run_queue,
+                    0,
+                    request
+                ),
                 HandoffMsg::Declined { .. }
             ),
             "a resident that already relocated once must not ship again",
@@ -412,7 +488,15 @@ mod tests {
         let Some(request) = prepare_steal(&mut thief, 1) else {
             panic!("a fresh thief slab must promise a slot");
         };
-        let msg = serve_steal(&victim, &mut forward, &victim_origins, 0, request);
+        let mut victim_run_queue = LocalRunQueue::new();
+        let msg = serve_steal(
+            &mut victim,
+            &mut forward,
+            &victim_origins,
+            &mut victim_run_queue,
+            0,
+            request,
+        );
         let Received::Installed(task_ref) = receive_handoff(&mut thief, &mut origins, msg) else {
             panic!("a delivery must install");
         };
@@ -587,6 +671,87 @@ mod tests {
     }
 
     #[test]
+    fn a_woken_resident_in_run_queue_ships_when_no_sleeping_candidate() {
+        let pip = Pip::issue(5, 9);
+        let mut victim = Slab::<TaskSlot>::new(1);
+        let key = seed(&mut victim, pip, Inert);
+        let Some(slot) = victim.get(key) else {
+            panic!("the task must resolve");
+        };
+        let Ok(()) = slot.header().state.wake() else {
+            panic!("Sleeping -> Woken must succeed");
+        };
+        let mut forward = ForwardTable::new(1);
+        let origins = ForwardOrigin::new(1);
+        let mut run_queue = LocalRunQueue::new();
+        run_queue.push(TaskRef::from_slab(0, key), &mut victim);
+
+        let mut thief = Slab::<TaskSlot>::new(1);
+        let Some(request) = prepare_steal(&mut thief, 1) else {
+            panic!("reserve must succeed");
+        };
+        let HandoffMsg::Delivered {
+            dest,
+            victim_id,
+            task,
+        } = serve_steal(
+            &mut victim,
+            &mut forward,
+            &origins,
+            &mut run_queue,
+            0,
+            request,
+        )
+        else {
+            panic!("a woken resident in the run queue must ship");
+        };
+        assert_eq!(victim_id, 0);
+        assert_eq!(task.pip(), pip);
+        assert_eq!(forward.lookup(key), Some(dest));
+    }
+
+    #[test]
+    fn a_woken_but_pinned_resident_declines_and_queue_is_restored() {
+        let mut victim = Slab::<TaskSlot>::new(1);
+        let key = seed(&mut victim, Pip::detached(), Inert);
+        let Some(slot) = victim.get(key) else {
+            panic!("the task must resolve");
+        };
+        let Ok(()) = slot.header().state.wake() else {
+            panic!("Sleeping -> Woken must succeed");
+        };
+        let Some(slot) = victim.get_mut(key) else {
+            panic!("the task must resolve");
+        };
+        slot.header_mut().is_pinned = true;
+        let mut forward = ForwardTable::new(1);
+        let origins = ForwardOrigin::new(1);
+        let mut run_queue = LocalRunQueue::new();
+        run_queue.push(TaskRef::from_slab(0, key), &mut victim);
+
+        let request = request_for(1);
+        assert!(
+            matches!(
+                serve_steal(
+                    &mut victim,
+                    &mut forward,
+                    &origins,
+                    &mut run_queue,
+                    0,
+                    request
+                ),
+                HandoffMsg::Declined { .. }
+            ),
+            "a pinned woken resident must decline",
+        );
+        assert_eq!(
+            run_queue.len(),
+            1,
+            "the queue is restored after a failed woken steal"
+        );
+    }
+
+    #[test]
     fn the_protocol_round_trip_polls_on_the_thief() {
         let polls = AtomicUsize::new(0);
         let drops = AtomicUsize::new(0);
@@ -607,7 +772,15 @@ mod tests {
         let Some(request) = prepare_steal(&mut thief, 1) else {
             panic!("a fresh thief slab must promise a slot");
         };
-        let msg = serve_steal(&victim, &mut forward, &victim_origins, 0, request);
+        let mut victim_run_queue = LocalRunQueue::new();
+        let msg = serve_steal(
+            &mut victim,
+            &mut forward,
+            &victim_origins,
+            &mut victim_run_queue,
+            0,
+            request,
+        );
         let Received::Installed(task_ref) = receive_handoff(&mut thief, &mut origins, msg) else {
             panic!("a delivery must install");
         };
