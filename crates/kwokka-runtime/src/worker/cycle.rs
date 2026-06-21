@@ -17,8 +17,8 @@ use crate::scheduler::stealing::relocate::ForwardTable;
 use crate::worker::wake::wake_or_forward;
 use crate::worker::{
     WorkerId,
-    frame::poll_one,
     inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+    polling::poll_one,
     reap::{REAP_QUEUE_CAPACITY, ReapQueue},
     wake::wake_local,
 };

@@ -28,7 +28,7 @@ use kwokka_core::id::Pip;
 
 use crate::{
     task::{TaskRef, marker::Mode},
-    worker::{WorkerId, frame},
+    worker::{WorkerId, polling},
 };
 
 /// Owning handle to a spawned task.
@@ -85,7 +85,7 @@ impl<T, M: Mode> TaskHandle<T, M> {
         let Ok(worker) = WorkerId::new(self.task_ref.worker_id()) else {
             return;
         };
-        frame::with_current(worker, |frame| frame.cancel_child(self.task_ref));
+        polling::with_current(worker, |frame| frame.cancel_child(self.task_ref));
     }
 
     /// Crate-internal accessor for the underlying slab/arena reference.
@@ -139,7 +139,7 @@ impl<T, M: Mode> Future for TaskHandle<T, M> {
         let Ok(worker) = WorkerId::new(self.task_ref.worker_id()) else {
             return Poll::Pending;
         };
-        frame::with_current(worker, |frame| frame.join_child::<T>(self.task_ref))
+        polling::with_current(worker, |frame| frame.join_child::<T>(self.task_ref))
             .unwrap_or(Poll::Pending)
     }
 }
