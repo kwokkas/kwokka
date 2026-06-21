@@ -115,13 +115,28 @@ pub(crate) struct TaskHeader {
     /// plain bool needs no atomicity. Shares the padding after
     /// `in_flight_ops`, so the header size is unchanged.
     pub(crate) is_remote_settled: bool,
+    /// Whether the task has entered `poll` at least once on its owning worker.
+    ///
+    /// The runnable steal path offers only polled tasks: a freshly woken task
+    /// that has never run is left for its owning worker, since relocating it
+    /// before its first poll would move that first poll to the thief. Written
+    /// by the owning worker on poll entry and read only on that worker, so the
+    /// plain bool needs no atomicity, and it sits with the in-flight and flag
+    /// bytes inside the header budget.
+    pub(crate) has_polled: bool,
+    /// Whether the task has ever submitted an in-flight op.
+    ///
+    /// An io-bound task stays on its issuing worker so its completions are
+    /// harvested on the ring that submitted them; the steal predicates skip
+    /// it. Sits with the other flag bytes inside the header budget.
+    pub(crate) io_bound: bool,
     pub(crate) next_runnable: Option<TaskRef>,
     pub(crate) vtable: &'static TaskVTable,
 }
 
 const _: () = assert!(
-    size_of::<TaskHeader>() <= 112,
-    "TaskHeader exceeds 112-byte budget; review TaskCell<F> capacity",
+    size_of::<TaskHeader>() <= 128,
+    "TaskHeader exceeds 128-byte budget; review TaskCell<F> capacity",
 );
 
 impl TaskHeader {
@@ -139,6 +154,8 @@ impl TaskHeader {
             in_flight_ops: 0,
             is_pinned: false,
             is_remote_settled: false,
+            has_polled: false,
+            io_bound: false,
             next_runnable: None,
             vtable,
         }
@@ -160,6 +177,8 @@ impl TaskHeader {
             in_flight_ops: 0,
             is_pinned: false,
             is_remote_settled: false,
+            has_polled: false,
+            io_bound: false,
             next_runnable: None,
             vtable,
         }
@@ -773,7 +792,7 @@ mod tests {
 
     #[test]
     fn header_size_within_budget() {
-        assert!(size_of::<TaskHeader>() <= 112);
+        assert!(size_of::<TaskHeader>() <= 128);
     }
 
     #[test]

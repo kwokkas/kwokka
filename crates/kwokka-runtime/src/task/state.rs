@@ -195,6 +195,36 @@ impl AtomicTaskState {
         }
     }
 
+    /// Retires a woken source slot via a `Woken -> Retired` CAS.
+    ///
+    /// Reconciles the Woken serve path with concurrent actors: success
+    /// means the move completed cleanly, while failure returns the state
+    /// of whichever actor won the window. A concurrent cancel or a re-wake
+    /// that already transitioned away from `Woken` stays intact and the
+    /// thief aborts, so the displaced state is never overwritten.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err(current)` when the slot is no longer `Woken`.
+    #[cfg_attr(
+        not(any(test, feature = "steal")),
+        expect(
+            dead_code,
+            reason = "the consumer is the Woken serve path, compiled only under the steal feature"
+        )
+    )]
+    pub(crate) fn try_retire_woken(&self) -> Result<(), TaskState> {
+        match self.state.compare_exchange(
+            TaskState::Woken as u8,
+            TaskState::Retired as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => Ok(()),
+            Err(current) => Err(TaskState::from_u8(current)),
+        }
+    }
+
     /// Attempts the transition `expected -> next`. Returns the actually
     /// observed state on failure.
     ///
@@ -569,6 +599,39 @@ mod tests {
         assert!(!state.cancel(), "a retired slot must reject a late cancel");
         assert_eq!(state.load(), TaskState::Retired);
     }
+
+    #[test]
+    fn try_retire_woken_succeeds_only_from_woken() {
+        let state = AtomicTaskState::new();
+        assert_eq!(
+            state.try_retire_woken(),
+            Err(TaskState::Sleeping),
+            "a sleeping slot must not retire via woken path",
+        );
+
+        let woken = AtomicTaskState::new();
+        let Ok(()) = woken.wake() else {
+            panic!("Sleeping -> Woken must succeed");
+        };
+        let Ok(()) = woken.try_retire_woken() else {
+            panic!("a woken slot must retire via the woken path");
+        };
+        assert_eq!(woken.load(), TaskState::Retired);
+    }
+
+    #[test]
+    fn try_retire_woken_leaves_sleeping_intact() {
+        let state = AtomicTaskState::new();
+        let Err(observed) = state.try_retire_woken() else {
+            panic!("a sleeping slot must reject the woken retire");
+        };
+        assert_eq!(observed, TaskState::Sleeping);
+        assert_eq!(
+            state.load(),
+            TaskState::Sleeping,
+            "a failed woken retire leaves the winner intact",
+        );
+    }
 }
 
 #[cfg(all(test, loom))]
@@ -688,6 +751,76 @@ mod loom_tests {
                 panic!("the thief thread must join cleanly");
             };
             assert!(mine != theirs, "exactly one thief claims the slot");
+        });
+    }
+
+    // Woken serve path crux race: a thief claiming and retiring a Woken
+    // slot against a concurrent cancel. Exactly one side owns the task,
+    // matching the Sleeping-path invariant in claim_then_retire_vs_cancel.
+    #[test]
+    fn woken_claim_retire_vs_cancel_exactly_one_wins() {
+        loom::model(|| {
+            let state = Arc::new(AtomicTaskState::new());
+            let Ok(()) = state.wake() else {
+                panic!("Sleeping -> Woken must succeed");
+            };
+            let canceler = Arc::clone(&state);
+            let cancel_thread = thread::spawn(move || canceler.cancel());
+            let relocated = state.try_claim() && state.try_retire_woken().is_ok();
+            let Ok(cancelled) = cancel_thread.join() else {
+                panic!("the cancel thread must join cleanly");
+            };
+            assert!(
+                relocated != cancelled,
+                "exactly one of relocation and cancel owns the Woken task",
+            );
+            let expected = if relocated {
+                TaskState::Retired
+            } else {
+                TaskState::Cancelled
+            };
+            assert_eq!(state.load(), expected);
+        });
+    }
+
+    // A Woken task retired by the steal path cannot be re-enqueued: once
+    // try_retire_woken commits `Woken -> Retired`, the wake() CAS
+    // (`Sleeping -> Woken`) cannot succeed -- it sees either `Woken` (before
+    // retire) or `Retired` (after). Both outcomes are safe: `Err(Woken)`
+    // means "already woken, no spurious enqueue", `Err(Retired)` means
+    // "slot is gone". The test verifies every loom-explored interleaving is
+    // one of these benign outcomes.
+    #[test]
+    fn woken_retire_vs_rewake_no_lost_wake() {
+        loom::model(|| {
+            let state = Arc::new(AtomicTaskState::new());
+            let Ok(()) = state.wake() else {
+                panic!("Sleeping -> Woken must succeed");
+            };
+            let rewaker = Arc::clone(&state);
+            let rewake_thread = thread::spawn(move || rewaker.wake());
+            let retire_result = state.try_retire_woken();
+            let Ok(rewake_result) = rewake_thread.join() else {
+                panic!("rewake thread must join cleanly");
+            };
+            // wake() transitions Sleeping -> Woken; the slot starts at Woken.
+            // Two orderings are possible under loom:
+            // - Retire commits before wake reads: wake sees Retired (terminal)
+            //   and returns Err(Retired). retire_result = Ok(()).
+            // - Wake reads before retire commits: wake sees Woken (!= Sleeping)
+            //   and returns Err(Woken). retire_result = Ok(()) or Err(Woken).
+            // In all cases no pending wake is silently dropped: the task is
+            // either Woken (will be polled on victim) or Retired (stolen, will
+            // be polled on thief after move_in).
+            match (retire_result, rewake_result) {
+                (Ok(()), Err(TaskState::Woken)) | (Ok(()), Err(TaskState::Retired)) => {
+                    assert_eq!(state.load(), TaskState::Retired);
+                }
+                (Err(TaskState::Woken), Err(TaskState::Woken)) => {
+                    assert_eq!(state.load(), TaskState::Woken);
+                }
+                other => panic!("unexpected race outcome: {other:?}"),
+            }
         });
     }
 }

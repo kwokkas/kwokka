@@ -60,7 +60,7 @@ impl StolenTask {
         not(test),
         expect(
             dead_code,
-            reason = "consumed by the Woken serve path landing in the follow-up PR"
+            reason = "consumed only in test assertions; observability consumers land in a later PR"
         )
     )]
     pub(crate) const fn pip(&self) -> Pip {
@@ -190,22 +190,60 @@ pub(crate) fn move_out(slot: &TaskSlot, key: SlabKey) -> Option<StolenTask> {
     })
 }
 
+/// Moves the woken task in `slot` out of the victim slab into transport.
+///
+/// Mirrors [`move_out`] for the `Woken` state: the retire CAS commits
+/// `Woken -> Retired`, after which no poll can enter (`Woken` guard fails)
+/// and no further wake can commit (`Retired` is terminal for the CAS).
+/// The stealability guards mirror those in [`move_out`] -- in-flight I/O,
+/// linked children, and pinned tasks are all rejected before any bytes move.
+///
+/// Returns `None` -- with the slot's bytes untouched -- when another thief
+/// holds the claim, the task is not stealable, or a concurrent cancel wins
+/// the retire window. On success the source slot is a `Retired` husk whose
+/// claim stays held as the move-window marker; the victim worker releases
+/// the slot itself, keyed by [`StolenTask::victim_key`].
+pub(crate) fn move_out_woken(slot: &TaskSlot, key: SlabKey) -> Option<StolenTask> {
+    let header = slot.header();
+    if !header.state.try_claim() {
+        return None;
+    }
+    if header.in_flight_ops != 0 || header.first_child.is_some() || header.is_pinned {
+        header.state.release_claim();
+        return None;
+    }
+    if header.state.try_retire_woken().is_err() {
+        header.state.release_claim();
+        return None;
+    }
+    let mut cell = copy_cell(slot);
+    cell.header_mut().state = AtomicTaskState::new();
+    let pip = cell.header().pip;
+    Some(StolenTask {
+        cell,
+        pip,
+        victim_key: key,
+        send_guard: PhantomData,
+    })
+}
+
 /// Copies the source cell's bytes into an owned transport cell.
 const fn copy_cell(source: &TaskSlot) -> TaskSlot {
     let mut cell = MaybeUninit::<TaskSlot>::uninit();
     // SAFETY:
-    // Invariant: the source state committed `Sleeping -> Retired` before
-    // this call, so no transition out of `Sleeping` can succeed any more:
-    // the task can be neither enqueued (wake fails its compare-exchange)
-    // nor polled (poll entry requires `Woken`), and concurrent wake or
-    // cancel attempts cannot commit a write after `Retired` is committed --
-    // their compare-exchange failures do not constitute conflicting writes
-    // under the Rust/C++ memory model. The copy therefore races no write,
-    // and the non-atomic read of the atomic's bytes is sound on the same
-    // basis. The `UnsafeCell` interior is not frozen by the shared borrow,
-    // so the read through it carries in-bounds shared-read-write
-    // provenance. The destination is a fresh local, so the ranges never
-    // overlap, and every byte pattern is a valid `TaskSlot`.
+    // Invariant: the source state committed `Sleeping or Woken -> Retired`
+    // before this call, so no transition out of the pre-retire state can
+    // succeed any more: the task can be neither enqueued (wake fails its
+    // compare-exchange against `Retired`) nor polled (poll entry requires
+    // `Woken`), and concurrent wake or cancel attempts cannot commit a write
+    // after `Retired` is committed -- their compare-exchange failures do not
+    // constitute conflicting writes under the Rust/C++ memory model. The
+    // copy therefore races no write, and the non-atomic read of the
+    // atomic's bytes is sound on the same basis. The `UnsafeCell` interior
+    // is not frozen by the shared borrow, so the read through it carries
+    // in-bounds shared-read-write provenance. The destination is a fresh
+    // local, so the ranges never overlap, and every byte pattern is a
+    // valid `TaskSlot`.
     // Precondition: the caller performed the retire compare-exchange on
     // this very slot and holds the relocation claim.
     // Failure mode: copying before the retire commits races a concurrent
@@ -558,6 +596,30 @@ mod tests {
         assert!(
             slot.header().state.try_claim(),
             "an aborted move must release its claim",
+        );
+    }
+
+    #[test]
+    fn the_woken_transport_state_resets_to_sleeping_unclaimed() {
+        let mut victim = Slab::<TaskSlot>::new(1);
+        let key = seed(&mut victim, Pip::detached(), Inert);
+        let Some(slot) = victim.get(key) else {
+            panic!("the task must resolve");
+        };
+        let Ok(()) = slot.header().state.wake() else {
+            panic!("Sleeping -> Woken must succeed");
+        };
+        let Some(slot) = victim.get(key) else {
+            panic!("the task must still resolve after wake");
+        };
+        let Some(stolen) = move_out_woken(slot, key) else {
+            panic!("a woken task must relocate via move_out_woken");
+        };
+        let header = stolen.cell.header();
+        assert_eq!(header.state.load(), TaskState::Sleeping);
+        assert!(
+            header.state.try_claim(),
+            "the transport claim must be released by the copy reset",
         );
     }
 

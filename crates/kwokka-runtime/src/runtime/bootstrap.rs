@@ -100,10 +100,11 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
 /// Serves one pending steal request against this worker's own slab.
 ///
 /// Pops at most one request per pass. The handoff core retires the first
-/// stealable sleeping resident out and records the forward route in the
-/// same straight-line step; the reply ships through the thief's handoff
-/// ring with an unpark signal chasing it. Runs ahead of the wake drain
-/// so a stale wake naming the fresh husk already finds its route.
+/// stealable resident out (Sleeping pass first, then Woken pass from the
+/// run queue) and records the forward route in the same straight-line step;
+/// the reply ships through the thief's handoff ring with an unpark signal
+/// chasing it. Runs ahead of the wake drain so a stale wake naming the
+/// fresh husk already finds its route.
 #[cfg(feature = "steal")]
 fn serve_steals(shard: &mut WorkerShard) {
     let Some(request) = registry::pop_steal_request(shard.id) else {
@@ -111,9 +112,10 @@ fn serve_steals(shard: &mut WorkerShard) {
     };
     let thief_id = request.thief_id;
     let reply = handoff::serve_steal(
-        &shard.tasks,
+        &mut shard.tasks,
         &mut shard.forward,
         &shard.origins,
+        &mut shard.run_queue,
         shard.id.raw(),
         request,
     );

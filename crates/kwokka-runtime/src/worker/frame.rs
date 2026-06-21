@@ -464,6 +464,11 @@ pub(crate) fn poll_one(
     if submitted > 0 {
         let header = parent.header_mut();
         header.in_flight_ops = header.in_flight_ops.saturating_add(submitted);
+        // An io-bound task stays on its issuing worker: pin it off the steal
+        // path so its completion harvests on the ring that submitted the op,
+        // even across the brief window after the op drains and before the
+        // task's final poll runs.
+        header.io_bound = true;
     }
     Some(outcome)
 }

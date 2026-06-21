@@ -73,6 +73,11 @@ pub(crate) fn poll_task(slot: &mut TaskSlot, cx: &mut Context<'_>) -> PollOutcom
     if let Err(observed) = slot.header().state.try_start_poll() {
         return PollOutcome::Skipped(observed);
     }
+    // The runnable steal path offers only polled tasks, so record poll entry
+    // here: a task becomes stealable as a runnable only after its owning
+    // worker has run it at least once, which keeps a task's first poll on the
+    // worker that spawned it.
+    slot.header_mut().has_polled = true;
     match slot.poll_via_vtable(cx) {
         Poll::Ready(()) => {
             // The future is consumed and its output written; advance
