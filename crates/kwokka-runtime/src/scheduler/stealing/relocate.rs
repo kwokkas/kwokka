@@ -56,6 +56,13 @@ pub(crate) struct StolenTask {
 
 impl StolenTask {
     /// Steal-stable identity of the relocated task.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the Woken serve path landing in the follow-up PR"
+        )
+    )]
     pub(crate) const fn pip(&self) -> Pip {
         self.pip
     }

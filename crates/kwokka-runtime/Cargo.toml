@@ -11,10 +11,9 @@ keywords = ["async", "runtime", "scheduler", "kwokka"]
 categories = ["asynchronous", "concurrency"]
 
 [features]
-steal = ["dep:crossbeam-deque"]
+steal = []
 
 [dependencies]
-crossbeam-deque = { workspace = true, optional = true }
 kwokka-core.workspace = true
 kwokka-io.workspace = true
 
@@ -25,4 +24,4 @@ loom.workspace = true
 workspace = true
 
 [package.metadata.cargo-machete]
-ignored = ["crossbeam-deque", "kwokka-core", "kwokka-io"]
+ignored = ["kwokka-core", "kwokka-io"]

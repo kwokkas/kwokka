@@ -59,6 +59,13 @@ impl ForwardOrigin {
     }
 
     /// Takes the origin recorded for `index`, leaving the slot bare.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "consumed by the Woken serve path landing in the follow-up PR"
+        )
+    )]
     pub(crate) fn take(&mut self, index: u32) -> Option<Origin> {
         self.entries.get_mut(index as usize)?.take()
     }
