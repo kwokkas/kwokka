@@ -11,6 +11,7 @@ pub(crate) mod endpoint;
 pub(crate) mod frame;
 mod id;
 pub(crate) mod inbox;
+pub(crate) mod polling;
 pub(crate) mod reap;
 pub(crate) mod shard;
 pub(crate) mod wake;

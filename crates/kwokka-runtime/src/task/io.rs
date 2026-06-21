@@ -26,7 +26,7 @@ use kwokka_io::operation::{IoRequest, SubmitResult};
 
 use crate::{
     task::{header::WakeData, waker},
-    worker::{WorkerId, frame},
+    worker::{WorkerId, polling},
 };
 
 /// A future that submits one internal timeout op and resolves with its result.
@@ -75,13 +75,13 @@ impl Future for TimerFuture {
             // result is stored, so a spurious early poll stays Pending; a real
             // completion carries a non-empty result (a timeout is -ETIME, never
             // the zeroed EMPTY).
-            return match frame::with_current(worker, |frame| frame.wake_data) {
+            return match polling::with_current(worker, |frame| frame.wake_data) {
                 Some(data) if data != WakeData::EMPTY => Poll::Ready(data.result),
                 _ => Poll::Pending,
             };
         }
         let request = IoRequest::<()>::timeout(this.duration_ns).with_user_data(task_ref.raw());
-        match frame::with_current(worker, |frame| frame.submit_internal(request)) {
+        match polling::with_current(worker, |frame| frame.submit_internal(request)) {
             Some(Some(SubmitResult::Submitted(_))) => {
                 this.is_submitted = true;
                 Poll::Pending

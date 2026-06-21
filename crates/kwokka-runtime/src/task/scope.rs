@@ -48,7 +48,7 @@ use crate::{
         slot::TaskSlot,
         waker,
     },
-    worker::{WorkerId, frame, inbox::PendingSpawn},
+    worker::{WorkerId, inbox::PendingSpawn, polling},
 };
 
 /// The structured scope of the running task.
@@ -77,7 +77,7 @@ impl<M: Mode> Scope<'_, M> {
             parent: self.parent,
             cell,
         };
-        match frame::with_current(self.worker, |frame| frame.push_spawn(request)) {
+        match polling::with_current(self.worker, |frame| frame.push_spawn(request)) {
             None => Err(SpawnError::NoActiveFrame),
             Some(None) => Ok(()),
             Some(Some(_returned)) => Err(SpawnError::InboxFull),
@@ -294,7 +294,7 @@ where
         // (0.2.0+), handled conservatively as not-yet-settled. On the poll that
         // observes settlement, the parent is recorded for the post-poll reap so
         // its settled children's slots are freed after this poll returns.
-        let settled = frame::with_current(worker, |frame| {
+        let settled = polling::with_current(worker, |frame| {
             let settled = frame.are_children_all_settled();
             if settled {
                 // A full reap queue drops the record (the children wait for the
@@ -324,8 +324,9 @@ mod tests {
     use crate::{
         task::{header::WakeData, slot::TaskSlot},
         worker::{
-            frame::{PollFrame, clear, install},
+            frame::PollFrame,
             inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+            polling::{clear, install},
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },
     };
