@@ -39,10 +39,12 @@ impl RuntimeBuilder {
         }
     }
 
-    /// Sets the worker count for a work-stealing runtime.
+    /// Sets the worker count for a multi-worker runtime.
     ///
-    /// Only [`Self::stealing`] reads a count above one; [`Self::affine`]
-    /// rejects it. The count is capped by the crew limit at build.
+    /// Both [`Self::stealing`] and [`Self::affine`] read a count above one --
+    /// stealing builds a work-stealing crew, affine a thread-per-core crew. A
+    /// count of one builds a single-worker runtime. The count is capped by the
+    /// crew limit at build.
     #[must_use]
     pub const fn workers(mut self, workers: usize) -> Self {
         self.workers = workers;
@@ -64,18 +66,21 @@ impl RuntimeBuilder {
         self
     }
 
-    /// Builds a thread-per-core (affine) runtime on the current thread.
+    /// Builds an affine (thread-per-core) runtime.
     ///
-    /// The worker id comes from the process-global allocator, so two
-    /// runtimes in one process never share a per-worker table slot.
+    /// With the default single worker the lead runs on the calling thread and
+    /// several such runtimes coexist in one process; with `workers > 1` it
+    /// builds a multi-worker crew that is one-per-process. See
+    /// [`Runtime::affine_crew`] for the parallelism-sized convenience entry.
     ///
     /// # Errors
     ///
     /// Returns `InvalidInput` if the task capacity exceeds the wake-inbox
-    /// capacity, which would let wakes be dropped. Returns `Other` when the
-    /// worker id space is exhausted. Otherwise returns the backend setup
-    /// error from the platform driver factory (e.g. an `io_uring` setup
-    /// failure under seccomp or an unsupported kernel).
+    /// capacity or the worker count exceeds the crew cap. Returns `Other` when
+    /// the worker id space is exhausted or a multi-worker affine runtime is
+    /// already live. Otherwise returns the backend setup error from the
+    /// platform driver factory (e.g. an `io_uring` setup failure under seccomp
+    /// or an unsupported kernel).
     pub fn affine(self) -> io::Result<Runtime<Affine>> {
         if self.task_capacity > registry::INBOX_CAPACITY {
             return Err(io::Error::new(
@@ -83,11 +88,18 @@ impl RuntimeBuilder {
                 "task_capacity exceeds the wake-inbox capacity",
             ));
         }
-        if self.workers > 1 {
+        if self.workers > crate::runtime::stealing::MAX_WORKERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "the affine runtime drives one worker; use stealing for a crew",
+                "worker count must not exceed the crew cap",
             ));
+        }
+        if self.workers > 1 {
+            return crate::runtime::affine::build(
+                self.ring_entries,
+                self.task_capacity,
+                self.workers,
+            );
         }
         let Some(worker_id) = registry::claim_one() else {
             return Err(io::Error::other("the worker id space is exhausted"));
