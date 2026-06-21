@@ -1,15 +1,9 @@
 //! Pinned-storage completion futures for socket operations.
-#![allow(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) on module-private items"
-)]
 //!
 //! [`RecvFuture`] and [`SendFuture`] carry their byte storage inline and
 //! hand the kernel a borrowed pointer into it through [`InlineBuf`]. Submits
 //! and completion reads travel the poll boundary, the same path the no-buffer
 //! socket futures use.
-
-#![allow(dead_code, reason = "pending kwokka-net and kwokka-fs wire-up")]
 
 use core::{
     future::Future,
@@ -50,7 +44,7 @@ use crate::{
 /// round trip decodes the polling task from the waker, so await it
 /// directly.
 #[must_use = "futures do nothing unless polled"]
-pub(crate) struct RecvFuture<const CAP: usize> {
+pub struct RecvFuture<const CAP: usize> {
     /// Source socket file descriptor.
     fd: i32,
     /// Inline destination; the kernel writes here, pinned with the future.
@@ -61,7 +55,7 @@ pub(crate) struct RecvFuture<const CAP: usize> {
 
 impl<const CAP: usize> RecvFuture<CAP> {
     /// Constructs a recv future for socket `fd`.
-    pub(crate) const fn new(fd: i32) -> Self {
+    pub const fn new(fd: i32) -> Self {
         Self {
             fd,
             buf: [0u8; CAP],
@@ -141,7 +135,7 @@ impl<const CAP: usize> Future for RecvFuture<CAP> {
 /// round trip decodes the polling task from the waker, so await it
 /// directly.
 #[must_use = "futures do nothing unless polled"]
-pub(crate) struct SendFuture<const CAP: usize> {
+pub struct SendFuture<const CAP: usize> {
     /// Target socket file descriptor.
     fd: i32,
     /// Inline source; the kernel reads `len` bytes here, pinned with the future.
@@ -155,7 +149,7 @@ pub(crate) struct SendFuture<const CAP: usize> {
 impl<const CAP: usize> SendFuture<CAP> {
     /// Constructs a send future for socket `fd` over `data`, sending its
     /// first `len` bytes (clamped to `CAP`).
-    pub(crate) const fn new(fd: i32, data: [u8; CAP], len: usize) -> Self {
+    pub const fn new(fd: i32, data: [u8; CAP], len: usize) -> Self {
         Self {
             fd,
             buf: data,

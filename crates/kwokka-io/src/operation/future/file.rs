@@ -1,15 +1,9 @@
 //! Pinned-storage completion futures for file operations.
-#![allow(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) on module-private items"
-)]
 //!
 //! [`FileReadFuture`] and [`FileWriteFuture`] carry their byte storage inline
 //! and hand the kernel a borrowed pointer into it through [`InlineBuf`].
 //! Submits and completion reads travel the poll boundary, the same path the
 //! socket futures use.
-
-#![allow(dead_code, reason = "pending kwokka-net and kwokka-fs wire-up")]
 
 use core::{
     future::Future,
@@ -51,7 +45,7 @@ use crate::{
 /// round trip decodes the polling task from the waker, so await it
 /// directly.
 #[must_use = "futures do nothing unless polled"]
-pub(crate) struct FileReadFuture<const CAP: usize> {
+pub struct FileReadFuture<const CAP: usize> {
     /// Target file descriptor.
     fd: i32,
     /// Byte offset the read starts at.
@@ -64,7 +58,7 @@ pub(crate) struct FileReadFuture<const CAP: usize> {
 
 impl<const CAP: usize> FileReadFuture<CAP> {
     /// Constructs a read future for `fd` starting at byte `offset`.
-    pub(crate) const fn new(fd: i32, offset: u64) -> Self {
+    pub const fn new(fd: i32, offset: u64) -> Self {
         Self {
             fd,
             offset,
@@ -146,7 +140,7 @@ impl<const CAP: usize> Future for FileReadFuture<CAP> {
 /// round trip decodes the polling task from the waker, so await it
 /// directly.
 #[must_use = "futures do nothing unless polled"]
-pub(crate) struct FileWriteFuture<const CAP: usize> {
+pub struct FileWriteFuture<const CAP: usize> {
     /// Target file descriptor.
     fd: i32,
     /// Byte offset the write starts at.
@@ -162,7 +156,7 @@ pub(crate) struct FileWriteFuture<const CAP: usize> {
 impl<const CAP: usize> FileWriteFuture<CAP> {
     /// Constructs a write future for `fd` at byte `offset` over `data`,
     /// writing its first `len` bytes (clamped to `CAP`).
-    pub(crate) const fn new(fd: i32, offset: u64, data: [u8; CAP], len: usize) -> Self {
+    pub const fn new(fd: i32, offset: u64, data: [u8; CAP], len: usize) -> Self {
         Self {
             fd,
             offset,
