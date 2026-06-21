@@ -5,6 +5,7 @@ mod handle;
 pub(crate) mod header;
 mod identity;
 pub(crate) mod io;
+pub(crate) mod lifecycle;
 mod marker;
 mod scope;
 pub(crate) mod slot;
