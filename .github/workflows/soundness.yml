@@ -93,7 +93,7 @@ jobs:
           export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
           export CARGO_TARGET_DIR="$RUNNER_TEMP/miri-target"
           cargo +nightly miri setup
-          cargo +nightly miri test --lib -p kwokka-core -p kwokka-io -p kwokka-runtime -- --skip concurrent_producers --skip affine_builds_on_this_host --skip affine_runtimes_claim_distinct_worker_ids
+          cargo +nightly miri test --lib -p kwokka-core -p kwokka-io -p kwokka-runtime -- --skip concurrent_producers --skip affine_builds_on_this_host --skip affine_runtimes_claim_distinct_worker_ids --skip affine_crew_builds_runs_and_is_single_instance
           cargo +nightly miri test --lib -p kwokka-runtime --features steal -- relocate handoff registry
 
   loom:

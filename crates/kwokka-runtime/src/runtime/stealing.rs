@@ -64,14 +64,26 @@ static READY: AtomicUsize = AtomicUsize::new(0);
 /// turns it into an error.
 static BOOT_FAILED: AtomicBool = AtomicBool::new(false);
 
+/// The scheduler discipline a crew runs, selecting which shutdown barrier the
+/// join and reset paths raise.
+pub(crate) enum CrewKind {
+    /// A single-worker crew -- no siblings, no barrier.
+    Solo,
+    /// A work-stealing crew, joined through the stealing shutdown barrier.
+    Stealing,
+    /// A multi-worker affine crew, joined through the affine shutdown barrier.
+    Affine,
+}
+
 /// Sibling worker threads owned by the runtime handle.
 ///
-/// The affine runtime carries a solo crew (no siblings); the stealing
-/// runtime carries one handle per spawned sibling. The handle's drop path
-/// joins the crew before the worker ids are released.
+/// The affine runtime carries a solo crew (no siblings) or a multi-worker
+/// affine crew; the stealing runtime carries one handle per spawned sibling.
+/// The handle's drop path joins the crew before the worker ids are released.
 pub(crate) struct Crew {
-    handles: [Option<thread::JoinHandle<()>>; MAX_WORKERS],
-    count: usize,
+    pub(crate) handles: [Option<thread::JoinHandle<()>>; MAX_WORKERS],
+    pub(crate) count: usize,
+    pub(crate) kind: CrewKind,
 }
 
 impl Crew {
@@ -80,6 +92,7 @@ impl Crew {
         Self {
             handles: [const { None }; MAX_WORKERS],
             count: 1,
+            kind: CrewKind::Solo,
         }
     }
 
@@ -95,7 +108,11 @@ impl Crew {
         if self.count <= 1 {
             return;
         }
-        SHUTDOWN.store(true, Ordering::SeqCst);
+        match self.kind {
+            CrewKind::Stealing => raise_shutdown(),
+            CrewKind::Affine => crate::runtime::affine::raise_shutdown(),
+            CrewKind::Solo => return,
+        }
         for offset in 1..self.count {
             registry::signal(sibling_id(lead, offset).raw());
         }
@@ -119,16 +136,25 @@ impl Crew {
             return;
         }
         registry::release_block(lead, self.count);
-        reset_statics();
+        match self.kind {
+            CrewKind::Affine => crate::runtime::affine::reset_statics(),
+            CrewKind::Stealing | CrewKind::Solo => reset_statics(),
+        }
     }
 }
 
 /// Resets the crew statics for the next stealing runtime in this process.
-fn reset_statics() {
+pub(crate) fn reset_statics() {
     READY.store(0, Ordering::SeqCst);
     BOOT_FAILED.store(false, Ordering::SeqCst);
     SHUTDOWN.store(false, Ordering::SeqCst);
     STEALING_LIVE.store(false, Ordering::Release);
+}
+
+/// Raises the stealing crew's shutdown broadcast. Every sibling observes it
+/// after its next pass and exits its loop.
+pub(crate) fn raise_shutdown() {
+    SHUTDOWN.store(true, Ordering::SeqCst);
 }
 
 /// The sibling id at `offset` within the crew's contiguous block.
@@ -137,7 +163,7 @@ fn reset_statics() {
 ///
 /// Panics if the offset leaves the claimed block's id range, which the
 /// block allocator's contiguity contract rules out.
-fn sibling_id(lead: WorkerId, offset: usize) -> WorkerId {
+pub(crate) fn sibling_id(lead: WorkerId, offset: usize) -> WorkerId {
     let Ok(step) = u8::try_from(offset) else {
         panic!("a crew offset fits a u8");
     };
@@ -216,6 +242,7 @@ fn spawn_crew(
     let mut crew = Crew {
         handles: [const { None }; MAX_WORKERS],
         count: workers,
+        kind: CrewKind::Stealing,
     };
     for offset in 1..workers {
         let sibling = sibling_id(lead, offset);
