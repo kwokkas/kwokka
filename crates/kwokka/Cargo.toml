@@ -24,6 +24,10 @@ kwokka-runtime.workspace = true
 kwokka-net = { workspace = true, optional = true }
 kwokka-fs = { workspace = true, optional = true }
 
+[package.metadata.docs.rs]
+features = ["full"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lints]
 workspace = true
 
