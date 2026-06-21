@@ -5,6 +5,8 @@
     reason = "pub(crate) on module-private items"
 )]
 
+#[cfg(target_os = "linux")]
+pub(crate) mod affine;
 pub(crate) mod dispatch;
 pub(crate) mod queue;
 #[cfg(feature = "steal")]

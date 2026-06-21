@@ -135,7 +135,18 @@ fn spawn_crew(
         let sibling = sibling_id(lead, offset);
         let spawned = thread::Builder::new()
             .name(format!("kwokka-affine-{}", sibling.raw()))
-            .spawn(move || sibling_main(sibling, ring_entries, task_capacity));
+            .spawn(move || {
+                // Pin once at thread start, before the build barrier releases,
+                // so the worker is placed before it polls a task.
+                #[cfg(target_os = "linux")]
+                {
+                    // IGNORE: pinning is non-fatal; an unpinned worker still runs.
+                    let _ = crate::scheduler::affine::pin::try_pin_current_thread(
+                        crate::scheduler::affine::topology::cpu_index_for(sibling, lead),
+                    );
+                }
+                sibling_main(sibling, ring_entries, task_capacity);
+            });
         match spawned {
             Ok(handle) => crew.handles[offset - 1] = Some(handle),
             Err(error) => {
