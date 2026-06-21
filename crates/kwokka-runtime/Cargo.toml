@@ -21,6 +21,11 @@ steal = []
 kwokka-core.workspace = true
 kwokka-io.workspace = true
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# CPU affinity for the thread-per-core scheduler: sched_setaffinity has no std
+# wrapper. Linux-only behind a cfg target so other platforms drop the dep.
+libc.workspace = true
+
 [dev-dependencies]
 loom.workspace = true
 

@@ -155,6 +155,7 @@ version = "0.0.1"
 dependencies = [
  "kwokka-core",
  "kwokka-io",
+ "libc",
  "loom",
 ]
 
