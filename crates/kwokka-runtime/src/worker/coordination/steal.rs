@@ -4,11 +4,11 @@
 //! All three tables are gated behind `#[cfg(feature = "steal")]` and are
 //! absent from loom builds (loom models drive the rings directly).
 
-#[cfg(all(feature = "steal", not(loom)))]
+#[cfg(feature = "steal")]
 use crate::scheduler::stealing::relocate::{HandoffMsg, SettledNote, StealRequest};
 #[cfg(all(feature = "steal", not(loom)))]
 use crate::sync::mpsc::MpscRing;
-#[cfg(feature = "steal")]
+#[cfg(all(feature = "steal", not(loom)))]
 use crate::task::TaskRef;
 use crate::worker::WorkerId;
 
@@ -208,7 +208,9 @@ pub(crate) fn has_handoff(_worker_id: WorkerId) -> bool {
 mod tests {
     use kwokka_core::Generation;
 
-    use super::{pop_handoff, pop_settled, pop_steal_request, push_handoff, push_settled, push_steal_request};
+    use super::{
+        pop_handoff, pop_settled, pop_steal_request, push_handoff, push_settled, push_steal_request,
+    };
     use crate::task::TaskRef;
     use crate::worker::WorkerId;
 

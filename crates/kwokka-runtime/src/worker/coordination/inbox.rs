@@ -158,7 +158,9 @@ pub(crate) fn set_parked(_worker_id: WorkerId, _is_parked: bool) {
 mod tests {
     use kwokka_core::Generation;
 
-    use super::{INBOX_CAPACITY, enqueue, pop, publish_endpoint, set_parked, signal, withdraw_endpoint};
+    use super::{
+        INBOX_CAPACITY, enqueue, pop, publish_endpoint, set_parked, signal, withdraw_endpoint,
+    };
     use crate::task::TaskRef;
     use crate::worker::WorkerId;
 
