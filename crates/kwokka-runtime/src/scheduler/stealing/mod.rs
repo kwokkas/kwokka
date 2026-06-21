@@ -1,23 +1,13 @@
-//! Work-stealing queue substrate -- per-worker deques, steal handles, and
-//! the shared overflow injector, all carrying [`TaskRef`] handles only.
+//! Work-stealing substrate -- handoff protocol and cross-slab task
+//! relocation, carrying [`TaskRef`] handles only.
 //!
-//! The 512-byte task bodies never enter these queues: a thief that wins a
-//! handle relocates the slot through the separate steal transport. Compiled
-//! only under the `steal` feature, so the default affine build carries none
-//! of it.
+//! The 512-byte task bodies never enter queues directly: a thief wins a
+//! handle through the per-worker handoff ring, then relocates the slot
+//! through the steal transport defined here. The actual run-loop
+//! composition (serve/receive calls, the worker steal ring) lives in the
+//! bootstrap layer.
 //!
 //! [`TaskRef`]: crate::task::TaskRef
 
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the stealing run loop consumes this substrate, landing with the multi-worker bootstrap"
-    )
-)]
-
-pub(crate) mod deque;
 pub(crate) mod handoff;
-pub(crate) mod injector;
 pub(crate) mod relocate;
-pub(crate) mod steal;
