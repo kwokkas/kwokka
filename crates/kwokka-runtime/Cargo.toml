@@ -11,6 +11,10 @@ keywords = ["async", "runtime", "scheduler", "kwokka"]
 categories = ["asynchronous", "concurrency"]
 
 [features]
+# Work-stealing scheduler: cross-worker task migration, steal-request rings, and
+# the cross-slab relocate path. Default-off so the simpler affine (thread-per-core)
+# build has no dead scheduler code compiled in. Promoted to default once the stealing
+# runtime reaches the same reliability tier as the affine runtime.
 steal = []
 
 [dependencies]
