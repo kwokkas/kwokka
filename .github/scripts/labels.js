@@ -14,6 +14,7 @@ const areaFor = (path) => {
   if (crate) return `A-${crate[1]}`;
   if (path.startsWith("crates/kwokka/")) return "A-facade";
   if (path.startsWith(".github/")) return "A-ci";
+  if (path === ".coderabbit.yaml") return "A-ci";
   if (/^docs\//.test(path) || /\.md$/.test(path) || /^LICENSE/.test(path)) {
     return "A-docs";
   }
