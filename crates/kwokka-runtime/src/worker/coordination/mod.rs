@@ -1,4 +1,4 @@
-//! Process-wide worker coordination tables: wake inboxes, wake endpoints,
+//! Process-wide worker coordination tables: wake mailboxes, wake endpoints,
 //! worker-id allocation, and (when the steal feature is active) the
 //! steal-request, handoff, and settled-note channels.
 
@@ -8,11 +8,11 @@
 )]
 
 mod alloc;
-mod inbox;
+mod mailbox;
 #[cfg(feature = "steal")]
 mod steal;
 
 pub(crate) use alloc::*;
-pub(crate) use inbox::*;
+pub(crate) use mailbox::*;
 #[cfg(feature = "steal")]
 pub(crate) use steal::*;
