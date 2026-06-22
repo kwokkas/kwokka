@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="../../.github/images/banner.png" alt="kwokka" />
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="../../.github/images/banner-dark.png">
+    <img src="../../.github/images/banner-light.png" alt="kwokka">
+  </picture>
 </p>
 
 [![crates.io](https://img.shields.io/crates/v/kwokka-io.svg)](https://crates.io/crates/kwokka-io)
