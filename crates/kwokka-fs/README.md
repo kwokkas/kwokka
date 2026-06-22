@@ -1,10 +1,38 @@
+<p align="center">
+  <img src="../../.github/images/banner.png" alt="kwokka" />
+</p>
+
+[![crates.io](https://img.shields.io/crates/v/kwokka-fs.svg)](https://crates.io/crates/kwokka-fs)
+[![docs.rs](https://docs.rs/kwokka-fs/badge.svg)](https://docs.rs/kwokka-fs)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 # kwokka-fs
 
-Files, directories, paths, and pipes for the kwokka runtime.
+Asynchronous file I/O for kwokka, built on the completion-based I/O
+driver. It provides file open, read, and write, surfaced as `kwokka::fs`.
+Directories, paths, and pipes arrive in a later release.
 
-Internal crate of the [`kwokka`](https://crates.io/crates/kwokka) async runtime.
-Depend on the `kwokka` facade rather than this crate directly.
+This is an internal crate of the [`kwokka`](https://crates.io/crates/kwokka)
+async framework. Depend on the `kwokka` facade rather than this crate
+directly.
+
+## Example
+
+```rust
+use kwokka::fs::File;
+
+#[kwokka::main(affine)] // or `stealing`
+async fn main() -> std::io::Result<()> {
+    let file = File::open("Cargo.toml").await?;
+    let (read, buf) = file.read::<1024>(0).await;
+    let len = read?;
+    // the first `len` bytes are in `buf`
+    Ok(())
+}
+```
 
 ## License
 
-Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
+Licensed under either of Apache License 2.0
+([LICENSE-APACHE](LICENSE-APACHE)) or the MIT license
+([LICENSE-MIT](LICENSE-MIT)), at your option.

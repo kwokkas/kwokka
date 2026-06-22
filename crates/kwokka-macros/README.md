@@ -1,10 +1,40 @@
+<p align="center">
+  <img src="../../.github/images/banner.png" alt="kwokka" />
+</p>
+
+[![crates.io](https://img.shields.io/crates/v/kwokka-macros.svg)](https://crates.io/crates/kwokka-macros)
+[![docs.rs](https://docs.rs/kwokka-macros/badge.svg)](https://docs.rs/kwokka-macros)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+
 # kwokka-macros
 
-Procedural macros lowering onto the kwokka facade.
+The procedural macros for kwokka. In 0.1.0 this is the `#[kwokka::main]`
+attribute, which boots a runtime and runs an async `main` on the
+scheduler you name. It is re-exported through the facade as
+`kwokka::main`.
 
-Internal crate of the [`kwokka`](https://crates.io/crates/kwokka) async runtime.
-Use these macros through the `kwokka` facade rather than depending on this crate directly.
+This is an internal crate of the [`kwokka`](https://crates.io/crates/kwokka)
+async framework. Use these macros through the `kwokka` facade rather than
+depending on this crate directly.
+
+## Example
+
+Thread-per-core:
+
+```rust
+#[kwokka::main(affine)]
+async fn main() {}
+```
+
+Work-stealing:
+
+```rust
+#[kwokka::main(stealing)]
+async fn main() {}
+```
 
 ## License
 
-Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT) at your option.
+Licensed under either of Apache License 2.0
+([LICENSE-APACHE](LICENSE-APACHE)) or the MIT license
+([LICENSE-MIT](LICENSE-MIT)), at your option.
