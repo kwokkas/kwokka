@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
 //! Completion-based I/O driver layer.
 //!
 //! Provides the [`IoDriver`] trait, backend dispatch enum, operation

@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
 //! Async runtime primitives.
 //!
 //! [`Runtime::affine`] and [`Runtime::stealing`] are the entry points;

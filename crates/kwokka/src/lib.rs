@@ -1,4 +1,6 @@
-//! Completion-based async runtime with integrated orchestration.
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+//! Completion-based async runtime with optional orchestration.
 //!
 //! This crate is the sole user entry point: every item re-exported here
 //! is the supported surface over the workspace crates, and nothing
