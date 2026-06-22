@@ -15,14 +15,16 @@ the latest 0.1.x release; older versions are not maintained.
 Please do not report security issues through public issues, pull
 requests, or discussions.
 
-Use GitHub's private vulnerability reporting instead: open the
-[Security tab](https://github.com/kwokkas/kwokka/security/advisories) and
-choose "Report a vulnerability". That opens a private advisory only the
-maintainers can see.
+Report privately through either channel:
 
-Include enough to understand and reproduce the issue: the affected crate
-and version, the platform and kernel, and a minimal example if you have
-one.
+- GitHub's private vulnerability reporting: open the
+  [Security tab](https://github.com/kwokkas/kwokka/security/advisories)
+  and choose "Report a vulnerability".
+- Email <security@kwokka.dev>.
+
+Both reach only the maintainers. Include enough to understand and
+reproduce the issue: the affected crate and version, the platform and
+kernel, and a minimal example if you have one.
 
 ## What counts as a security issue
 
