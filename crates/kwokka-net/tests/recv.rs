@@ -47,9 +47,8 @@ fn recv_returns_sent_bytes() {
     // Hold the connection open until the recv has drained its bytes.
     drop(client);
 
-    assert!(result >= 0, "the recv completed with an error: {result}");
-    let Ok(received) = usize::try_from(result) else {
-        panic!("a non-negative recv result fits usize");
+    let Ok(received) = result else {
+        panic!("the recv must resolve with a byte count, not an error");
     };
     assert_eq!(
         &buf[..received],

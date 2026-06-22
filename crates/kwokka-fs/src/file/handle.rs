@@ -66,8 +66,8 @@ impl File {
 
     /// Hands out the future reading up to `CAP` bytes at byte `offset`.
     ///
-    /// Awaiting it resolves to the kernel result paired with the filled
-    /// buffer. See [`FileReadFuture`] for the await-to-completion
+    /// Awaiting it resolves to an [`io::Result`] byte count paired with the
+    /// filled buffer. See [`FileReadFuture`] for the await-to-completion
     /// contract.
     ///
     /// # Examples
@@ -79,7 +79,8 @@ impl File {
     ///
     /// let mut runtime = Runtime::affine()?;
     /// let file = runtime.block_on(File::open("Cargo.toml"))?;
-    /// let (read, _buf) = runtime.block_on(file.read::<64>(0));
+    /// let (result, _buf) = runtime.block_on(file.read::<64>(0));
+    /// let _read = result?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn read<const CAP: usize>(&self, offset: u64) -> FileReadFuture<CAP> {
@@ -90,8 +91,8 @@ impl File {
     ///
     /// `data` is a `CAP`-byte array and `len` marks how many of its leading
     /// bytes to write (clamped to `CAP`); the rest is ignored. Awaiting it
-    /// resolves to the kernel result. See [`FileWriteFuture`] for the
-    /// await-to-completion contract.
+    /// resolves to an [`io::Result`] byte count. See [`FileWriteFuture`] for
+    /// the await-to-completion contract.
     ///
     /// # Examples
     ///
@@ -104,7 +105,7 @@ impl File {
     /// let file = runtime.block_on(File::create("scratch.bin"))?;
     /// let mut data = [0u8; 64];
     /// data[..5].copy_from_slice(b"hello");
-    /// let written = runtime.block_on(file.write::<64>(0, data, 5));
+    /// let _written = runtime.block_on(file.write::<64>(0, data, 5))?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn write<const CAP: usize>(

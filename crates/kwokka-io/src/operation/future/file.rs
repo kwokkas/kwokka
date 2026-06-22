@@ -11,10 +11,11 @@ use core::{
     pin::Pin,
     task::{Context, Poll},
 };
+use std::io;
 
 use crate::{
     boundary::{self, IoSeam},
-    operation::{InlineBuf, IoBufMut, IoRequest, SubmitResult},
+    operation::{InlineBuf, IoBufMut, IoRequest, SubmitResult, future::bytes_from_cqe},
 };
 
 /// A future that reads from `fd` into an inline `CAP`-byte buffer.
@@ -23,8 +24,9 @@ use crate::{
 /// submits a read op, handing the kernel an [`InlineBuf`] over this
 /// future's own `buf` -- addressed by the polling task's identity token
 /// for the `user_data` round trip -- and yields `Pending`. A later poll,
-/// woken by the completion drain, returns the kernel result paired with
-/// the filled buffer.
+/// woken by the completion drain, returns an [`io::Result`] byte count
+/// paired with the filled buffer: the bytes read (`0` at end of file), or
+/// the mapped [`io::Error`].
 ///
 /// The buffer lives inline in this future, which the runtime pins in its
 /// slab slot, so the kernel writes into stable memory with no heap
@@ -69,7 +71,7 @@ impl<const CAP: usize> FileReadFuture<CAP> {
 }
 
 impl<const CAP: usize> Future for FileReadFuture<CAP> {
-    type Output = (i32, [u8; CAP]);
+    type Output = (io::Result<usize>, [u8; CAP]);
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         // The polling task's identity is encoded in its waker; the poll
@@ -81,9 +83,10 @@ impl<const CAP: usize> Future for FileReadFuture<CAP> {
         let this = self.get_mut();
         if this.is_submitted {
             return match IoSeam::with_current(binding.worker_id, IoSeam::completion_result) {
-                Some(Some(slot)) => {
-                    Poll::Ready((slot.result, mem::replace(&mut this.buf, [0u8; CAP])))
-                }
+                Some(Some(slot)) => Poll::Ready((
+                    bytes_from_cqe(slot.result),
+                    mem::replace(&mut this.buf, [0u8; CAP]),
+                )),
                 _ => Poll::Pending,
             };
         }
@@ -106,7 +109,7 @@ impl<const CAP: usize> Future for FileReadFuture<CAP> {
             // production path runs on a real driver, so this is the
             // test-seam / unsupported path; resolve with -EINVAL rather
             // than hang.
-            _ => Poll::Ready((-22, mem::replace(&mut this.buf, [0u8; CAP]))),
+            _ => Poll::Ready((bytes_from_cqe(-22), mem::replace(&mut this.buf, [0u8; CAP]))),
         }
     }
 }
@@ -119,8 +122,8 @@ impl<const CAP: usize> Future for FileReadFuture<CAP> {
 /// future's own `buf` with its first `len` bytes marked initialized --
 /// addressed by the polling task's identity token for the `user_data`
 /// round trip -- and yields `Pending`. A later poll, woken by the
-/// completion drain, returns the kernel result: the bytes written, or a
-/// negative `-errno`.
+/// completion drain, returns an [`io::Result`]: the bytes written, or the
+/// mapped [`io::Error`].
 ///
 /// The buffer lives inline in this future, which the runtime pins in its
 /// slab slot, so the kernel reads stable memory with no heap allocation.
@@ -168,9 +171,9 @@ impl<const CAP: usize> FileWriteFuture<CAP> {
 }
 
 impl<const CAP: usize> Future for FileWriteFuture<CAP> {
-    type Output = i32;
+    type Output = io::Result<usize>;
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<usize>> {
         // The polling task's identity is encoded in its waker; the poll
         // boundary decoder rejects a waker the runtime did not build, the
         // same contract the read future holds.
@@ -180,7 +183,7 @@ impl<const CAP: usize> Future for FileWriteFuture<CAP> {
         let this = self.get_mut();
         if this.is_submitted {
             return match IoSeam::with_current(binding.worker_id, IoSeam::completion_result) {
-                Some(Some(slot)) => Poll::Ready(slot.result),
+                Some(Some(slot)) => Poll::Ready(bytes_from_cqe(slot.result)),
                 _ => Poll::Pending,
             };
         }
@@ -204,7 +207,7 @@ impl<const CAP: usize> Future for FileWriteFuture<CAP> {
             // production path runs on a real driver, so this is the
             // test-seam / unsupported path; resolve with -EINVAL rather
             // than hang.
-            _ => Poll::Ready(-22),
+            _ => Poll::Ready(bytes_from_cqe(-22)),
         }
     }
 }

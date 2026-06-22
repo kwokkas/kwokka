@@ -43,8 +43,8 @@ impl TcpStream {
 
     /// Hands out the future receiving up to `CAP` bytes from this socket.
     ///
-    /// Awaiting it resolves to the kernel result paired with the filled
-    /// buffer. See [`RecvFuture`] for the await-to-completion contract.
+    /// Awaiting it resolves to an [`io::Result`] byte count paired with the
+    /// filled buffer. See [`RecvFuture`] for the await-to-completion contract.
     ///
     /// # Examples
     ///
@@ -56,7 +56,8 @@ impl TcpStream {
     /// let mut runtime = Runtime::affine()?;
     /// let listener = TcpListener::bind("127.0.0.1:0")?;
     /// let stream = runtime.block_on(listener.accept())?;
-    /// let (read, _buf) = runtime.block_on(stream.recv::<64>());
+    /// let (result, _buf) = runtime.block_on(stream.recv::<64>());
+    /// let _read = result?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn recv<const CAP: usize>(&self) -> RecvFuture<CAP> {
@@ -67,9 +68,9 @@ impl TcpStream {
     /// to `CAP`) over this socket.
     ///
     /// `data` is a `CAP`-byte array and `len` marks how many of its leading
-    /// bytes to send; the rest is ignored. Awaiting it resolves to the
-    /// kernel result. See [`SendFuture`] for the await-to-completion
-    /// contract.
+    /// bytes to send; the rest is ignored. Awaiting it resolves to an
+    /// [`io::Result`] byte count. See [`SendFuture`] for the
+    /// await-to-completion contract.
     ///
     /// # Examples
     ///
@@ -83,7 +84,7 @@ impl TcpStream {
     /// let stream = runtime.block_on(listener.accept())?;
     /// let mut data = [0u8; 64];
     /// data[..5].copy_from_slice(b"hello");
-    /// let sent = runtime.block_on(stream.send::<64>(data, 5));
+    /// let _sent = runtime.block_on(stream.send::<64>(data, 5))?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
     pub fn send<const CAP: usize>(&self, data: [u8; CAP], len: usize) -> SendFuture<CAP> {

@@ -56,12 +56,12 @@ fn roundtrip_delivers_payload_over_runtime_futures() {
         accepted >= 0,
         "the accept completed with an error: {accepted}"
     );
-    let Ok(sent) = usize::try_from(sent) else {
-        panic!("a successful send result fits usize, got {sent}");
+    let Ok(sent) = sent else {
+        panic!("the send must resolve with a byte count");
     };
     assert_eq!(sent, payload.len(), "the kernel sent every requested byte");
-    let Ok(received) = usize::try_from(received) else {
-        panic!("a successful recv result fits usize, got {received}");
+    let Ok(received) = received else {
+        panic!("the recv must resolve with a byte count");
     };
     assert_eq!(received, payload.len(), "the recv drained the full payload");
     assert_eq!(

@@ -47,9 +47,8 @@ fn send_delivers_buffer_bytes() {
         message.len(),
     ));
 
-    assert!(result >= 0, "the send completed with an error: {result}");
-    let Ok(sent) = usize::try_from(result) else {
-        panic!("a non-negative send result fits usize");
+    let Ok(sent) = result else {
+        panic!("the send must resolve with a byte count, not an error");
     };
     assert_eq!(sent, message.len(), "the kernel sent every requested byte");
 
