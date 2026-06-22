@@ -17,6 +17,7 @@
 pub(crate) mod clock;
 pub(crate) mod entry;
 pub(crate) mod handle;
+pub(crate) mod request;
 pub(crate) mod slot;
 pub(crate) mod wheel;
 

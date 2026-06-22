@@ -34,6 +34,7 @@ use crate::worker::{
 use crate::{
     scheduler::dispatch::{PollOutcome, poll_task},
     task::{TaskRef, header::WakeData, slot::TaskSlot, waker::waker_from_task_ref},
+    timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
 };
 use kwokka_core::slab::{Slab, SlabKey};
 
@@ -122,6 +123,11 @@ pub(crate) fn with_current<R>(worker: WorkerId, f: impl FnOnce(&PollFrame) -> R)
 /// whose slot was reclaimed -- so the worker skips it. The parent `&mut
 /// TaskSlot` and any mid-poll child read both derive from `tasks` at distinct
 /// indices, the structural disjointness the slab accessors document.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "disjoint slab / inbox / reap / driver / timer borrows; bundling \
+              them recreates the borrow conflict the poll frame avoids"
+)]
 pub(crate) fn poll_one(
     tasks: NonNull<Slab<TaskSlot>>,
     parent_key: SlabKey,
@@ -130,6 +136,7 @@ pub(crate) fn poll_one(
     inbox: NonNull<SpawnInbox<SPAWN_INBOX_CAPACITY>>,
     reap: NonNull<ReapQueue<REAP_QUEUE_CAPACITY>>,
     driver: Option<NonNull<DriverType>>,
+    timer_requests: Option<NonNull<TimerInbox<TIMER_INBOX_CAPACITY>>>,
 ) -> Option<PollOutcome> {
     // SAFETY: Invariant -- `tasks` points at the worker's live slab; the caller
     // (`cycle::tick`) formed it via `NonNull::from(&mut *tasks)` and does not
@@ -166,6 +173,7 @@ pub(crate) fn poll_one(
         driver,
         wake_data,
         submitted_ops: AtomicU16::new(0),
+        timer_requests,
     };
     let _guard = FrameGuard::install(worker_id, &frame);
     // The seam shares the frame's poll window: declared after the frame guard
@@ -277,6 +285,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -312,6 +321,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -336,6 +346,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -362,6 +373,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -394,6 +406,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -434,6 +447,7 @@ mod tests {
             task,
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
+            None,
             None,
         );
         assert_eq!(outcome, Some(PollOutcome::Completed));
@@ -487,6 +501,7 @@ mod tests {
             task,
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
+            None,
             None,
         );
         assert_eq!(outcome, Some(PollOutcome::Completed));
@@ -561,6 +576,7 @@ mod tests {
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
             Some(NonNull::from(&mut driver)),
+            None,
         );
         assert_eq!(outcome, Some(PollOutcome::Completed));
         let Some(slot) = slab.get(key) else {
@@ -586,6 +602,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
