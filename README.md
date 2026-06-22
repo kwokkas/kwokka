@@ -13,7 +13,7 @@
 > still change before 1.0. Orchestration and a Tokio compatibility layer
 > arrive in later releases.
 
-## Install
+## Installation
 
 Add Kwokka to your `Cargo.toml`:
 
