@@ -22,7 +22,7 @@ jobs:
       workflows: ${{ steps.gate.outputs.workflows }}
       toml: ${{ steps.gate.outputs.toml }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -46,7 +46,7 @@ jobs:
     if: needs.changes.outputs.workflows == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: bash .github/scripts/actionlint.sh
@@ -56,7 +56,7 @@ jobs:
     if: needs.changes.outputs.workflows == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: taiki-e/install-action@zizmor
@@ -67,7 +67,7 @@ jobs:
     if: needs.changes.outputs.toml == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: taiki-e/install-action@taplo-cli

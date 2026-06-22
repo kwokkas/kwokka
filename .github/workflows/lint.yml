@@ -25,7 +25,7 @@ jobs:
       code: ${{ steps.gate.outputs.code }}
       deps: ${{ steps.gate.outputs.deps }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -65,7 +65,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@nightly
@@ -78,7 +78,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-env
@@ -91,7 +91,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: crate-ci/typos@master
@@ -103,7 +103,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-env
@@ -117,7 +117,7 @@ jobs:
     env:
       RUSTDOCFLAGS: --cfg docsrs -D warnings
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-env
@@ -128,7 +128,7 @@ jobs:
     if: needs.changes.outputs.deps == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-env
@@ -140,7 +140,7 @@ jobs:
     if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -165,7 +165,7 @@ jobs:
     if: needs.changes.outputs.code == 'true'
     runs-on: kwokka-runner
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - uses: ./.github/actions/rust-env
