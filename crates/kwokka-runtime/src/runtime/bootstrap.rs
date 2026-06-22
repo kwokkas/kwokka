@@ -70,6 +70,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         &mut shard.run_queue,
         &mut shard.spawn_inbox,
         &mut shard.reap_queue,
+        &mut shard.timer_requests,
         shard.id,
         Some(NonNull::from(&mut shard.driver)),
         &shard.forward,
@@ -81,6 +82,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         &mut shard.run_queue,
         &mut shard.spawn_inbox,
         &mut shard.reap_queue,
+        &mut shard.timer_requests,
         shard.id,
         Some(NonNull::from(&mut shard.driver)),
     );

@@ -24,6 +24,7 @@ use kwokka_io::{
 };
 
 use crate::task::{JoinError, TaskRef, header::WakeData, slot::TaskSlot, state::TaskState};
+use crate::timer::request::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest};
 use crate::worker::inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox};
 use crate::worker::reap::{REAP_QUEUE_CAPACITY, ReapQueue};
 use kwokka_core::slab::{Slab, SlabKey};
@@ -70,6 +71,12 @@ pub(crate) struct PollFrame {
     /// `&mut`), so the count rides the frame and [`poll_one`] lands it on
     /// the header through the `&mut` it still legitimately holds.
     pub(crate) submitted_ops: AtomicU16,
+    /// The owning worker's timer-request inbox, or `None` for a test frame with
+    /// no timer wiring. A field disjoint from the task slab, reached during a
+    /// poll so a sleeping future can arm a timer without touching the wheel
+    /// directly; the run-loop drains it after the poll and registers each
+    /// request on the wheel against its own clock.
+    pub(crate) timer_requests: Option<NonNull<TimerInbox<TIMER_INBOX_CAPACITY>>>,
 }
 
 impl PollFrame {
@@ -93,6 +100,34 @@ impl PollFrame {
         // double-mutable-aliasing UB.
         let inbox = unsafe { &mut *self.inbox.as_ptr() };
         inbox.push(request)
+    }
+
+    /// Arms a timer for the polling task, returning `false` when no timer inbox
+    /// is installed (a test frame) or the inbox is full.
+    ///
+    /// The future records a relative `delay_ticks`; the run-loop computes the
+    /// absolute deadline against its clock when it drains the inbox after the
+    /// poll, so this path never reads the clock.
+    pub(crate) fn request_timer(&self, task_ref: TaskRef, delay_ticks: u64) -> bool {
+        let Some(timer_requests) = self.timer_requests else {
+            return false;
+        };
+        // SAFETY: Invariant -- `timer_requests` was formed from a
+        // `&mut TimerInbox` that no other live reference aliases for this call,
+        // so this `&mut` is unique and carries write provenance. The production
+        // caller (the worker run-loop) points it at `WorkerShard::timer_requests`,
+        // a field disjoint from `WorkerShard::tasks` the poll holds `&mut` on
+        // across the window, so the write never aliases the parent poll borrow.
+        // Precondition: the caller formed `timer_requests` from a non-aliased
+        // `&mut TimerInbox`, and one future polls at a time per worker, so at
+        // most one such `&mut` exists at once.
+        // Failure mode: aliasing the inbox with another live `&mut` (were it the
+        // same allocation as the borrowed task slab) is double-mutable-aliasing UB.
+        let timer_requests = unsafe { &mut *timer_requests.as_ptr() };
+        timer_requests.push(TimerRequest {
+            task_ref,
+            delay_ticks,
+        })
     }
 
     /// Records `parent` in the worker's reap queue for post-poll reclamation of
@@ -387,6 +422,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -407,6 +443,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: Some(child),
@@ -428,6 +465,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: Some(child),
@@ -459,6 +497,7 @@ mod tests {
                 tasks: NonNull::from(&mut slab),
                 driver: None,
                 wake_data: WakeData::EMPTY,
+                timer_requests: None,
                 submitted_ops: AtomicU16::new(0),
                 reap: NonNull::from(&mut reap),
                 first_child: Some(child),
@@ -478,6 +517,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: Some(child),
@@ -500,6 +540,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -545,6 +586,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -576,6 +618,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -598,6 +641,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -628,6 +672,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -650,6 +695,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -673,6 +719,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -703,6 +750,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -744,6 +792,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -766,6 +815,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -789,6 +839,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -812,6 +863,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,
@@ -835,6 +887,7 @@ mod tests {
             tasks: NonNull::from(&mut slab),
             driver: None,
             wake_data: WakeData::EMPTY,
+            timer_requests: None,
             submitted_ops: AtomicU16::new(0),
             reap: NonNull::from(&mut reap),
             first_child: None,

@@ -25,7 +25,11 @@ use crate::worker::{
 use crate::{
     scheduler::{dispatch::PollOutcome, queue::LocalRunQueue},
     task::{TaskRef, children::push_child, slot::TaskSlot},
-    timer::{clock::Clock, wheel::TimerWheel},
+    timer::{
+        clock::Clock,
+        request::{TIMER_INBOX_CAPACITY, TimerInbox},
+        wheel::TimerWheel,
+    },
 };
 use kwokka_core::slab::{Slab, SlabKey};
 
@@ -58,13 +62,10 @@ pub(crate) enum Tick {
 ///
 /// A task re-queued by a mid-poll reschedule waits for the next pass, so a
 /// single tick cannot spin on a self-rescheduling task.
-#[cfg_attr(
-    feature = "steal",
-    expect(
-        clippy::too_many_arguments,
-        reason = "the shard is destructured into disjoint borrows by design; \
-                  bundling them would recreate the double-&mut-self conflict"
-    )
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the shard is destructured into disjoint borrows by design; \
+              bundling them would recreate the double-&mut-self conflict"
 )]
 pub(crate) fn tick<C: Clock>(
     tasks: &mut Slab<TaskSlot>,
@@ -72,6 +73,7 @@ pub(crate) fn tick<C: Clock>(
     run_queue: &mut LocalRunQueue,
     spawn_inbox: &mut SpawnInbox<SPAWN_INBOX_CAPACITY>,
     reap: &mut ReapQueue<REAP_QUEUE_CAPACITY>,
+    timer_requests: &mut TimerInbox<TIMER_INBOX_CAPACITY>,
     worker_id: WorkerId,
     driver: Option<NonNull<DriverType>>,
     #[cfg(feature = "steal")] forward: &ForwardTable,
@@ -109,6 +111,7 @@ pub(crate) fn tick<C: Clock>(
             NonNull::from(&mut *spawn_inbox),
             NonNull::from(&mut *reap),
             driver,
+            Some(NonNull::from(&mut *timer_requests)),
         ) else {
             continue;
         };
@@ -116,6 +119,19 @@ pub(crate) fn tick<C: Clock>(
             run_queue.push(task_ref, tasks);
         }
         polled += 1;
+    }
+
+    // Drain timer arms requested during this tick's polls: turn each relative
+    // delay into an absolute deadline against this worker's clock and register
+    // it on the wheel. A full wheel drops the arm permanently -- the sleeping
+    // future then stays pending until its task is cancelled. The wheel is sized
+    // to the task slab, so a full wheel means every slot already holds a timer;
+    // no panic or UB, but the dropped sleep does not complete on its own.
+    while let Some(request) = timer_requests.pop() {
+        let deadline = timer.now_tick().saturating_add(request.delay_ticks);
+        // IGNORE: a full wheel returns Err; the arm is dropped and its future
+        // stays pending until cancelled (a full wheel needs every slot armed).
+        let _ = timer.register(request.task_ref, deadline);
     }
 
     if woke_any || polled > 0 {
@@ -182,7 +198,11 @@ mod tests {
     use crate::{
         scheduler::{dispatch::spawn_insert, queue::LocalRunQueue},
         task::{header::Slot, slot::TaskSlot, state::TaskState},
-        timer::{clock::Clock, wheel::TimerWheel},
+        timer::{
+            clock::Clock,
+            request::{TIMER_INBOX_CAPACITY, TimerInbox},
+            wheel::TimerWheel,
+        },
         worker::{
             WorkerId,
             inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
@@ -225,6 +245,7 @@ mod tests {
         spawn_inbox: &mut SpawnInbox<SPAWN_INBOX_CAPACITY>,
     ) -> Tick {
         let mut reap = ReapQueue::<REAP_QUEUE_CAPACITY>::new();
+        let mut timer_requests = TimerInbox::<TIMER_INBOX_CAPACITY>::new();
         #[cfg(feature = "steal")]
         {
             let forward = crate::scheduler::stealing::relocate::ForwardTable::new(1);
@@ -234,6 +255,7 @@ mod tests {
                 run_queue,
                 spawn_inbox,
                 &mut reap,
+                &mut timer_requests,
                 worker(0),
                 None,
                 &forward,
@@ -247,6 +269,7 @@ mod tests {
                 run_queue,
                 spawn_inbox,
                 &mut reap,
+                &mut timer_requests,
                 worker(0),
                 None,
             )

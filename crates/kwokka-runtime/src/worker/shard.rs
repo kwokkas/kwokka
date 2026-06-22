@@ -18,7 +18,11 @@ use crate::worker::{
 use crate::{
     scheduler::queue::LocalRunQueue,
     task::slot::TaskSlot,
-    timer::{clock::SystemClock, wheel::TimerWheel},
+    timer::{
+        clock::SystemClock,
+        request::{TIMER_INBOX_CAPACITY, TimerInbox},
+        wheel::TimerWheel,
+    },
 };
 use kwokka_core::slab::Slab;
 #[cfg(feature = "steal")]
@@ -59,6 +63,10 @@ pub(crate) struct WorkerShard {
     /// and drained after each tick by the reap path to free their settled
     /// children's slots. A field disjoint from `tasks`, like `spawn_inbox`.
     pub(crate) reap_queue: ReapQueue<REAP_QUEUE_CAPACITY>,
+    /// Timer arms requested mid-poll by sleeping futures. A field disjoint from
+    /// `tasks`, reached through the poll frame; drained after each tick, where
+    /// each relative delay becomes an absolute deadline on the timer wheel.
+    pub(crate) timer_requests: TimerInbox<TIMER_INBOX_CAPACITY>,
     /// Routes from this worker's retired husks to their tasks' new homes,
     /// recorded at ship time in the serve step. Sized to the slab, one
     /// entry per slot.
@@ -95,6 +103,7 @@ impl WorkerShard {
             run_queue: LocalRunQueue::new(),
             spawn_inbox: SpawnInbox::new(),
             reap_queue: ReapQueue::new(),
+            timer_requests: TimerInbox::new(),
             #[cfg(feature = "steal")]
             forward: ForwardTable::new(task_capacity),
             #[cfg(feature = "steal")]
