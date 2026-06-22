@@ -39,7 +39,17 @@ internals. The reports that matter most:
 - untrusted input that can corrupt memory
 
 A panic or a logic bug with no soundness angle is better as a normal bug
-report.
+report. A vulnerability in a dependency is best reported to that project
+first; let us know as well if it reaches kwokka and we will pull in the
+fix.
+
+## Safe harbor
+
+We support good-faith security research. If you make a real effort to
+follow this policy, steer clear of privacy violations and service
+disruption, and give us reasonable time to respond before any public
+disclosure, we will not pursue or support legal action against you for
+that research.
 
 ## What to expect
 
