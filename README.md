@@ -2,22 +2,37 @@
   <img src=".github/images/banner.png" alt="kwokka" />
 </p>
 
-<p align="center">
-  A completion-based async runtime for Rust, built on io_uring.
-</p>
-
 [![crates.io](https://img.shields.io/crates/v/kwokka.svg)](https://crates.io/crates/kwokka)
 [![docs.rs](https://docs.rs/kwokka/badge.svg)](https://docs.rs/kwokka)
 [![CI](https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg)](https://github.com/kwokkas/kwokka/actions/workflows/test.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85.0-blue.svg)](#supported-rust-versions)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
+> [!WARNING]
+> Kwokka is at 0.1.0. The public API is settled but pre-1.0 and can
+> still change before 1.0. Orchestration and a Tokio compatibility layer
+> arrive in later releases.
+
 ## Install
+
+Add Kwokka to your `Cargo.toml`:
 
 ```toml
 [dependencies]
 kwokka = "0.1"
 ```
+
+The runtime and structured concurrency come by default. TCP, files, and
+work-stealing migration are cargo features, so a minimal build skips
+them:
+
+```toml
+[dependencies]
+kwokka = { version = "0.1", features = ["full"] }
+```
+
+`full` enables `net`, `fs`, and `stealing`. Pick them one at a time if
+you only need some.
 
 ## What is Kwokka?
 
@@ -53,20 +68,25 @@ that move toward idle workers.
 
 ## Examples
 
-Thread-per-core (`affine`):
+A thread-per-core echo server on `affine`:
 
 ```rust
-use std::time::Duration;
-
-use kwokka::time::sleep;
+use kwokka::net::TcpListener;
 
 #[kwokka::main(affine)]
-async fn main() {
-    sleep(Duration::from_millis(10)).await;
+async fn main() -> std::io::Result<()> {
+    let listener = TcpListener::bind("127.0.0.1:8080")?;
+    let stream = listener.accept().await?;
+
+    let (read, buf) = stream.recv::<1024>().await;
+    let len = read?;
+    stream.send(buf, len).await?;
+
+    Ok(())
 }
 ```
 
-Work-stealing (`stealing`):
+Fanning work across the stealing crew with a `Send` scope:
 
 ```rust
 use kwokka::task::scope_send;
@@ -75,7 +95,9 @@ use kwokka::task::scope_send;
 async fn main() {
     scope_send(|crew| {
         for _ in 0..8 {
-            crew.spawn(async {}).ok();
+            crew.spawn(async {
+                // a unit of work the crew can relocate toward an idle core
+            }).ok();
         }
     })
     .await;
@@ -85,6 +107,9 @@ async fn main() {
 > [!NOTE]
 > The `stealing` cargo feature turns on task migration. Without it,
 > `stealing` mode still runs but keeps each task on its starting worker.
+
+> [!TIP]
+> The full API reference lives on [docs.rs](https://docs.rs/kwokka).
 
 To embed the runtime yourself, build `Runtime::affine()` or
 `Runtime::stealing()` and drive it with `block_on`.
@@ -96,16 +121,17 @@ minimum supported version is treated as a minor-version change.
 
 ## Supported Linux kernels
 
-io_uring is the primary backend and needs Linux 5.11 or newer. On older
-kernels Kwokka falls back to epoll. Some io_uring features, such as
-provided buffers and zero-copy send, need newer kernels and turn on only
-when the running kernel supports them.
+> [!IMPORTANT]
+> io_uring needs Linux 5.11 or newer. On older kernels Kwokka falls back
+> to epoll automatically.
+
+Some io_uring features, such as provided buffers and zero-copy send, need
+newer kernels and turn on only when the running kernel supports them.
 
 ## Contributing
 
 Contributions are welcome. Open an issue to discuss a change, or send a
-pull request. A fuller contributor guide arrives with the public
-release.
+pull request. A fuller contributor guide arrives with the public release.
 
 ## License
 
