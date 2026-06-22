@@ -1,7 +1,7 @@
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="../../.github/images/banner-dark.png">
-    <img src="../../.github/images/banner-light.png" alt="kwokka">
+    <source media="(prefers-color-scheme: dark)" srcset="https://cdn.kwokka.dev/images/banner-dark.png">
+    <img src="https://cdn.kwokka.dev/images/banner-light.png" alt="kwokka">
   </picture>
 </p>
 
