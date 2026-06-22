@@ -4,6 +4,16 @@ Thanks for your interest in kwokka. It is an early-stage project (0.1.x),
 so the most useful help right now is bug reports, small focused fixes,
 and discussion about where the API should go.
 
+> [!IMPORTANT]
+> kwokka officially allows AI-assisted contributions. Tools that generate
+> or help write code are fine to use. What is not optional is that you,
+> the author, understand the code you submit and can explain how it works
+> and why it is correct. You are responsible for every line in your patch
+> as if you had written it by hand: its correctness, its license
+> compatibility (a tool may reproduce code under a license that is not
+> compatible with Apache-2.0 or MIT, and catching that is on you), and how
+> it fits the design. A patch the author cannot explain will not be merged.
+
 ## Before you start
 
 kwokka is maintained by one person for now, and the public API is still
@@ -18,17 +28,6 @@ saves you from building something that does not fit the design.
 - For a feature or an API change, open the issue first.
 - Security issues do not belong in public issues. See
   [SECURITY.md](SECURITY.md).
-
-## AI-assisted contributions
-
-> [!IMPORTANT]
-> kwokka officially allows AI-assisted contributions. Tools that generate
-> or help write code are fine to use. What is not optional is that you,
-> the author, understand the code you submit and can explain how it works
-> and why it is correct. You are responsible for every line in your patch
-> as if you had written it by hand, including its correctness, its
-> licensing, and how it fits the design. A patch the author cannot explain
-> will not be merged.
 
 ## Development
 
@@ -57,8 +56,9 @@ Common types are `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, and
 commit is fine, and a body or footer is welcome wherever it adds context.
 The PR description is what gets reviewed, so the reasoning belongs there.
 
-**Description.** Fill in the template: what the change completes, and how
-it is proven. New `unsafe` carries a `// SAFETY:` comment, and a new
+**Description.** Fill in the PR template: what the change completes, and
+how it is proven. A pull request that does not follow the template will
+not be accepted. New `unsafe` carries a `// SAFETY:` comment, and a new
 concurrency primitive comes with a loom model or a note on why it does
 not need one.
 
