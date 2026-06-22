@@ -2,8 +2,7 @@
 
 /// Logical task scope, a raw `u32` index with no heap allocation.
 ///
-/// The `u32` is the scope index directly. A name-to-index interning pool
-/// is future work, not part of this type today.
+/// The `u32` is the scope index directly: no interning, no allocation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct Namespace(pub u32);

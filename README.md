@@ -136,7 +136,8 @@ newer kernels and turn on only when the running kernel supports them.
 ## Contributing
 
 Contributions are welcome. Open an issue to discuss a change, or send a
-pull request. A fuller contributor guide arrives with the public release.
+pull request. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for the full
+contributor guide.
 
 ## License
 

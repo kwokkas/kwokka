@@ -83,7 +83,7 @@ pub(crate) fn build_socket(domain: i32, socket_type: i32, protocol: i32) -> Entr
 ///
 /// # Note
 ///
-// needs a `how` parameter before partial shutdown (SHUT_RD/SHUT_WR) works
+/// Needs a `how` parameter before partial shutdown (`SHUT_RD`/`SHUT_WR`) works.
 pub(crate) fn build_shutdown(fd: i32, flags: OpFlags) -> Entry {
     if flags.fixed_fd {
         opcode::Shutdown::new(Fixed(fd as u32), libc::SHUT_RDWR).build()

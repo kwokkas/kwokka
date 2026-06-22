@@ -3,8 +3,7 @@
 /// Marker trait for types with stable, `repr(C)` byte layout.
 ///
 /// The stable layout lets a value be treated as raw bytes. A bump
-/// allocator can use the bound to skip drop on reset, and a distributed
-/// zero-copy wire format is a later use of the same guarantee.
+/// allocator can use the bound to skip drop on reset.
 ///
 /// # Safety
 ///

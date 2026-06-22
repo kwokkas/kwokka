@@ -23,6 +23,7 @@ impl WheelSlot {
     }
 
     /// Returns `true` when no entries are linked in this slot.
+    #[allow(dead_code, reason = "drop-cancel deferred to 0.2.0")]
     pub(crate) const fn is_empty(&self) -> bool {
         self.head.is_none()
     }

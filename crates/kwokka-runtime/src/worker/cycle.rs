@@ -36,7 +36,7 @@ use kwokka_core::slab::{Slab, SlabKey};
 /// Whether a [`tick`] advanced any work.
 ///
 /// The blocking run-loop -- which composes the driver completion drain and
-/// the park step around this tick once those paths land -- parks only on
+/// the park step around this tick -- parks only on
 /// [`Tick::Idle`]: an idle tick means the run queue drained empty and no
 /// timer fired, so the worker has nothing to do until the next wake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,12 +162,12 @@ pub(crate) fn drain_spawns(
         *pip_seq += 1;
         pending.cell.header_mut().set_pip(pip);
         let Ok(key) = tasks.insert(pending.cell) else {
-            // TODO(pablo): 0.1.0 treats a full worker task slab as a
-            // configuration error and aborts rather than silently dropping the
-            // child (a lost-task hazard, not benign backpressure). Unbounded
-            // dynamic fan-out is the roadmap, so bounded backpressure -- surfacing
-            // to the parent or capping the spawn rate -- replaces this panic in
-            // 0.2.0+.
+            // TODO(pablo): replace this panic with bounded backpressure in 0.2.0 (#116).
+            // 0.1.0 treats a full worker task slab as a configuration error and
+            // aborts rather than silently dropping the child (a lost-task hazard,
+            // not benign backpressure). Unbounded dynamic fan-out is the roadmap, so
+            // bounded backpressure -- surfacing to the parent or capping the spawn
+            // rate -- is the replacement.
             panic!(
                 "worker task slab full: a child spawn exceeded capacity; \
                  increase it via RuntimeBuilder::task_capacity"

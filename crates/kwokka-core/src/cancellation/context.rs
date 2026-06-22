@@ -5,7 +5,7 @@ use crate::{
     id::Pip,
 };
 
-/// Full state of a cancellation event - observability-friendly metadata.
+/// Full state of a cancellation event, carrying source identity and policy.
 ///
 /// Carries the originating [`Pip`] across propagation so a consumer can
 /// reconstruct cancel chains by source.

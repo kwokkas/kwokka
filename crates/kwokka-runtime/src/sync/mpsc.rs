@@ -13,10 +13,6 @@
 //! drives it with many producers behind the same API.
 
 #![allow(
-    dead_code,
-    reason = "MpscRing is wired up by worker::registry, ported in a later runtime PR"
-)]
-#![allow(
     clippy::redundant_pub_crate,
     reason = "pub(crate) on module-private items"
 )]

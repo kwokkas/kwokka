@@ -18,7 +18,9 @@ pub(crate) trait Clock: Send + Sync + 'static {
 
 /// Wall-clock time source backed by [`Instant`].
 ///
-/// Converts elapsed nanoseconds to ticks using [`TICK_NS`].
+/// [`now`](SystemClock::now) returns the elapsed milliseconds since
+/// construction, where one millisecond is one wheel tick
+/// (1 ms = [`TICK_NS`] ns).
 pub(crate) struct SystemClock {
     start: Instant,
 }
