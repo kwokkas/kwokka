@@ -41,6 +41,8 @@ fn accept_returns_connection_fd() {
     // Hold the connection open until the accept has resolved.
     drop(client);
 
+    // AcceptFuture resolves to the accepted descriptor as a raw i32; a
+    // non-negative value is a live fd, a negative one is -errno.
     assert!(result >= 0, "the accept completed with an error: {result}");
     assert_ne!(
         result,

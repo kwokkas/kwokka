@@ -19,7 +19,6 @@ rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/kwokkas/kwokka"
 homepage = "https://kwokka.dev"
-documentation = "https://docs.kwokka.dev"
 
 # Version policy: the facade ships at 0.1.0 (a stable public surface);
 # the internal crates ship at 0.0.x so semver-checks treats every change

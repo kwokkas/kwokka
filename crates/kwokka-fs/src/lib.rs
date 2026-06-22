@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
 //! Files, directories, paths, and pipes for the kwokka runtime.
 //!
 //! Filesystem endpoints live here, speaking through the pinned

@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
 //! Foundational types shared by all kwokka crates.
 //!
 //! Defines the leaf vocabulary on which the rest of the workspace builds:

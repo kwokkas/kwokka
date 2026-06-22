@@ -1,3 +1,5 @@
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
 //! Procedural macros lowering onto the `kwokka` facade.
 //!
 //! The generated code imports only from the facade, never from the

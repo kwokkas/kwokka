@@ -1,4 +1,6 @@
-//! Completion-based async runtime with integrated orchestration.
+#![doc(html_logo_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+#![doc(html_favicon_url = "https://cdn.kwokka.dev/images/icon-light.png")]
+//! Completion-based async runtime with optional orchestration.
 //!
 //! This crate is the sole user entry point: every item re-exported here
 //! is the supported surface over the workspace crates, and nothing
@@ -10,6 +12,7 @@
 //! Tasks fan out through structured scopes ([`task::scope`] and the
 //! `Send`-bounded [`task::scope_send`]) rather than a free-standing
 //! spawn, so every child settles before its scope resolves.
+//! [`time::sleep`] suspends a task for a wall-clock duration.
 //!
 //! Network and filesystem endpoints live under the `net` and `fs`
 //! modules, each gated behind its own feature (`net`, `fs`, or `full`)

@@ -2,6 +2,7 @@
 name = "kwokka-fs"
 version = "0.0.1"
 description = "files, directories, paths, and pipes for the kwokka runtime"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

@@ -1,85 +1,110 @@
-# Kwokka
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://cdn.kwokka.dev/images/banner-dark.png">
+    <img src="https://cdn.kwokka.dev/images/banner-light.png" alt="kwokka">
+  </picture>
+</p>
 
-A completion-based async runtime for Rust.
+[![crates.io](https://img.shields.io/crates/v/kwokka.svg)](https://crates.io/crates/kwokka)
+[![docs.rs](https://docs.rs/kwokka/badge.svg)](https://docs.rs/kwokka)
+[![CI](https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg)](https://github.com/kwokkas/kwokka/actions/workflows/test.yml)
+[![MSRV](https://img.shields.io/badge/MSRV-1.85.0-blue.svg)](#supported-rust-versions)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-Kwokka submits I/O operations to the kernel and reacts when they
-complete, instead of polling file descriptors for readiness. On Linux
-that maps directly onto io_uring. An epoll fallback and a kqueue
-backend for macOS and BSD expose the same completion API everywhere
-else.
+> [!WARNING]
+> Kwokka is at 0.1.0. The public API is settled but pre-1.0 and can
+> still change before 1.0. Orchestration and a Tokio compatibility layer
+> arrive in later releases.
 
-> [!IMPORTANT]
-> Early development (0.1.0). The runtime, structured concurrency, TCP,
-> and file I/O below are implemented. The public API is settled but
-> pre-1.0 and can still change. Orchestration and Tokio compatibility
-> are planned for later releases.
+## Installation
 
-## Design
+Add Kwokka to your `Cargo.toml`:
 
-Four rules the codebase holds itself to:
+```toml
+[dependencies]
+kwokka = "0.1"
+```
 
-- Completion-based I/O at the core. The readiness backends, epoll and
-  kqueue, are adapted to completion internally, so user code sees one
-  model on every platform.
-- Zero-cost abstraction. Dispatch is enum-based. There are no trait
-  objects and no vtables in the runtime.
-- Zero-copy data flow. I/O runs through pinned inline buffers that the
-  operation's future owns, with no per-call heap allocation. Bytes are
-  copied only when they cross a real ownership boundary.
-- Index-based ownership. Tasks live in per-worker generational slabs
-  and are addressed by index rather than reference counting.
+The runtime and structured concurrency come by default. TCP, files, and
+work-stealing migration are cargo features, so a minimal build skips
+them:
 
-## Scheduler modes
+```toml
+[dependencies]
+kwokka = { version = "0.1", features = ["full"] }
+```
 
-There are two scheduler modes, and you pick one explicitly:
-`#[kwokka::main]` takes the choice as a bare scheduler argument, and
-there is no default. A phantom `Mode` type parameter (`Affine` or
-`Stealing`) turns a cross-mode mistake into a compile error rather than
-a runtime panic.
+`full` enables `net`, `fs`, and `stealing`. Pick them one at a time if
+you only need some.
 
-| Argument   | Scheduler       | Tasks                                 |
-| ---------- | --------------- | ------------------------------------- |
-| `affine`   | thread-per-core | `!Send`, pinned to the calling thread |
-| `stealing` | work-stealing   | `Send`, relocated toward idle workers |
+## What is Kwokka?
+
+Kwokka is a completion-native async framework for Rust, built on
+io_uring. Instead of polling file descriptors for readiness, it hands
+operations to the kernel and reacts when they complete. io_uring is the
+Linux backend, with epoll as a fallback, kqueue for macOS and the BSDs,
+and IOCP for Windows planned. They all sit behind one completion API.
+
+You choose the scheduler explicitly. `affine` is thread-per-core with
+tasks pinned to their thread, and `stealing` is work-stealing with tasks
+that move toward idle workers.
+
+> [!TIP]
+> A phantom `Mode` type makes mixing `affine` and `stealing` a compile
+> error rather than a runtime panic. The dual-scheduler runtime is the
+> foundation, and an optional orchestration layer for pipelines, batches,
+> and DAGs builds on top of it in later releases.
+
+## Features
+
+- Completion-native I/O on io_uring, with epoll and kqueue behind the
+  same API.
+- Two schedulers you pick explicitly: thread-per-core (`affine`) and
+  work-stealing (`stealing`).
+- Enum-based dispatch, with no trait objects or vtables in the runtime.
+- Zero-copy reads and writes through pinned inline buffers, with no
+  per-call heap allocation.
+- An allocation-free hot path: task poll, wake, and I/O submission touch
+  no heap in steady state.
+- Index-addressed tasks in per-worker generational slabs, with no
+  reference counting.
+- Structured concurrency through scopes, so a scope waits for its
+  children.
+- TCP and file I/O behind the `net` and `fs` features.
+
+## Examples
+
+The full API reference lives on [docs.rs](https://docs.rs/kwokka).
+
+A thread-per-core echo server on `affine`:
 
 ```rust
-use kwokka::fs::File;
+use kwokka::net::TcpListener;
 
 #[kwokka::main(affine)]
 async fn main() -> std::io::Result<()> {
-    let file = File::open("Cargo.toml").await?;
-    let (read, buf) = file.read::<1024>(0).await;
-    let read = read?;
-    // the first `read` bytes are now in `buf`
+    let listener = TcpListener::bind("127.0.0.1:8080")?;
+    let stream = listener.accept().await?;
+
+    let (read, buf) = stream.recv::<1024>().await;
+    let len = read?;
+    stream.send(buf, len).await?;
+
     Ok(())
 }
 ```
 
-To embed the runtime instead of using the attribute, build
-`Runtime::affine()` or `Runtime::stealing()` and drive it with
-`block_on`. `RuntimeBuilder` sets custom worker capacities.
-
-## Structured concurrency
-
-Tasks fan out through scopes rather than a free-standing spawn, so
-every child settles before its scope resolves. `task::scope` runs its
-children on the affine worker. `task::scope_send` is the `Send`-bounded
-twin whose children may migrate across the stealing crew.
-`task::yield_now` hands the worker back to the scheduler for one pass.
-
-A `scope_send` fans a batch of Send tasks across the stealing crew, and
-the scope resolves once they all finish:
+A work-stealing fan-out on `stealing`:
 
 ```rust
 use kwokka::task::scope_send;
 
 #[kwokka::main(stealing)]
 async fn main() {
-    // fan out eight Send tasks for the crew to relocate toward idle cores
     scope_send(|crew| {
         for _ in 0..8 {
             crew.spawn(async {
-                // a unit of work
+                // a unit of work the crew can relocate toward an idle core
             }).ok();
         }
     })
@@ -87,25 +112,34 @@ async fn main() {
 }
 ```
 
-## Network and filesystem
+> [!NOTE]
+> The `stealing` cargo feature turns on task migration. Without it,
+> `stealing` mode still runs but keeps each task on its starting worker.
 
-Endpoints are feature-gated behind `net`, `fs`, or `full`, so a minimal
-build pulls in neither. Reads and writes run through the stream's own
-pinned inline buffer of const-generic size, with no heap allocation.
+To embed the runtime yourself, build `Runtime::affine()` or
+`Runtime::stealing()` and drive it with `block_on`.
 
-`net::TcpListener` binds a port and accepts connections. The accepted
-`net::TcpStream` converses through `recv` and `send`. A client-side
-connect arrives in a later release.
+## Supported Rust Versions
 
-`fs::File` opens a handle and reads or writes it at an offset. Opening
-is async-shaped over a one-shot blocking syscall for now. The
-ring-lowered open swaps in later with no change a caller can see.
+Kwokka supports Rust 1.85.0 and later on edition 2024. Raising the
+minimum supported version is treated as a minor-version change.
 
-## Minimum supported Rust version
+## Supported Linux kernels
 
-Rust 1.85.0, edition 2024.
+> [!IMPORTANT]
+> io_uring needs Linux 5.11 or newer. On older kernels Kwokka falls back
+> to epoll automatically.
+
+Some io_uring features, such as provided buffers and zero-copy send, need
+newer kernels and turn on only when the running kernel supports them.
+
+## Contributing
+
+Contributions are welcome. Open an issue to discuss a change, or send a
+pull request. A fuller contributor guide arrives with the public release.
 
 ## License
 
-Licensed under either the Apache License 2.0 or the MIT license, at
-your option.
+Licensed under either of Apache License 2.0
+([LICENSE-APACHE](LICENSE-APACHE)) or the MIT license
+([LICENSE-MIT](LICENSE-MIT)), at your option.
