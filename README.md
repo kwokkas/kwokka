@@ -2,31 +2,29 @@
   <img src=".github/images/banner.png" alt="kwokka" />
 </p>
 
-<p align="center">
-  <a href="https://crates.io/crates/kwokka"><img src="https://img.shields.io/crates/v/kwokka.svg" alt="crates.io"></a>
-  <a href="https://docs.rs/kwokka"><img src="https://docs.rs/kwokka/badge.svg" alt="docs.rs"></a>
-  <a href="https://github.com/kwokkas/kwokka/actions/workflows/test.yml"><img src="https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg" alt="CI"></a>
-  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="license"></a>
-  <a href="#minimum-supported-rust-version"><img src="https://img.shields.io/badge/MSRV-1.85.0-blue.svg" alt="MSRV"></a>
-</p>
+[![crates.io](https://img.shields.io/crates/v/kwokka.svg)](https://crates.io/crates/kwokka)
+[![docs.rs](https://docs.rs/kwokka/badge.svg)](https://docs.rs/kwokka)
+[![CI](https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg)](https://github.com/kwokkas/kwokka/actions/workflows/test.yml)
+[![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-<p align="center">
-  A completion-based async runtime for Rust, built on io_uring.
-</p>
-
-Kwokka hands I/O to the kernel and waits for completion instead of
-polling for readiness. There are two schedulers, thread-per-core and
+Kwokka is a completion-based async runtime for Rust, built on io_uring.
+It hands I/O to the kernel and waits for completion instead of polling
+for readiness. There are two schedulers, thread-per-core and
 work-stealing, and you pick one explicitly.
 
-## Quick start
+## Examples
 
-```toml
-[dependencies]
-kwokka = "0.1"
-```
+Thread-per-core (`affine`):
 
 ```rust
-#[kwokka::main(affine)] // or `stealing`
+#[kwokka::main(affine)]
+async fn main() {}
+```
+
+Work-stealing (`stealing`):
+
+```rust
+#[kwokka::main(stealing)]
 async fn main() {}
 ```
 
@@ -43,28 +41,6 @@ two a compile error. For manual control, build `Runtime::affine()` or
   addressed by index.
 - Zero-copy I/O through pinned inline buffers, with no per-call heap.
 - Enum dispatch only. No trait objects, no vtables in the runtime.
-
-## Platform support
-
-| Platform      | Backend  | Status           |
-| ------------- | -------- | ---------------- |
-| Linux 5.11+   | io_uring | Primary          |
-| Linux (older) | epoll    | Fallback         |
-| macOS, BSD    | kqueue   | Supported        |
-| Windows       | IOCP     | Planned (0.2.0+) |
-
-## Cargo features
-
-| Feature    | Enables                              |
-| ---------- | ------------------------------------ |
-| `net`      | TCP listener and stream              |
-| `fs`       | file open, read, and write           |
-| `stealing` | task migration in work-stealing mode |
-| `full`     | `net`, `fs`, and `stealing`          |
-
-## Minimum supported Rust version
-
-Rust 1.85.0, edition 2024.
 
 ## License
 
