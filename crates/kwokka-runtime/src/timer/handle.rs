@@ -2,10 +2,6 @@
 //! conversion for the intrusive timer lists.
 
 #![allow(
-    dead_code,
-    reason = "timer registration and cancellation are pending scheduler wire-up"
-)]
-#![allow(
     clippy::redundant_pub_crate,
     reason = "pub(crate) on module-private items"
 )]

@@ -280,10 +280,9 @@ impl BumpAllocator {
     /// Transitions Frozen -> Build, runs LIFO drops, and bumps the generation.
     ///
     /// Every pointer a prior `alloc*` call returned dangles after this
-    /// call. The arena keeps no outstanding-handle count, so ensuring
-    /// none is live at reset is the caller's responsibility, which keeps
-    /// the reset path free of atomics. A higher-level coordinator that
-    /// owns the allocator is expected to enforce that guard.
+    /// call. The arena keeps no outstanding-handle count, so the caller
+    /// ensures no live pointer remains at reset, which keeps the reset
+    /// path free of atomics.
     pub fn reset(&mut self) {
         self.run_drops();
         self.cursor = 0;

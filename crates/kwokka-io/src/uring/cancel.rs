@@ -17,6 +17,9 @@ use crate::{CancelError, operation::SubmitToken};
 /// `IORING_OP_ASYNC_CANCEL` returns 0 on success, `-ENOENT` if the
 /// target was not found, `-EALREADY` if already completed.
 pub(crate) const fn map_cancel_result(result: i32) -> Result<(), CancelError> {
+    // ABI: errno values per io_uring_prep_cancel.3 and
+    // io_uring_cancelation.7 -- -ENOENT (-2) target not found,
+    // -EALREADY (-114) already in progress / completed.
     match result {
         0 => Ok(()),
         -2 => Err(CancelError::NotFound),

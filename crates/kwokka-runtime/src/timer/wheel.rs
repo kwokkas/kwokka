@@ -66,6 +66,7 @@ impl<C: Clock> TimerWheel<C> {
 
     /// Cancel a timer. Returns `true` if the entry was found and removed.
     #[must_use]
+    #[allow(dead_code, reason = "drop-cancel deferred to 0.2.0")]
     pub(crate) fn cancel(&mut self, handle: TimerHandle) -> bool {
         if self.entries.get(handle.key()).is_none() {
             return false;
@@ -107,6 +108,7 @@ impl<C: Clock> TimerWheel<C> {
     }
 
     /// Current tick of the wheel.
+    #[allow(dead_code, reason = "drop-cancel deferred to 0.2.0")]
     pub(crate) const fn current_tick(&self) -> u64 {
         self.current_tick
     }
