@@ -2,24 +2,38 @@
   <img src=".github/images/banner.png" alt="kwokka" />
 </p>
 
+<p align="center">
+  A completion-based async runtime for Rust, built on io_uring.
+</p>
+
 [![crates.io](https://img.shields.io/crates/v/kwokka.svg)](https://crates.io/crates/kwokka)
 [![docs.rs](https://docs.rs/kwokka/badge.svg)](https://docs.rs/kwokka)
 [![CI](https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg)](https://github.com/kwokkas/kwokka/actions/workflows/test.yml)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85.0-blue.svg)](#supported-rust-versions)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
+## Install
+
+```toml
+[dependencies]
+kwokka = "0.1"
+```
+
 ## What is Kwokka?
 
 Kwokka is a completion-based async runtime for Rust, built on io_uring.
 Instead of polling file descriptors for readiness, it hands operations
-to the kernel and reacts when they complete. On Linux that maps onto
-io_uring, with an epoll fallback and a kqueue backend for macOS and the
-BSDs behind the same API.
+to the kernel and reacts when they complete. io_uring is the Linux
+backend, with epoll as a fallback, kqueue for macOS and the BSDs, and
+IOCP for Windows planned. They all sit behind one completion API.
 
 You choose the scheduler explicitly. `affine` is thread-per-core with
 tasks pinned to their thread, and `stealing` is work-stealing with tasks
-that move toward idle workers. A phantom `Mode` type makes mixing the
-two a compile error rather than a runtime panic.
+that move toward idle workers.
+
+> [!TIP]
+> A phantom `Mode` type makes mixing `affine` and `stealing` a compile
+> error rather than a runtime panic.
 
 ## Features
 
@@ -42,16 +56,35 @@ two a compile error rather than a runtime panic.
 Thread-per-core (`affine`):
 
 ```rust
+use std::time::Duration;
+
+use kwokka::time::sleep;
+
 #[kwokka::main(affine)]
-async fn main() {}
+async fn main() {
+    sleep(Duration::from_millis(10)).await;
+}
 ```
 
 Work-stealing (`stealing`):
 
 ```rust
+use kwokka::task::scope_send;
+
 #[kwokka::main(stealing)]
-async fn main() {}
+async fn main() {
+    scope_send(|crew| {
+        for _ in 0..8 {
+            crew.spawn(async {}).ok();
+        }
+    })
+    .await;
+}
 ```
+
+> [!NOTE]
+> The `stealing` cargo feature turns on task migration. Without it,
+> `stealing` mode still runs but keeps each task on its starting worker.
 
 To embed the runtime yourself, build `Runtime::affine()` or
 `Runtime::stealing()` and drive it with `block_on`.
