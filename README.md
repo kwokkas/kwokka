@@ -36,11 +36,11 @@ you only need some.
 
 ## What is Kwokka?
 
-Kwokka is a completion-based async runtime for Rust, built on io_uring.
-Instead of polling file descriptors for readiness, it hands operations
-to the kernel and reacts when they complete. io_uring is the Linux
-backend, with epoll as a fallback, kqueue for macOS and the BSDs, and
-IOCP for Windows planned. They all sit behind one completion API.
+Kwokka is a completion-native async framework for Rust, built on
+io_uring. Instead of polling file descriptors for readiness, it hands
+operations to the kernel and reacts when they complete. io_uring is the
+Linux backend, with epoll as a fallback, kqueue for macOS and the BSDs,
+and IOCP for Windows planned. They all sit behind one completion API.
 
 You choose the scheduler explicitly. `affine` is thread-per-core with
 tasks pinned to their thread, and `stealing` is work-stealing with tasks
@@ -50,9 +50,13 @@ that move toward idle workers.
 > A phantom `Mode` type makes mixing `affine` and `stealing` a compile
 > error rather than a runtime panic.
 
+The dual-scheduler runtime is the foundation. An optional orchestration
+layer for pipelines, batches, and DAGs builds on top of it in later
+releases.
+
 ## Features
 
-- Completion-based I/O on io_uring, with epoll and kqueue behind the
+- Completion-native I/O on io_uring, with epoll and kqueue behind the
   same API.
 - Two schedulers you choose explicitly: thread-per-core (`affine`) and
   work-stealing (`stealing`).
@@ -60,6 +64,8 @@ that move toward idle workers.
   or vtables.
 - Zero-copy reads and writes through pinned inline buffers, with no
   per-call heap allocation.
+- No heap on the hot path. Task poll, wake, and I/O submission allocate
+  nothing in steady state.
 - Index-based ownership. Tasks live in per-worker generational slabs and
   carry no reference counting.
 - Structured concurrency through scopes, so a scope waits for its
@@ -67,6 +73,9 @@ that move toward idle workers.
 - TCP and file I/O behind the `net` and `fs` features.
 
 ## Examples
+
+> [!TIP]
+> The full API reference lives on [docs.rs](https://docs.rs/kwokka).
 
 A thread-per-core echo server on `affine`:
 
@@ -107,9 +116,6 @@ async fn main() {
 > [!NOTE]
 > The `stealing` cargo feature turns on task migration. Without it,
 > `stealing` mode still runs but keeps each task on its starting worker.
-
-> [!TIP]
-> The full API reference lives on [docs.rs](https://docs.rs/kwokka).
 
 To embed the runtime yourself, build `Runtime::affine()` or
 `Runtime::stealing()` and drive it with `block_on`.
