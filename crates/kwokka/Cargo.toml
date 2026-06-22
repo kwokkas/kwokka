@@ -33,3 +33,28 @@ workspace = true
 
 [package.metadata.cargo-machete]
 ignored = ["kwokka-core", "kwokka-macros", "kwokka-runtime", "kwokka-net", "kwokka-fs"]
+
+# Feature-free examples; auto-discovery would find them, but the explicit
+# entries keep the example set documented alongside the gated ones.
+[[example]]
+name = "affine"
+
+[[example]]
+name = "sleep"
+
+[[example]]
+name = "scope"
+
+# Gated examples: required-features keeps `cargo build --examples` (no
+# features) from compiling them, so a minimal build stays minimal.
+[[example]]
+name = "stealing"
+required-features = ["stealing"]
+
+[[example]]
+name = "tcp_echo"
+required-features = ["net"]
+
+[[example]]
+name = "file_read"
+required-features = ["fs"]
