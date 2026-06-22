@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/images/banner.svg" alt="kwokka" />
+  <img src=".github/images/banner.png" alt="kwokka" />
 </p>
 
 <p align="center">
