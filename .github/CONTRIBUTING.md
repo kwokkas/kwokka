@@ -13,43 +13,54 @@ saves you from building something that does not fit the design.
 
 - Bug reports and feature ideas go through the
   [issue tracker](https://github.com/kwokkas/kwokka/issues/new/choose).
-  For a feature or an API change, open the issue first.
+  Use the bug report or feature request template. The tracking and work
+  item templates are for maintainers.
+- For a feature or an API change, open the issue first.
 - Security issues do not belong in public issues. See
   [SECURITY.md](SECURITY.md).
 
+## AI-assisted contributions
+
+> [!IMPORTANT]
+> kwokka officially allows AI-assisted contributions. Tools that generate
+> or help write code are fine to use. What is not optional is that you,
+> the author, understand the code you submit and can explain how it works
+> and why it is correct. You are responsible for every line in your patch
+> as if you had written it by hand, including its correctness, its
+> licensing, and how it fits the design. A patch the author cannot explain
+> will not be merged.
+
 ## Development
 
-kwokka targets Rust 1.85.0 on edition 2024. The primary platform is
-Linux with io_uring; epoll and kqueue are the fallbacks.
-
-Build and test the workspace:
-
-```bash
-cargo build --workspace
-cargo test --workspace
-```
-
-Before you open a PR, run what CI runs:
-
-```bash
-cargo +nightly fmt --all --check
-cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-cargo doc --workspace --no-deps
-```
-
-The format check needs nightly because the rustfmt config uses
-nightly-only options.
+kwokka targets Rust 1.85.0 on edition 2024. The primary platform is Linux
+with io_uring; epoll and kqueue are the fallbacks. CI checks formatting,
+clippy with warnings denied, the test suite, and the docs, so it pays to
+run those locally before you push.
 
 ## Pull requests
 
-- Keep each PR to one logical change. Small PRs are easier to review and
-  land sooner.
-- Give the PR a [conventional-commit](https://www.conventionalcommits.org)
-  title, such as `fix: handle short reads in the recv future`.
-- Fill in the template: what the change completes, and how it is proven.
-  New `unsafe` carries a `// SAFETY:` comment, and a new concurrency
-  primitive comes with a loom model or a note on why it does not need one.
+Keep each PR to one logical change. Smaller PRs are easier to review and
+land sooner.
+
+**Title.** The PR title follows [conventional commits](https://www.conventionalcommits.org):
+a `type:` prefix and a short summary, with no scope in parentheses and 50
+characters or fewer. For example:
+
+```
+fix: handle short reads in the recv future
+```
+
+Common types are `feat`, `fix`, `docs`, `refactor`, `test`, `perf`, and
+`chore`.
+
+**Commits.** Commit messages inside the PR are your call. A title-only
+commit is fine, and a body or footer is welcome wherever it adds context.
+The PR description is what gets reviewed, so the reasoning belongs there.
+
+**Description.** Fill in the template: what the change completes, and how
+it is proven. New `unsafe` carries a `// SAFETY:` comment, and a new
+concurrency primitive comes with a loom model or a note on why it does
+not need one.
 
 ## License
 
