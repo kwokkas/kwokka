@@ -1,0 +1,11 @@
+error: the `scheduler = "..."` form was replaced; write #[kwokka::main(affine)] or #[kwokka::main(stealing)]
+ --> tests/ui/legacy.rs:1:16
+  |
+1 | #[kwokka::main(scheduler = "affine")]
+  |                ^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/legacy.rs:2:19
+  |
+2 | async fn main() {}
+  |                   ^ consider adding a `main` function to `$DIR/tests/ui/legacy.rs`

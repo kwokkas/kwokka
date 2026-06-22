@@ -1,0 +1,24 @@
+//! Network endpoints -- TCP sockets over the completion backend.
+//!
+//! Gated behind the `net` feature. [`TcpListener`] binds a port and
+//! accepts inbound connections; the accepted [`TcpStream`] converses
+//! through the [`recv`](TcpStream::recv) and [`send`](TcpStream::send)
+//! futures, which read and write the stream's own pinned inline buffers
+//! with no heap allocation. Client-side connect arrives with a stream
+//! constructor in a later release.
+//!
+//! # Examples
+//!
+//! ```no_run
+//! # // no_run: binds a live socket and drives io_uring, which a doctest host may lack.
+//! use kwokka::{net::TcpListener, runtime::Runtime};
+//!
+//! let mut runtime = Runtime::affine()?;
+//! let listener = TcpListener::bind("127.0.0.1:0")?;
+//! let stream = runtime.block_on(listener.accept())?;
+//! let (result, _buf) = runtime.block_on(stream.recv::<64>());
+//! let _read = result?;
+//! # Ok::<(), std::io::Error>(())
+//! ```
+
+pub use kwokka_net::tcp::{RecvFuture, SendFuture, TcpListener, TcpStream};

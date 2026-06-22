@@ -1,0 +1,11 @@
+error: unknown scheduler `fearless`, expected `affine` or `stealing`
+ --> tests/ui/unknown.rs:1:16
+  |
+1 | #[kwokka::main(fearless)]
+  |                ^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/unknown.rs:2:19
+  |
+2 | async fn main() {}
+  |                   ^ consider adding a `main` function to `$DIR/tests/ui/unknown.rs`
