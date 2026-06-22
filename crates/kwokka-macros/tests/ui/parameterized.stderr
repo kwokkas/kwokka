@@ -1,0 +1,11 @@
+error: the #[kwokka::main] entry point takes no arguments
+ --> tests/ui/parameterized.rs:2:15
+  |
+2 | async fn main(answer: u32) {}
+  |               ^^^^^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/parameterized.rs:2:30
+  |
+2 | async fn main(answer: u32) {}
+  |                              ^ consider adding a `main` function to `$DIR/tests/ui/parameterized.rs`

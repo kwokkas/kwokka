@@ -32,24 +32,25 @@ Four rules the codebase holds itself to:
 ## Scheduler modes
 
 There are two scheduler modes, and you pick one explicitly:
-`#[kwokka::main]` takes the choice as a mandatory `scheduler` argument,
-and there is no default. A phantom `Mode` type parameter (`Affine` or
+`#[kwokka::main]` takes the choice as a bare scheduler argument, and
+there is no default. A phantom `Mode` type parameter (`Affine` or
 `Stealing`) turns a cross-mode mistake into a compile error rather than
 a runtime panic.
 
-| `scheduler =` | Scheduler       | Tasks                                 |
-| ------------- | --------------- | ------------------------------------- |
-| `"affine"`    | thread-per-core | `!Send`, pinned to the calling thread |
-| `"stealing"`  | work-stealing   | `Send`, relocated toward idle workers |
+| Argument   | Scheduler       | Tasks                                 |
+| ---------- | --------------- | ------------------------------------- |
+| `affine`   | thread-per-core | `!Send`, pinned to the calling thread |
+| `stealing` | work-stealing   | `Send`, relocated toward idle workers |
 
 ```rust
 use kwokka::fs::File;
 
-#[kwokka::main(scheduler = "affine")]
+#[kwokka::main(affine)]
 async fn main() -> std::io::Result<()> {
     let file = File::open("Cargo.toml").await?;
     let (read, buf) = file.read::<1024>(0).await;
-    // read bytes are now in buf
+    let read = read?;
+    // the first `read` bytes are now in `buf`
     Ok(())
 }
 ```
@@ -72,7 +73,7 @@ the scope resolves once they all finish:
 ```rust
 use kwokka::task::scope_send;
 
-#[kwokka::main(scheduler = "stealing")]
+#[kwokka::main(stealing)]
 async fn main() {
     // fan out eight Send tasks for the crew to relocate toward idle cores
     scope_send(|crew| {

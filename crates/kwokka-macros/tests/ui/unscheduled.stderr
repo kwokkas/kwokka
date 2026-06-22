@@ -1,0 +1,13 @@
+error: the scheduler is never defaulted; write #[kwokka::main(affine)] or #[kwokka::main(stealing)]
+ --> tests/ui/unscheduled.rs:1:1
+  |
+1 | #[kwokka::main]
+  | ^^^^^^^^^^^^^^^
+  |
+  = note: this error originates in the attribute macro `kwokka::main` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/unscheduled.rs:2:19
+  |
+2 | async fn main() {}
+  |                   ^ consider adding a `main` function to `$DIR/tests/ui/unscheduled.rs`

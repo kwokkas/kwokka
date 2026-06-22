@@ -1,0 +1,11 @@
+error: argument `workers` is not supported in 0.1.0
+ --> tests/ui/unsupported.rs:1:26
+  |
+1 | #[kwokka::main(stealing, workers = 8)]
+  |                          ^^^^^^^
+
+error[E0601]: `main` function not found in crate `$CRATE`
+ --> tests/ui/unsupported.rs:2:19
+  |
+2 | async fn main() {}
+  |                   ^ consider adding a `main` function to `$DIR/tests/ui/unsupported.rs`

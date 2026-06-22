@@ -14,8 +14,8 @@ categories = ["asynchronous", "concurrency"]
 [features]
 net = ["dep:kwokka-net"]
 fs = ["dep:kwokka-fs"]
-steal = ["kwokka-runtime/steal"]
-full = ["net", "fs", "steal"]
+stealing = ["kwokka-runtime/steal"]
+full = ["net", "fs", "stealing"]
 
 [dependencies]
 kwokka-core.workspace = true
