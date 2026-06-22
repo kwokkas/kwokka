@@ -39,9 +39,8 @@ fn file_write_persists_buffer() {
         message.len(),
     ));
 
-    assert!(result >= 0, "the write completed with an error: {result}");
-    let Ok(written) = usize::try_from(result) else {
-        panic!("a non-negative write result fits usize");
+    let Ok(written) = result else {
+        panic!("the write must resolve with a byte count, not an error");
     };
     assert_eq!(
         written,

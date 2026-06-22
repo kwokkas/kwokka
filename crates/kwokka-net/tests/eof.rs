@@ -41,8 +41,11 @@ fn recv_resolves_zero_when_peer_closes() {
     let (result, _buf) =
         runtime.block_on(kwokka_net::tcp::RecvFuture::<64>::new(server.as_raw_fd()));
 
+    let Ok(received) = result else {
+        panic!("a recv on a closed peer resolves with EOF, not an error");
+    };
     assert_eq!(
-        result, 0,
-        "a recv on a closed peer resolves with 0, not {result}"
+        received, 0,
+        "a recv on a closed peer resolves with 0 bytes (EOF)"
     );
 }

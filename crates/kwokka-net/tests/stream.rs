@@ -66,8 +66,8 @@ fn accept_resolves_a_connected_stream() {
         panic!("the client write must succeed");
     };
     let (received, buf) = runtime.block_on(stream.recv::<64>());
-    let Ok(received) = usize::try_from(received) else {
-        panic!("a successful recv result fits usize, got {received}");
+    let Ok(received) = received else {
+        panic!("the stream recv must resolve with a byte count");
     };
     assert_eq!(
         &buf[..received],
@@ -79,8 +79,8 @@ fn accept_resolves_a_connected_stream() {
     let mut data = [0u8; 64];
     data[..payload.len()].copy_from_slice(payload);
     let sent = runtime.block_on(stream.send::<64>(data, payload.len()));
-    let Ok(sent) = usize::try_from(sent) else {
-        panic!("a successful send result fits usize, got {sent}");
+    let Ok(sent) = sent else {
+        panic!("the stream send must resolve with a byte count");
     };
     assert_eq!(sent, payload.len(), "the kernel sent every requested byte");
     let mut echoed = [0u8; 64];

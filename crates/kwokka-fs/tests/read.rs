@@ -35,9 +35,8 @@ fn file_read_returns_written_bytes() {
     };
     let (result, buf) = runtime.block_on(FileReadFuture::<64>::new(file.as_raw_fd(), 0));
 
-    assert!(result >= 0, "the read completed with an error: {result}");
-    let Ok(read) = usize::try_from(result) else {
-        panic!("a non-negative read result fits usize");
+    let Ok(read) = result else {
+        panic!("the read must resolve with a byte count, not an error");
     };
     assert_eq!(
         &buf[..read],

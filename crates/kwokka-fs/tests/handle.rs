@@ -31,25 +31,20 @@ fn a_file_round_trips_through_the_handle() {
 
     let written = runtime.block_on(async {
         let file = File::create(&path).await?;
-        Ok::<i32, std::io::Error>(file.write::<64>(0, data, payload.len()).await)
+        file.write::<64>(0, data, payload.len()).await
     });
     let Ok(written) = written else {
-        panic!("creating the fixture file must succeed");
-    };
-    let Ok(written) = usize::try_from(written) else {
-        panic!("a successful write result fits usize, got {written}");
+        panic!("the create-and-write must resolve with a byte count");
     };
     assert_eq!(written, payload.len(), "the kernel wrote every byte");
 
     let read_back = runtime.block_on(async {
         let file = File::open(&path).await?;
-        Ok::<(i32, [u8; 64]), std::io::Error>(file.read::<64>(0).await)
+        let (received, buf) = file.read::<64>(0).await;
+        Ok::<(usize, [u8; 64]), std::io::Error>((received?, buf))
     });
     let Ok((received, buf)) = read_back else {
-        panic!("reopening the fixture file must succeed");
-    };
-    let Ok(received) = usize::try_from(received) else {
-        panic!("a successful read result fits usize, got {received}");
+        panic!("the reopen-and-read must resolve with a byte count");
     };
     assert_eq!(
         &buf[..received],
