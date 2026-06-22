@@ -2,6 +2,7 @@
 name = "kwokka-runtime"
 version = "0.0.1"
 description = "scheduler, worker, task, memory, timer, and sync primitives"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

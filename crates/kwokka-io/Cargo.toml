@@ -2,6 +2,7 @@
 name = "kwokka-io"
 version = "0.0.1"
 description = "completion-based I/O driver, buffer pool, and operation types"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

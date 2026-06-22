@@ -1,7 +1,8 @@
 [package]
 name = "kwokka-core"
 version = "0.0.1"
-description = "Foundational types shared across the kwokka workspace."
+description = "foundational types shared across the kwokka workspace"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

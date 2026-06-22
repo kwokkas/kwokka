@@ -2,6 +2,7 @@
 name = "kwokka-macros"
 version = "0.0.1"
 description = "procedural macros lowering onto the kwokka facade"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true

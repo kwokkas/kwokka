@@ -42,6 +42,10 @@ a runtime panic.
 | `affine`   | thread-per-core | `!Send`, pinned to the calling thread |
 | `stealing` | work-stealing   | `Send`, relocated toward idle workers |
 
+Work-stealing migration is gated on the default-off `stealing` cargo
+feature. Without it `stealing` mode runs but does not migrate tasks
+across workers.
+
 ```rust
 use kwokka::fs::File;
 

@@ -10,6 +10,7 @@
 //! Tasks fan out through structured scopes ([`task::scope`] and the
 //! `Send`-bounded [`task::scope_send`]) rather than a free-standing
 //! spawn, so every child settles before its scope resolves.
+//! [`time::sleep`] suspends a task for a wall-clock duration.
 //!
 //! Network and filesystem endpoints live under the `net` and `fs`
 //! modules, each gated behind its own feature (`net`, `fs`, or `full`)
