@@ -9,9 +9,10 @@
 //! polling task's [`TaskRef`] from the waker, so it must be awaited directly --
 //! not inside a `select!`/`join!` branch that wraps the waker.
 //!
-//! [`Scope::spawn`] is affine-only for now -- defined for [`Affine`] alone, with
-//! the Stealing-tier scope-spawn deferred to a later phase. 0.1.0 itself is dual
-//! scheduler. Child futures are `'static` and the builder is a non-async closure.
+//! [`Scope::spawn`] is defined for both [`Affine`] (pinned children) and
+//! [`Stealing`] (migrating, `Send`-bounded) modes; [`scope`] opens an affine
+//! scope and [`scope_send`] a stealing one. Child futures are `'static` and the
+//! builder is a non-async closure.
 //! The scope awaits every child before it resolves, and the worker reaps each
 //! settled child's slot after the poll.
 //!

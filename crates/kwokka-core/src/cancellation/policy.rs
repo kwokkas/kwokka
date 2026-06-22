@@ -24,8 +24,8 @@ pub struct CancellationPolicy {
     /// a graceful window before forced abort.
     pub cleanup_deadline: Option<Duration>,
 
-    /// Whether to cancel in-flight `io_uring` operations
-    /// (`IORING_OP_ASYNC_CANCEL`).
+    /// Whether to request cancellation of in-flight I/O operations
+    /// (honoured by the I/O driver layer).
     pub cancel_inflight_io: bool,
 
     /// Behavior when cancel is called on an already-cancelled task.
