@@ -1,6 +1,5 @@
-<!-- banner: replace src with the committed image (e.g. .github/images/banner.png) -->
 <p align="center">
-  <img src="https://raw.githubusercontent.com/kwokkas/kwokka/main/.github/images/banner.png" alt="kwokka" />
+  <img src=".github/images/banner.png" alt="kwokka" />
 </p>
 
 <p align="center">
