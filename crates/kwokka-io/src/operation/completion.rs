@@ -4,8 +4,9 @@ use crate::operation::SubmitToken;
 
 /// I/O completion event wrapping an `io_uring` CQE.
 ///
-/// `result` is kept as a raw `i32` (negative = `-errno`). The caller
-/// (`kwokka-net`, `kwokka-fs`) is responsible for converting to `io::Result`.
+/// `result` is kept as a raw `i32` (negative = `-errno`). The completion
+/// futures decode it into an `io::Result` before user code sees it; a
+/// direct `Completion` consumer converts the raw value itself.
 /// `NOTIF` CQEs are absorbed by the driver loop and never surface here.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Completion {

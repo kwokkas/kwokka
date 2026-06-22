@@ -28,7 +28,7 @@ use crate::{
     reason = "UringDriver is the primary variant; Box indirection banned by allocation policy"
 )]
 pub enum DriverType {
-    /// `io_uring` backend -- Linux 6.0+ production target.
+    /// `io_uring` backend -- Linux 5.11+ production target.
     #[cfg(target_os = "linux")]
     Uring(UringDriver),
 

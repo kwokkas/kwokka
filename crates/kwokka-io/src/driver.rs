@@ -9,7 +9,7 @@ use crate::{
 /// Completion-based I/O backend.
 ///
 /// Single submit entry point; `(OpCode, OpFlags)` selects the concrete kernel op.
-/// Prefer `DriverImpl` enum dispatch over dynamic dispatch in the runtime path.
+/// Prefer `DriverType` enum dispatch over dynamic dispatch in the runtime path.
 ///
 /// # Default methods
 ///
