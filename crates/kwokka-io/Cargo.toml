@@ -5,6 +5,7 @@ description = "completion-based I/O driver, buffer pool, and operation types"
 readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
