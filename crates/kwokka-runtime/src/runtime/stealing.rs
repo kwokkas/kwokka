@@ -30,19 +30,19 @@ use core::{
 };
 use std::{io, thread};
 
+#[cfg(feature = "steal")]
+use kwokka_core::slab::SlabKey;
 use kwokka_io::{DriverType, wake};
 
-use crate::runtime::{bootstrap, handle::Runtime};
 #[cfg(not(feature = "steal"))]
 use crate::worker::wake::wake_local;
-#[cfg(feature = "steal")]
-use crate::{scheduler::stealing::handoff, worker::wake::wake_or_forward};
 use crate::{
+    runtime::{bootstrap, handle::Runtime},
     task::Stealing,
     worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard},
 };
 #[cfg(feature = "steal")]
-use kwokka_core::slab::SlabKey;
+use crate::{scheduler::stealing::handoff, worker::wake::wake_or_forward};
 
 /// Most workers one stealing runtime drives -- the id-block allocator cap.
 pub(crate) const MAX_WORKERS: usize = 64;
@@ -509,8 +509,10 @@ mod tests {
         operation::{IoRequest, SubmitResult},
     };
 
-    use crate::runtime::builder::RuntimeBuilder;
-    use crate::task::{io::TimerFuture, scope_send};
+    use crate::{
+        runtime::builder::RuntimeBuilder,
+        task::{io::TimerFuture, scope_send},
+    };
 
     /// Whether the io child completed on the thread of its first poll.
     static IO_STAYED: AtomicBool = AtomicBool::new(false);

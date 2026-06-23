@@ -5,6 +5,8 @@
     reason = "pub(crate) on module-private items"
 )]
 
+use kwokka_core::slab::{Slab, SlabKey};
+
 use crate::{
     scheduler::queue::LocalRunQueue,
     task::{TaskRef, slot::TaskSlot},
@@ -13,7 +15,6 @@ use crate::{
 use crate::{
     scheduler::stealing::relocate::ForwardTable, task::state::TaskState, worker::registry,
 };
-use kwokka_core::slab::{Slab, SlabKey};
 
 /// Wakes `task_ref`: transitions it to `Woken` and, on success, pushes it
 /// onto the local run queue.
@@ -84,14 +85,17 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use kwokka_core::{id::Pip, namespace::Namespace};
+    use kwokka_core::{
+        id::Pip,
+        namespace::Namespace,
+        slab::{Slab, SlabKey},
+    };
 
     use super::wake_local;
     use crate::{
         scheduler::{dispatch::spawn_insert, queue::LocalRunQueue},
         task::{slot::TaskSlot, state::TaskState},
     };
-    use kwokka_core::slab::{Slab, SlabKey};
 
     struct Pending;
     impl Future for Pending {
@@ -142,12 +146,13 @@ mod tests {
     #[cfg(feature = "steal")]
     #[test]
     fn a_husk_wake_re_routes_to_the_new_worker() {
+        use kwokka_core::Generation;
+
         use crate::{
             scheduler::stealing::relocate::ForwardTable,
             task::TaskRef,
             worker::{WorkerId, registry},
         };
-        use kwokka_core::Generation;
         let mut tasks = Slab::<TaskSlot>::new(1);
         let mut run_queue = LocalRunQueue::new();
         let Ok(stale) = spawn_insert(&mut tasks, 17, Pip::detached(), Namespace::ROOT, Pending)

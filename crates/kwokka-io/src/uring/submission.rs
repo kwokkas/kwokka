@@ -20,11 +20,15 @@
 
 use io_uring::squeue::Entry;
 
-use crate::operation::{
-    CommonFields, ControlPayload, IoBuf, IoBufMut, IoRequest, OpCode, OpFlags, OpPayload,
+use crate::{
+    operation::{
+        CommonFields, ControlPayload, IoBuf, IoBufMut, IoRequest, OpCode, OpFlags, OpPayload,
+    },
+    uring::{
+        opcode::{control, io, net, sync},
+        setup::flags::sqe_flags,
+    },
 };
-use crate::uring::opcode::{control, io, net, sync};
-use crate::uring::setup::flags::sqe_flags;
 
 /// Scratch buffers owned by the caller for SQE fields that must
 /// outlive the [`Entry`] until submission.

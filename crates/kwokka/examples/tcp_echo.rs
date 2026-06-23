@@ -4,8 +4,7 @@
 //! The flow compiles and type-checks without a live client; running it would
 //! block on accept until a connection arrives. Gated on the `net` feature.
 
-use kwokka::net::TcpListener;
-use kwokka::runtime::Runtime;
+use kwokka::{net::TcpListener, runtime::Runtime};
 
 fn main() -> std::io::Result<()> {
     let mut runtime = Runtime::affine()?;

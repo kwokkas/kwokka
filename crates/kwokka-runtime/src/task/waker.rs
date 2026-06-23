@@ -143,8 +143,9 @@ pub(crate) fn register_seam_decoder() {
 #[cfg(test)]
 #[cfg(not(loom))]
 mod tests {
-    use super::*;
     use kwokka_core::Generation;
+
+    use super::*;
 
     fn fake_ref(worker_id: u8, generation: u32, index: u32) -> TaskRef {
         TaskRef::from_arena(worker_id, index, Generation::from_raw(generation))

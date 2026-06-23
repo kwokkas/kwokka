@@ -12,8 +12,10 @@
 
 use io_uring::cqueue;
 
-use crate::operation::{Completion, CqeFlags, SubmitToken};
-use crate::uring::setup::flags::{is_cqe_more, is_cqe_notif};
+use crate::{
+    operation::{Completion, CqeFlags, SubmitToken},
+    uring::setup::flags::{is_cqe_more, is_cqe_notif},
+};
 
 /// Drain up to `max` completions from `cq`, appending to `out`.
 ///

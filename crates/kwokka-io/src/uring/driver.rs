@@ -12,8 +12,8 @@
 //!
 //! 1. `IORING_SETUP_SINGLE_ISSUER` is set -- kernel enforces single-thread submission.
 //! 2. `UringDriver` is owned by exactly one `WorkerShard`.
-//! 3. `WorkerShard` is accessed only from its owning worker thread (the
-//!    poll-frame contract in `worker/frame.rs` and `worker/polling.rs`).
+//! 3. `WorkerShard` is accessed only from its owning worker thread (the poll-frame contract in
+//!    `worker/frame.rs` and `worker/polling.rs`).
 //! 4. Reentrant access within the same thread is sequential.
 //! 5. `Send` is implemented manually; `Sync` is intentionally omitted to prevent cross-thread
 //!    references at compile time.
@@ -34,14 +34,6 @@ use io_uring::{
     types::{SubmitArgs, Timespec},
 };
 
-use crate::uring::{
-    completion::drain_completions,
-    setup::{
-        detect::{ProbeResult, probe_and_create},
-        flags::SetupTier,
-    },
-    submission::{SubmitScratch, build_entry, build_entry_read, build_entry_write},
-};
 use crate::{
     CancelError, IoDriver, RegisterError,
     buffer::{
@@ -51,6 +43,14 @@ use crate::{
     capability::CapabilityMatrix,
     operation::{
         Completion, InlineBuf, IoBuf, IoBufMut, IoRequest, OpCode, SubmitResult, SubmitToken,
+    },
+    uring::{
+        completion::drain_completions,
+        setup::{
+            detect::{ProbeResult, probe_and_create},
+            flags::SetupTier,
+        },
+        submission::{SubmitScratch, build_entry, build_entry_read, build_entry_write},
     },
 };
 

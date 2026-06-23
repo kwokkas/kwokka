@@ -211,8 +211,7 @@ mod tests {
     use super::{
         pop_handoff, pop_settled, pop_steal_request, push_handoff, push_settled, push_steal_request,
     };
-    use crate::task::TaskRef;
-    use crate::worker::WorkerId;
+    use crate::{task::TaskRef, worker::WorkerId};
 
     fn worker(id: u8) -> WorkerId {
         let Ok(worker_id) = WorkerId::new(id) else {
@@ -223,8 +222,9 @@ mod tests {
 
     #[test]
     fn a_settled_note_round_trips_to_the_victim() {
-        use crate::scheduler::stealing::relocate::SettledNote;
         use kwokka_core::slab::SlabKey;
+
+        use crate::scheduler::stealing::relocate::SettledNote;
         let key = SlabKey::new(3, Generation::from_raw(1));
         let Ok(()) = push_settled(13, SettledNote { victim_key: key }) else {
             panic!("push into an empty settled ring must succeed");
@@ -239,8 +239,9 @@ mod tests {
 
     #[test]
     fn a_steal_request_round_trips_to_the_victim() {
-        use crate::scheduler::stealing::relocate::StealRequest;
         use kwokka_core::slab::SlabKey;
+
+        use crate::scheduler::stealing::relocate::StealRequest;
         assert!(pop_steal_request(worker(14)).is_none());
         let dest = TaskRef::from_slab(15, SlabKey::new(2, Generation::from_raw(1)));
         let Ok(()) = push_steal_request(14, StealRequest { thief_id: 15, dest }) else {
@@ -256,13 +257,16 @@ mod tests {
 
     #[test]
     fn a_handoff_reply_round_trips_to_the_thief() {
-        use kwokka_core::{id::Pip, namespace::Namespace};
+        use kwokka_core::{
+            id::Pip,
+            namespace::Namespace,
+            slab::{Slab, SlabKey},
+        };
 
         use crate::{
             scheduler::stealing::relocate::{HandoffMsg, move_out},
             task::{header::Slot, slot::TaskSlot},
         };
-        use kwokka_core::slab::{Slab, SlabKey};
 
         let mut victim = Slab::<TaskSlot>::new(1);
         let cell = Slot::new(

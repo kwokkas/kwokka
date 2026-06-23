@@ -4,8 +4,8 @@ use std::io;
 
 use kwokka_io::{DriverType, wake};
 
-use crate::runtime::handle::Runtime;
 use crate::{
+    runtime::handle::Runtime,
     task::{Affine, Stealing},
     worker::{registry, shard::WorkerShard},
 };

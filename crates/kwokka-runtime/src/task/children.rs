@@ -229,11 +229,10 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    use kwokka_core::{id::Pip, namespace::Namespace};
+    use kwokka_core::{Generation, id::Pip, namespace::Namespace};
 
     use super::*;
     use crate::task::header::Slot;
-    use kwokka_core::Generation;
 
     struct InertFuture;
 

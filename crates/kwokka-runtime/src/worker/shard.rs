@@ -5,16 +5,13 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use kwokka_core::id::Pip;
+#[cfg(feature = "steal")]
+use kwokka_core::slab::SlabKey;
+use kwokka_core::{id::Pip, slab::Slab};
 use kwokka_io::DriverType;
 
 #[cfg(feature = "steal")]
 use crate::scheduler::stealing::{handoff::ForwardOrigin, relocate::ForwardTable};
-use crate::worker::{
-    WorkerId,
-    inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-    reap::{REAP_QUEUE_CAPACITY, ReapQueue},
-};
 use crate::{
     scheduler::queue::LocalRunQueue,
     task::slot::TaskSlot,
@@ -23,10 +20,12 @@ use crate::{
         request::{TIMER_INBOX_CAPACITY, TimerInbox},
         wheel::TimerWheel,
     },
+    worker::{
+        WorkerId,
+        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+    },
 };
-use kwokka_core::slab::Slab;
-#[cfg(feature = "steal")]
-use kwokka_core::slab::SlabKey;
 
 /// Per-worker shard owning I/O backend, task slab, timer wheel, and run queue.
 ///

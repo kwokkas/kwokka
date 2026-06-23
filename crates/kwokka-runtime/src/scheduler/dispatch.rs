@@ -10,10 +10,13 @@ use core::{
     task::{Context, Poll},
 };
 
-use kwokka_core::{id::Pip, namespace::Namespace};
+use kwokka_core::{
+    id::Pip,
+    namespace::Namespace,
+    slab::{Slab, SlabError},
+};
 
 use crate::task::{TaskRef, header::Slot, slot::TaskSlot, state::TaskState};
-use kwokka_core::slab::{Slab, SlabError};
 
 /// Result of a single [`poll_task`] attempt.
 ///
@@ -113,11 +116,14 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use kwokka_core::{id::Pip, namespace::Namespace};
+    use kwokka_core::{
+        id::Pip,
+        namespace::Namespace,
+        slab::{Slab, SlabError, SlabKey},
+    };
 
     use super::{PollOutcome, poll_task, spawn_insert};
     use crate::task::{slot::TaskSlot, state::TaskState, waker::waker_from_task_ref};
-    use kwokka_core::slab::{Slab, SlabError, SlabKey};
 
     /// Future that records its own drop, optionally completing immediately.
     struct CountingFuture {

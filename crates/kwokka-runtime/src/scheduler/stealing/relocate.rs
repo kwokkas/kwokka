@@ -21,13 +21,13 @@
 
 use core::{marker::PhantomData, mem::MaybeUninit, ptr};
 
-use kwokka_core::id::Pip;
-
-use crate::task::{TaskRef, slot::TaskSlot, state::AtomicTaskState};
 use kwokka_core::{
     Generation,
+    id::Pip,
     slab::{Slab, SlabKey},
 };
+
+use crate::task::{TaskRef, slot::TaskSlot, state::AtomicTaskState};
 
 /// A task body in flight between a victim slab and a thief slab.
 ///
@@ -363,11 +363,10 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use kwokka_core::{id::Pip, namespace::Namespace};
+    use kwokka_core::{Generation, id::Pip, namespace::Namespace};
 
     use super::*;
     use crate::task::{header::Slot, state::TaskState};
-    use kwokka_core::Generation;
 
     struct Inert;
     impl Future for Inert {

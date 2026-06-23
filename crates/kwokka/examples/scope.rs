@@ -5,9 +5,7 @@
 
 use core::time::Duration;
 
-use kwokka::runtime::Runtime;
-use kwokka::task::scope;
-use kwokka::time::sleep;
+use kwokka::{runtime::Runtime, task::scope, time::sleep};
 
 fn main() -> std::io::Result<()> {
     let mut runtime = Runtime::affine()?;

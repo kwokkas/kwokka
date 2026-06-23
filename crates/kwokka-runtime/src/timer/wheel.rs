@@ -2,11 +2,14 @@
 
 use core::num::NonZeroU32;
 
-use crate::task::TaskRef;
-use crate::timer::{
-    TimerHandle, clock::Clock, entry::TimerEntry, nz_to_slab, slab_to_nz, slot::WheelLevel,
-};
 use kwokka_core::slab::{Slab, SlabError};
+
+use crate::{
+    task::TaskRef,
+    timer::{
+        TimerHandle, clock::Clock, entry::TimerEntry, nz_to_slab, slab_to_nz, slot::WheelLevel,
+    },
+};
 
 const LEVEL_COUNT: usize = 6;
 
@@ -269,8 +272,9 @@ fn position(deadline_tick: u64, current_tick: u64) -> (u8, u8) {
 mod tests {
     use core::sync::atomic::{AtomicU64, Ordering};
 
-    use super::*;
     use kwokka_core::{Generation, slab::SlabKey};
+
+    use super::*;
 
     struct MockClock(AtomicU64);
 
