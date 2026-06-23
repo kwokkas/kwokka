@@ -13,7 +13,6 @@ updates:
       - github_actions
     commit-message:
       prefix: ci
-      include: scope
     groups:
       actions:
         update-types:
