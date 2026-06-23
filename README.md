@@ -5,8 +5,6 @@
   </picture>
 </p>
 
-<p align="center">Completion-native async runtime for Rust with optional orchestration</p>
-
 [![crates.io](https://img.shields.io/crates/v/kwokka.svg)](https://crates.io/crates/kwokka)
 [![docs.rs](https://docs.rs/kwokka/badge.svg)](https://docs.rs/kwokka)
 [![CI](https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg)](https://github.com/kwokkas/kwokka/actions/workflows/test.yml)
@@ -141,6 +139,12 @@ newer kernels and turn on only when the running kernel supports them.
 Contributions are welcome. Open an issue to discuss a change, or send a
 pull request. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for the full
 contributor guide.
+
+## Security
+
+Report a vulnerability privately through GitHub Security Advisories
+rather than a public issue. See [SECURITY.md](.github/SECURITY.md) for
+the disclosure process.
 
 ## License
 
