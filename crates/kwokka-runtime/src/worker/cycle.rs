@@ -8,20 +8,16 @@
 
 use core::ptr::NonNull;
 
-use kwokka_core::id::Pip;
+use kwokka_core::{
+    id::Pip,
+    slab::{Slab, SlabKey},
+};
 use kwokka_io::DriverType;
 
 #[cfg(feature = "steal")]
 use crate::scheduler::stealing::relocate::ForwardTable;
 #[cfg(feature = "steal")]
 use crate::worker::wake::wake_or_forward;
-use crate::worker::{
-    WorkerId,
-    inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-    polling::poll_one,
-    reap::{REAP_QUEUE_CAPACITY, ReapQueue},
-    wake::wake_local,
-};
 use crate::{
     scheduler::{dispatch::PollOutcome, queue::LocalRunQueue},
     task::{TaskRef, children::push_child, slot::TaskSlot},
@@ -30,8 +26,14 @@ use crate::{
         request::{TIMER_INBOX_CAPACITY, TimerInbox},
         wheel::TimerWheel,
     },
+    worker::{
+        WorkerId,
+        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+        polling::poll_one,
+        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        wake::wake_local,
+    },
 };
-use kwokka_core::slab::{Slab, SlabKey};
 
 /// Whether a [`tick`] advanced any work.
 ///
@@ -192,7 +194,11 @@ mod tests {
         task::{Context, Poll},
     };
 
-    use kwokka_core::{id::Pip, namespace::Namespace};
+    use kwokka_core::{
+        id::Pip,
+        namespace::Namespace,
+        slab::{Slab, SlabKey},
+    };
 
     use super::{Tick, drain_spawns, tick};
     use crate::{
@@ -209,7 +215,6 @@ mod tests {
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },
     };
-    use kwokka_core::slab::{Slab, SlabKey};
 
     /// Builds a [`WorkerId`] for tests, panicking outside the routable range.
     fn worker(id: u8) -> WorkerId {

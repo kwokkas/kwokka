@@ -19,12 +19,14 @@ use std::{io, thread};
 
 use kwokka_io::{DriverType, wake};
 
-use crate::runtime::stealing::{Crew, CrewKind, MAX_WORKERS, sibling_id};
-use crate::runtime::{bootstrap, handle::Runtime};
-use crate::worker::wake::wake_local;
 use crate::{
+    runtime::{
+        bootstrap,
+        handle::Runtime,
+        stealing::{Crew, CrewKind, MAX_WORKERS, sibling_id},
+    },
     task::Affine,
-    worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard},
+    worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard, wake::wake_local},
 };
 
 /// One multi-worker affine runtime per process: the crew shares the

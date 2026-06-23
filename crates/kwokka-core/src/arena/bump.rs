@@ -3,10 +3,11 @@
 
 use core::{alloc::Layout, fmt, mem::MaybeUninit, ptr::NonNull};
 
-use crate::arena::builder::BumpAllocatorBuilder;
-use crate::arena::phase::ArenaPhase;
-use crate::flat::FlatLayout;
-use crate::generation::Generation;
+use crate::{
+    arena::{builder::BumpAllocatorBuilder, phase::ArenaPhase},
+    flat::FlatLayout,
+    generation::Generation,
+};
 
 /// Errors emitted by [`BumpAllocator`] operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

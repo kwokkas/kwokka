@@ -10,8 +10,8 @@ use std::io;
 
 use kwokka_io::wake;
 
-use crate::runtime::{builder::RuntimeBuilder, stealing::Crew};
 use crate::{
+    runtime::{builder::RuntimeBuilder, stealing::Crew},
     task::{Affine, Mode},
     worker::{registry, shard::WorkerShard},
 };

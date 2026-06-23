@@ -13,8 +13,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use crate::RegisterError;
-use crate::buffer::slot::BufGroupId;
+use crate::{RegisterError, buffer::slot::BufGroupId};
 
 /// Maximum registered buffer slots. Covers `io_uring` kernel limit.
 pub(crate) const MAX_REGISTERED_BUFFERS: usize = 32768;

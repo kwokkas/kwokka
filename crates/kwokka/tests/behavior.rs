@@ -7,12 +7,16 @@
 
 #![cfg(not(any(miri, loom)))]
 
-use core::sync::atomic::{AtomicUsize, Ordering};
-use core::time::Duration;
+use core::{
+    sync::atomic::{AtomicUsize, Ordering},
+    time::Duration,
+};
 
-use kwokka::runtime::Runtime;
-use kwokka::task::{scope, yield_now};
-use kwokka::time::sleep;
+use kwokka::{
+    runtime::Runtime,
+    task::{scope, yield_now},
+    time::sleep,
+};
 
 // Children are `'static`, so they cannot borrow a stack cell; a process-wide
 // atomic is the Send + Sync channel for observing that both children ran.

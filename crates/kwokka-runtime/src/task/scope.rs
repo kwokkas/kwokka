@@ -321,6 +321,11 @@ where
 mod tests {
     use core::{ptr::NonNull, task::Waker};
 
+    use kwokka_core::{
+        Generation,
+        slab::{Slab, SlabKey},
+    };
+
     use super::*;
     use crate::{
         task::{header::WakeData, slot::TaskSlot},
@@ -330,10 +335,6 @@ mod tests {
             polling::{clear, install},
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },
-    };
-    use kwokka_core::{
-        Generation,
-        slab::{Slab, SlabKey},
     };
 
     /// A child future that never completes, so a spawned cell stays in the inbox.

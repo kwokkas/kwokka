@@ -2,8 +2,9 @@
 
 use core::num::NonZeroU32;
 
-use crate::timer::{entry::TimerEntry, nz_to_slab};
 use kwokka_core::slab::Slab;
+
+use crate::timer::{entry::TimerEntry, nz_to_slab};
 
 /// Number of slots per wheel level.
 pub(crate) const SLOTS_PER_LEVEL: usize = 64;
@@ -113,10 +114,10 @@ impl WheelLevel {
 #[cfg(test)]
 #[cfg(not(loom))]
 mod tests {
-    use super::*;
-    use crate::task::TaskRef;
-    use crate::timer::slab_to_nz;
     use kwokka_core::{Generation, slab::SlabKey};
+
+    use super::*;
+    use crate::{task::TaskRef, timer::slab_to_nz};
 
     fn dummy_task_ref() -> TaskRef {
         TaskRef::from_slab(0, SlabKey::new(0, Generation::ZERO))

@@ -14,13 +14,14 @@
     reason = "pub(crate) on module-private items"
 )]
 
+use kwokka_core::slab::{Slab, SlabKey};
+
 use crate::task::{
     TaskRef,
     children::{iter_children, remove_child},
     slot::TaskSlot,
     state::TaskState,
 };
-use kwokka_core::slab::{Slab, SlabKey};
 
 /// Per-worker capacity of settled-parent records awaiting a reap pass.
 ///

@@ -13,8 +13,10 @@ use std::io;
 
 use io_uring::{IoUring, opcode};
 
-use crate::capability::{CapabilityMatrix, KernelVersion};
-use crate::uring::setup::flags::SetupTier;
+use crate::{
+    capability::{CapabilityMatrix, KernelVersion},
+    uring::setup::flags::SetupTier,
+};
 
 /// Result of the `io_uring` capability probe.
 pub(crate) struct ProbeResult {

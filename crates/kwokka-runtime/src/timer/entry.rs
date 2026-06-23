@@ -27,8 +27,9 @@ pub(crate) struct TimerEntry {
 #[cfg(test)]
 #[cfg(not(loom))]
 mod tests {
-    use super::*;
     use kwokka_core::{Generation, slab::SlabKey};
+
+    use super::*;
 
     fn dummy_task_ref() -> TaskRef {
         TaskRef::from_slab(0, SlabKey::new(0, Generation::ZERO))

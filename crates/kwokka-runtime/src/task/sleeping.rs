@@ -17,9 +17,11 @@ use core::{
     time::Duration,
 };
 
-use crate::task::waker;
-use crate::timer::clock::TICK_NS;
-use crate::worker::{WorkerId, polling};
+use crate::{
+    task::waker,
+    timer::clock::TICK_NS,
+    worker::{WorkerId, polling},
+};
 
 /// Returns a future that completes after `duration`.
 ///
@@ -31,6 +33,7 @@ use crate::worker::{WorkerId, polling};
 /// ```rust
 /// # async fn run() {
 /// use core::time::Duration;
+///
 /// use kwokka_runtime::task::sleep;
 ///
 /// sleep(Duration::from_millis(10)).await;
@@ -138,14 +141,16 @@ mod tests {
     };
 
     use super::*;
-    use crate::task::{TaskRef, header::WakeData, slot::TaskSlot, waker::waker_from_task_ref};
-    use crate::timer::request::{TIMER_INBOX_CAPACITY, TimerInbox};
-    use crate::worker::{
-        WorkerId,
-        frame::PollFrame,
-        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-        polling::{clear, install},
-        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+    use crate::{
+        task::{TaskRef, header::WakeData, slot::TaskSlot, waker::waker_from_task_ref},
+        timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
+        worker::{
+            WorkerId,
+            frame::PollFrame,
+            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+            polling::{clear, install},
+            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        },
     };
 
     fn worker_id(id: u8) -> WorkerId {

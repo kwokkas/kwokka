@@ -3,8 +3,7 @@
 //! Reads this crate's own manifest from offset zero. Gated on the `fs`
 //! feature. The read future resolves to a byte count paired with the buffer.
 
-use kwokka::fs::File;
-use kwokka::runtime::Runtime;
+use kwokka::{fs::File, runtime::Runtime};
 
 fn main() -> std::io::Result<()> {
     let mut runtime = Runtime::affine()?;

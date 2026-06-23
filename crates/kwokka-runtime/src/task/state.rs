@@ -805,10 +805,10 @@ mod loom_tests {
             };
             // wake() transitions Sleeping -> Woken; the slot starts at Woken.
             // Two orderings are possible under loom:
-            // - Retire commits before wake reads: wake sees Retired (terminal)
-            //   and returns Err(Retired). retire_result = Ok(()).
-            // - Wake reads before retire commits: wake sees Woken (!= Sleeping)
-            //   and returns Err(Woken). retire_result = Ok(()) or Err(Woken).
+            // - Retire commits before wake reads: wake sees Retired (terminal) and returns
+            //   Err(Retired). retire_result = Ok(()).
+            // - Wake reads before retire commits: wake sees Woken (!= Sleeping) and returns
+            //   Err(Woken). retire_result = Ok(()) or Err(Woken).
             // In all cases no pending wake is silently dropped: the task is
             // either Woken (will be polled on victim) or Retired (stolen, will
             // be polled on thief after move_in).

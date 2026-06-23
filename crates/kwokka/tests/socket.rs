@@ -9,11 +9,9 @@
 #![cfg(all(target_os = "linux", feature = "net"))]
 #![cfg(not(any(miri, loom)))]
 
-use std::io::Write;
-use std::net::TcpStream;
+use std::{io::Write, net::TcpStream};
 
-use kwokka::net::TcpListener;
-use kwokka::runtime::Runtime;
+use kwokka::{net::TcpListener, runtime::Runtime};
 
 #[test]
 fn the_facade_accepts_and_recvs_a_loopback_payload() {

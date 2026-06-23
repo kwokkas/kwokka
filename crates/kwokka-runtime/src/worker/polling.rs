@@ -22,21 +22,23 @@ use core::{
     task::Context,
 };
 
-use kwokka_io::DriverType;
-use kwokka_io::boundary::{IoSeam, SeamGuard, WakeSlot};
-
-use crate::worker::{
-    WorkerId,
-    frame::PollFrame,
-    inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-    reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+use kwokka_core::slab::{Slab, SlabKey};
+use kwokka_io::{
+    DriverType,
+    boundary::{IoSeam, SeamGuard, WakeSlot},
 };
+
 use crate::{
     scheduler::dispatch::{PollOutcome, poll_task},
     task::{TaskRef, header::WakeData, slot::TaskSlot, waker::waker_from_task_ref},
     timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
+    worker::{
+        WorkerId,
+        frame::PollFrame,
+        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+    },
 };
-use kwokka_core::slab::{Slab, SlabKey};
 
 /// One slot per routable [`WorkerId`] (the 7-bit worker space).
 const FRAME_SLOTS: usize = TaskRef::WORKER_ID_MAX as usize + 1;
@@ -230,12 +232,16 @@ mod tests {
     use kwokka_core::{id::Pip, namespace::Namespace};
 
     use super::*;
-    use crate::task::{
-        header::{Slot, WakeData},
-        state::TaskState,
+    use crate::{
+        task::{
+            header::{Slot, WakeData},
+            state::TaskState,
+        },
+        worker::{
+            inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
+            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        },
     };
-    use crate::worker::inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox};
-    use crate::worker::reap::{REAP_QUEUE_CAPACITY, ReapQueue};
 
     struct Inert;
     impl Future for Inert {

@@ -8,8 +8,10 @@
     reason = "pub(crate) satisfies unreachable_pub on this private module"
 )]
 
-use crate::addr::SockAddr;
-use crate::operation::{IoBuf, IoBufMut, OpCode, OpFlags, SubmitToken};
+use crate::{
+    addr::SockAddr,
+    operation::{IoBuf, IoBufMut, OpCode, OpFlags, SubmitToken},
+};
 
 /// An I/O request ready for submission to a backend.
 ///

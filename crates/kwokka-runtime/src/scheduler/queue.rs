@@ -1,7 +1,8 @@
 //! Per-worker local run queue backed by an intrusive linked list.
 
-use crate::task::{TaskRef, slot::TaskSlot};
 use kwokka_core::slab::Slab;
+
+use crate::task::{TaskRef, slot::TaskSlot};
 
 /// FIFO run queue using the intrusive `next_runnable` link in [`TaskHeader`].
 ///

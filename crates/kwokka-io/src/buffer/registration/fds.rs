@@ -13,8 +13,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use crate::RegisterError;
-use crate::buffer::slot::FdSlot;
+use crate::{RegisterError, buffer::slot::FdSlot};
 
 /// Maximum registered fd slots.
 pub(crate) const MAX_REGISTERED_FDS: usize = 65536;
@@ -23,9 +22,10 @@ const FD_BITMAP_WORDS: usize = MAX_REGISTERED_FDS / 64;
 
 /// Userspace registry for registered file-descriptor slots.
 ///
-/// Same allocation model as [`RegisteredBuffers`](crate::buffer::registration::buffers::RegisteredBuffers)
-/// but indexed by [`FdSlot`] with `u32` capacity, clamped to [`MAX_REGISTERED_FDS`].
-/// 8 KB inline, no heap allocation.
+/// Same allocation model as
+/// [`RegisteredBuffers`](crate::buffer::registration::buffers::RegisteredBuffers) but indexed by
+/// [`FdSlot`] with `u32` capacity, clamped to [`MAX_REGISTERED_FDS`]. 8 KB inline, no heap
+/// allocation.
 pub(crate) struct RegisteredFds {
     used: [u64; FD_BITMAP_WORDS],
     capacity: u32,

@@ -5,8 +5,11 @@ pub(crate) mod core;
 pub(crate) mod future;
 pub(crate) mod request;
 
-pub use completion::{Completion, CqeFlags};
 pub use core::{InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, SubmitResult, SubmitToken};
-pub use future::file::{FileReadFuture, FileWriteFuture};
-pub use future::socket::{RecvFuture, SendFuture};
+
+pub use completion::{Completion, CqeFlags};
+pub use future::{
+    file::{FileReadFuture, FileWriteFuture},
+    socket::{RecvFuture, SendFuture},
+};
 pub use request::{CommonFields, ControlPayload, IoRequest, OpPayload};

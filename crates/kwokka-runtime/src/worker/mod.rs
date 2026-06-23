@@ -17,5 +17,4 @@ pub(crate) mod shard;
 pub(crate) mod wake;
 
 pub(crate) use coordination as registry;
-
 pub use id::{WorkerError, WorkerId};

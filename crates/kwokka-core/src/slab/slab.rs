@@ -2,8 +2,7 @@
 
 use core::{fmt, mem::MaybeUninit, ptr::NonNull};
 
-use crate::generation::Generation;
-use crate::slab::key::SlabKey;
+use crate::{generation::Generation, slab::key::SlabKey};
 
 const FREE_SENTINEL: u32 = u32::MAX;
 

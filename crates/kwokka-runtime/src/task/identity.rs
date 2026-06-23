@@ -123,8 +123,9 @@ impl fmt::Debug for TaskRef {
 #[cfg(test)]
 #[cfg(not(loom))]
 mod tests {
-    use super::*;
     use kwokka_core::slab::Slab;
+
+    use super::*;
 
     fn slab_key(worker_capacity: usize, value: u32) -> SlabKey {
         let mut slab: Slab<u32> = Slab::new(worker_capacity);

@@ -18,12 +18,11 @@
 
 use core::{future::Future, ptr::NonNull};
 
-use kwokka_core::namespace::Namespace;
-use kwokka_core::slab::SlabKey;
+use kwokka_core::{namespace::Namespace, slab::SlabKey};
 use kwokka_io::{IoDriver, operation::Completion, wake};
 
-use crate::runtime::handle::Runtime;
 use crate::{
+    runtime::handle::Runtime,
     scheduler::dispatch::spawn_insert,
     task::{Affine, TaskRef, state::TaskState},
     timer::clock::SystemClock,

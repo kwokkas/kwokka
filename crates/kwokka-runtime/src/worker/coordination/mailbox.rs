@@ -15,10 +15,9 @@
 
 #[cfg(not(loom))]
 use crate::sync::mpsc::MpscRing;
-use crate::task::TaskRef;
-use crate::worker::WorkerId;
 #[cfg(not(loom))]
 use crate::worker::endpoint::EndpointCell;
+use crate::{task::TaskRef, worker::WorkerId};
 
 /// Per-worker inbox capacity. A power of two for the ring mask, sized to
 /// exceed the per-worker live-task count so a push is loss-free in steady
@@ -161,8 +160,7 @@ mod tests {
     use super::{
         INBOX_CAPACITY, enqueue, pop, publish_endpoint, set_parked, signal, withdraw_endpoint,
     };
-    use crate::task::TaskRef;
-    use crate::worker::WorkerId;
+    use crate::{task::TaskRef, worker::WorkerId};
 
     fn task_for(worker_id: u8) -> TaskRef {
         TaskRef::from_arena(worker_id, 1, Generation::ZERO)

@@ -11,11 +11,7 @@
 
 use std::time::Duration;
 
-use kwokka::fs::File;
-use kwokka::net::TcpListener;
-use kwokka::runtime::Runtime;
-use kwokka::task::scope;
-use kwokka::time::sleep;
+use kwokka::{fs::File, net::TcpListener, runtime::Runtime, task::scope, time::sleep};
 
 #[test]
 fn the_facade_composes_runtime_net_scope_time_and_fs() {

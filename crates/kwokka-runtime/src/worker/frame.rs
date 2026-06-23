@@ -18,16 +18,20 @@ use core::{
     task::Poll,
 };
 
+use kwokka_core::slab::{Slab, SlabKey};
 use kwokka_io::{
     DriverType, IoDriver,
     operation::{IoRequest, SubmitResult},
 };
 
-use crate::task::{JoinError, TaskRef, header::WakeData, slot::TaskSlot, state::TaskState};
-use crate::timer::request::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest};
-use crate::worker::inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox};
-use crate::worker::reap::{REAP_QUEUE_CAPACITY, ReapQueue};
-use kwokka_core::slab::{Slab, SlabKey};
+use crate::{
+    task::{JoinError, TaskRef, header::WakeData, slot::TaskSlot, state::TaskState},
+    timer::request::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest},
+    worker::{
+        inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
+        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+    },
+};
 
 /// The slab-free handle a polled task uses to reach its worker.
 ///
@@ -342,14 +346,13 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use kwokka_core::{id::Pip, namespace::Namespace};
+    use kwokka_core::{Generation, id::Pip, namespace::Namespace};
 
     use super::*;
     use crate::task::{
         header::{Slot, WakeData},
         state::TaskState,
     };
-    use kwokka_core::Generation;
 
     struct Inert;
     impl Future for Inert {
