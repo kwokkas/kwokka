@@ -20,7 +20,7 @@ env:
 
 jobs:
   changes:
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.gate.outputs.code }}
       deps: ${{ steps.gate.outputs.deps }}
@@ -63,7 +63,7 @@ jobs:
   format:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -76,7 +76,7 @@ jobs:
   clippy:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -89,7 +89,7 @@ jobs:
   typos:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,7 +101,7 @@ jobs:
   machete:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -113,7 +113,7 @@ jobs:
   doc:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     env:
       RUSTDOCFLAGS: --cfg docsrs -D warnings
     steps:
@@ -126,7 +126,7 @@ jobs:
   deny:
     needs: changes
     if: needs.changes.outputs.deps == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -138,7 +138,7 @@ jobs:
   semver:
     needs: changes
     if: needs.changes.outputs.code == 'true' && github.event_name == 'pull_request'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -163,7 +163,7 @@ jobs:
   hack:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:

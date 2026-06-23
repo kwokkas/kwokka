@@ -18,7 +18,7 @@ env:
 
 jobs:
   changes:
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     outputs:
       miri: ${{ steps.gate.outputs.miri }}
       loom: ${{ steps.gate.outputs.loom }}
@@ -70,7 +70,7 @@ jobs:
   miri:
     needs: changes
     if: needs.changes.outputs.miri == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     env:
       MIRIFLAGS: -Zmiri-strict-provenance
     steps:
@@ -80,8 +80,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
         with:
           components: miri
-      # Per-job sysroot and target dir to avoid a shared-sysroot race and
-      # stale-target reuse on the self-hosted runner. --lib keeps the run on
+      # Per-job sysroot and target dir under RUNNER_TEMP keep miri's setup
+      # isolated from the cached build. --lib keeps the run on
       # unit tests. io_uring syscall tests cannot run under miri; they are
       # excluded with --skip as they arrive (uring stage). The mpsc
       # concurrent_producers test spawns OS threads over a 15k-iteration body,
@@ -99,7 +99,7 @@ jobs:
   loom:
     needs: changes
     if: needs.changes.outputs.loom == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     env:
       RUSTFLAGS: --cfg loom
     steps:
