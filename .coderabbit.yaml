@@ -4,41 +4,33 @@ early_access: false
 tone_instructions: >-
     Be terse and mechanical. Prioritize correctness, memory safety, and the
     stated coding standards over style. State findings directly; skip praise.
+issue_enrichment:
+    auto_enrich:
+        enabled: false
 reviews:
-    profile: chill
-    request_changes_workflow: true
-    high_level_summary: true
-    high_level_summary_in_walkthrough: true
-    poem: false
-    review_status: true
-    collapse_walkthrough: true
-    suggested_labels: true
-    auto_apply_labels: false
-    suggested_reviewers: false
-    auto_assign_reviewers: false
+    profile: assertive
+    request_changes_workflow: false
+    high_level_summary: false
+    auto_title_placeholder: "@coderabbitai"
+    review_status: false
+    commit_status: false
+    fail_commit_status: false
+    collapse_walkthrough: false
+    changed_files_summary: true
+    sequence_diagrams: false
+    estimate_code_review_effort: false
     assess_linked_issues: true
     related_issues: true
     related_prs: true
+    suggested_labels: false
+    auto_apply_labels: false
+    suggested_reviewers: false
+    auto_assign_reviewers: false
+    poem: false
+    abort_on_close: true
     path_filters:
         - "!**/*.lock"
         - "!target/**"
-    path_instructions:
-        - path: "crates/**/*.rs"
-          instructions: >-
-              Systems async runtime. Outside the kwokka-compat crate and FFI
-              boundaries, reject Arc, Rc, Box, Vec::new/vec!, String allocation,
-              RefCell, Cell, and dyn Trait; the runtime uses enum dispatch and Copy
-              index handles. No unwrap, expect, panic!(), todo!(), or unimplemented!
-              anywhere, including tests. Every unsafe block must carry a // SAFETY:
-              comment naming invariant, precondition, and failure mode. Public items
-              need rustdoc (Errors for Result, Panics where applicable, Safety on pub
-              unsafe fn). Prefer early returns and let-else over deep nesting. Name by
-              domain, not role (no Manager/Helper/Util suffixes).
-        - path: "crates/kwokka-compat/**"
-          instructions: >-
-              The Tokio shim crate; exempt from the Arc/Box/dyn ban since it bridges
-              Tokio's trait surface. Focus on buffer ownership across the
-              readiness-to-completion poll bridge.
     auto_review:
         enabled: true
         auto_incremental_review: true
@@ -50,12 +42,36 @@ reviews:
             enabled: false
         unit_tests:
             enabled: false
+    pre_merge_checks:
+        docstrings:
+            mode: "off"
+        title:
+            mode: warning
+        description:
+            mode: warning
+        issue_assessment:
+            mode: warning
     tools:
         gitleaks:
+            enabled: true
+        actionlint:
+            enabled: true
+        yamllint:
+            enabled: true
+        markdownlint:
+            enabled: true
+        hadolint:
+            enabled: true
+        shellcheck:
+            enabled: true
+        eslint:
+            enabled: true
+        clippy:
             enabled: true
 chat:
     auto_reply: true
 knowledge_base:
+    opt_out: false
     learnings:
         scope: local
     issues:
