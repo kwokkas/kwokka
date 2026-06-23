@@ -1,2 +1,5 @@
+# Keep the devcontainer out of the repo language statistics.
+.devcontainer/** linguist-vendored
+
 # Keep the CI helper scripts out of the repo language statistics.
 .github/scripts/** linguist-vendored

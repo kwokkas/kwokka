@@ -1,0 +1,24 @@
+{
+  "name": "kwokka",
+  "build": {
+    "dockerfile": "Dockerfile"
+  },
+  "runArgs": ["--privileged"],
+  "postCreateCommand": "cargo fetch",
+  "mounts": [
+    "source=kwokka-cargo-registry,target=/usr/local/cargo/registry,type=volume",
+    "source=kwokka-target,target=${containerWorkspaceFolder}/target,type=volume"
+  ],
+  "customizations": {
+    "vscode": {
+      "extensions": [
+        "rust-lang.rust-analyzer",
+        "tamasfe.even-better-toml"
+      ],
+      "settings": {
+        "rust-analyzer.rustfmt.extraArgs": ["+nightly"],
+        "rust-analyzer.check.command": "clippy"
+      }
+    }
+  }
+}
