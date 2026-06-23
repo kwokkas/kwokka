@@ -35,7 +35,8 @@ kwokka-net = { path = "crates/kwokka-net", version = "0.0.1" }
 kwokka-runtime = { path = "crates/kwokka-runtime", version = "0.0.1" }
 # External dependencies. Each is pulled by a single concern so the
 # dependency surface stays auditable.
-io-uring = "0.7.4"
+# EnterFlags moved to the crate root in 0.7.11; the driver imports it there.
+io-uring = "0.7.11"
 libc = "0.2"
 loom = "0.7"
 proc-macro2 = "1"
