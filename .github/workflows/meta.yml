@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   changes:
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     outputs:
       workflows: ${{ steps.gate.outputs.workflows }}
       toml: ${{ steps.gate.outputs.toml }}
@@ -44,7 +44,7 @@ jobs:
   actionlint:
     needs: changes
     if: needs.changes.outputs.workflows == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -54,7 +54,7 @@ jobs:
   zizmor:
     needs: changes
     if: needs.changes.outputs.workflows == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -65,7 +65,7 @@ jobs:
   taplo:
     needs: changes
     if: needs.changes.outputs.toml == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:

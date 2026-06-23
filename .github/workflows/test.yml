@@ -21,7 +21,7 @@ env:
 
 jobs:
   changes:
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     outputs:
       code: ${{ steps.gate.outputs.code }}
     steps:
@@ -51,7 +51,7 @@ jobs:
   unit:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -64,13 +64,11 @@ jobs:
         with:
           name: junit
           path: target/nextest/ci/junit.xml
-      - if: always()
-        run: sccache --show-stats
 
   doctest:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
@@ -81,7 +79,7 @@ jobs:
   msrv:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
         with:
@@ -94,7 +92,7 @@ jobs:
   coverage:
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: kwokka-runner
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
         with:
