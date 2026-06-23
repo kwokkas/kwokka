@@ -1,0 +1,168 @@
+name: Nightly
+
+# The full verification sweep plus slow / nightly-only checks, kept off the
+# per-PR path. Runs daily, on manual dispatch (optionally against a chosen
+# ref), and on any PR that edits this file (so the jobs are validated when
+# they change). full-test / miri / loom / msrv mirror the per-PR workflows
+# but run unconditionally here, catching flakes, toolchain drift, and
+# nightly-rustc regressions the path-gated PR runs would miss.
+on:
+  schedule:
+    # 18:23 UTC keeps off the top-of-hour scheduler congestion and lands the
+    # result before the working day.
+    - cron: "23 18 * * *"
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch or SHA to test.
+        required: false
+        default: main
+  pull_request:
+    branches: [main]
+    paths:
+      - ".github/workflows/nightly.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The full test suite, unconditional. Re-running nightly surfaces the
+  # nondeterministic failures a single per-PR run can miss.
+  full-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: ./.github/actions/rust-env
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features
+      - run: cargo test --doc --workspace --all-features
+
+  # Mirrors soundness.yml's miri job, run unconditionally. The skip set and
+  # the steal-feature suite list track that job; keep them in step.
+  miri:
+    runs-on: ubuntu-latest
+    env:
+      MIRIFLAGS: -Zmiri-strict-provenance
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - run: |
+          export MIRI_SYSROOT="$RUNNER_TEMP/miri-sysroot"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/miri-target"
+          cargo +nightly miri setup
+          cargo +nightly miri test --lib -p kwokka-core -p kwokka-io -p kwokka-runtime -- --skip concurrent_producers --skip affine_builds_on_this_host --skip affine_runtimes_claim_distinct_worker_ids --skip affine_crew_builds_runs_and_is_single_instance
+          cargo +nightly miri test --lib -p kwokka-runtime --features steal -- relocate handoff registry
+
+  # Mirrors soundness.yml's loom job, run unconditionally.
+  loom:
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: --cfg loom
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: ./.github/actions/rust-env
+      - run: cargo test --release -p kwokka-runtime --lib
+      - run: cargo test --release -p kwokka-runtime --lib --features steal
+
+  # Mirrors test.yml's MSRV check, run unconditionally so a dependency that
+  # raises the effective MSRV without a code change is still caught.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: ./.github/actions/rust-env
+        with:
+          toolchain: "1.85"
+      - run: cargo check --workspace --all-features
+
+  # Declared dependency lower bounds must resolve and build. The nightly
+  # toolchain resolves the minimal lockfile; the pinned stable then builds it.
+  minimal-versions:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: ./.github/actions/rust-env
+      - run: cargo +nightly update -Z minimal-versions
+      - run: cargo check --workspace --all-features
+
+  # cargo careful runs the suite against a std rebuilt with debug assertions
+  # plus extra UB checks.
+  careful:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: taiki-e/install-action@cargo-careful
+      - run: cargo +nightly careful test --workspace --all-features
+
+  # AddressSanitizer covers what miri cannot: miri skips the io_uring syscall
+  # tests, so the registered-buffer, set_len, and MaybeUninit accounting on the
+  # real kernel completion path is otherwise unchecked. Scoped to the three
+  # unsafe-bearing crates (their build pulls no proc-macro, so the sanitizer
+  # never reaches a host macro). LSan is off: the runtime's process-lifetime
+  # statics are not leaks. The 15k-iteration mpsc stress test is too slow under
+  # instrumentation; loom model-checks that interleaving instead.
+  asan:
+    runs-on: ubuntu-24.04
+    env:
+      RUSTFLAGS: -Zsanitizer=address
+      ASAN_OPTIONS: detect_leaks=0
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: taiki-e/install-action@nextest
+      - run: >
+          cargo +nightly nextest run -Zbuild-std
+          --target x86_64-unknown-linux-gnu
+          -p kwokka-core -p kwokka-io -p kwokka-runtime --all-features
+          -E 'not test(/concurrent_producers/)'
+
+  # repr(C) layouts, FlatLayout size/alignment proofs, and the raw io_uring
+  # FFI are architecture-sensitive. A 64-bit non-x86 compile guards them.
+  # cargo check does not link and no dependency compiles C, so the target
+  # alone is enough; no cross linker is needed.
+  cross-aarch64:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: ./.github/actions/rust-env
+      - run: rustup target add aarch64-unknown-linux-gnu
+      - run: cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
