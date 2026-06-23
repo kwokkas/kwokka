@@ -22,7 +22,10 @@ const areaFor = (path) => {
     /\.toml$/.test(path) ||
     path === "Cargo.lock" ||
     path.startsWith(".cargo/") ||
-    path.startsWith(".config/")
+    path.startsWith(".config/") ||
+    path.startsWith(".devcontainer/") ||
+    path === ".gitattributes" ||
+    path === ".gitignore"
   ) {
     return "A-build";
   }

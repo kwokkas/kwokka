@@ -8,15 +8,6 @@
 /coverage
 perf.data*
 
-# Python
-*.pyc
-__pycache__/
-
-# Env / secrets
-.env
-.env.*
-!.env.example
-
 # Editor / IDE
 .idea/
 .vscode/
