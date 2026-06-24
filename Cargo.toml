@@ -27,7 +27,11 @@ homepage = "https://kwokka.dev"
 # facade. Do not raise an internal crate to 0.1.x without promoting it to
 # a supported surface.
 [workspace.dependencies]
-kwokka = { path = "crates/kwokka", version = "0.1.0" }
+# Path-only (no version): kwokka-macros dev-depends on the facade for its
+# expansion tests. Without a version, cargo drops this dev-dependency when
+# packaging kwokka-macros, so the not-yet-published facade is never resolved
+# from the registry (which would deadlock the publish order).
+kwokka = { path = "crates/kwokka" }
 kwokka-core = { path = "crates/kwokka-core", version = "0.0.1" }
 kwokka-fs = { path = "crates/kwokka-fs", version = "0.0.1" }
 kwokka-io = { path = "crates/kwokka-io", version = "0.0.1" }
