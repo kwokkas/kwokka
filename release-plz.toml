@@ -1,6 +1,4 @@
 [workspace]
-# Independent versions: the facade carries the public 0.1.x line; internal
-# crates stay on 0.0.x and release-plz bumps only the ones that changed.
 changelog_update = true
 git_tag_enable = true
 git_release_enable = false
@@ -9,19 +7,10 @@ pr_labels = ["release"]
 publish_timeout = "10m"
 pr_name = "chore: release{% if version %} v{{ version }}{% endif %}"
 
-# Facade: the stable public surface. The only crate that gets a GitHub Release.
 [[package]]
 name = "kwokka"
 semver_check = true
 git_release_enable = true
-
-# Excluded from release-plz: kwokka-macros dev-depends on the facade, forming a
-# cycle that breaks release-plz's publish-order graph (fs/net end up ordered
-# before runtime). macros changes rarely and stays at its published version;
-# the facade depends on that version. Re-enable when the cycle is resolved.
-[[package]]
-name = "kwokka-macros"
-release = false
 
 [changelog]
 commit_parsers = [
