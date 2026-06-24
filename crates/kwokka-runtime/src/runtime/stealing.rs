@@ -416,8 +416,8 @@ mod tests {
     };
 
     use crate::{
-        runtime::builder::RuntimeBuilder,
-        task::{io::TimerFuture, scope_send},
+        runtime::{builder::RuntimeBuilder, probe::SubmitProbe},
+        task::scope_send,
     };
 
     /// Whether the io child completed on the thread of its first poll.
@@ -428,7 +428,7 @@ mod tests {
     static SLEEPER_MIGRATED: AtomicBool = AtomicBool::new(false);
 
     /// Submits one timeout through the cross-crate seam and resolves with the
-    /// drained result -- the seam-routed twin of [`TimerFuture`], standing in
+    /// drained result -- the seam-routed twin of [`SubmitProbe`], standing in
     /// for an I/O future hosted outside this crate.
     struct SeamTimer {
         /// Timeout in nanoseconds, submitted on the first poll.
@@ -459,7 +459,7 @@ mod tests {
                     Poll::Pending
                 }
                 // No seam, no driver, or a rejected op: resolve with -EINVAL
-                // rather than hang, mirroring TimerFuture's fallback.
+                // rather than hang, mirroring SubmitProbe's fallback.
                 _ => Poll::Ready(-22),
             }
         }
@@ -504,7 +504,7 @@ mod tests {
                 // The submit raises the in-flight counter before the child
                 // suspends, so there is no sleeping-with-zero window; the
                 // serve sweep must decline this child until the CQE lands.
-                let result = TimerFuture::new(50_000_000).await;
+                let result = SubmitProbe::new(50_000_000).await;
                 assert!(
                     result < 0,
                     "a completed timeout returns a negative -errno, got {result}",
