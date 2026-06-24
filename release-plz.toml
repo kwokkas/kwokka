@@ -1,12 +1,17 @@
 [workspace]
+# Independent versions: the facade carries the public 0.1.x line; internal
+# crates stay on 0.0.x and release-plz bumps only the ones that changed.
 changelog_update = true
 git_tag_enable = true
 git_release_enable = false
+# Publish only when the release PR is merged, not on every push to main.
+release_always = false
 semver_check = false
-# no-scope title for the pr-title gate
+pr_labels = ["release"]
+publish_timeout = "10m"
 pr_name = "chore: release{% if version %} v{{ version }}{% endif %}"
 
-# Facade: the stable public surface.
+# Facade: the stable public surface. The only crate that gets a GitHub Release.
 [[package]]
 name = "kwokka"
 semver_check = true
@@ -21,7 +26,8 @@ commit_parsers = [
   { message = "^docs", group = "Documentation" },
   { message = "^test", group = "Testing" },
   { message = "^build", group = "Build" },
+  { message = "^security", group = "Security" },
   { message = "^revert", group = "Reverts" },
-  { message = "^ci", skip = true },
-  { message = "^chore", skip = true },
+  { message = "^(ci|chore)", skip = true },
+  { message = ".*", group = "Other" },
 ]
