@@ -11,7 +11,7 @@ concurrency:
 jobs:
     title:
         name: PR Title
-        runs-on: kwokka-runner
+        runs-on: ubuntu-latest
         permissions:
             contents: read
             pull-requests: read
@@ -27,7 +27,7 @@ jobs:
 
     label:
         name: Labels
-        runs-on: kwokka-runner
+        runs-on: ubuntu-latest
         permissions:
             contents: read
             pull-requests: write

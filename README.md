@@ -16,7 +16,7 @@
 > still change before 1.0. Orchestration and a Tokio compatibility layer
 > arrive in later releases.
 
-## Installation
+## Getting started
 
 Add Kwokka to your `Cargo.toml`:
 
@@ -42,8 +42,9 @@ you only need some.
 Kwokka is a completion-native async framework for Rust, built on
 io_uring. Instead of polling file descriptors for readiness, it hands
 operations to the kernel and reacts when they complete. io_uring is the
-Linux backend, with epoll as a fallback, kqueue for macOS and the BSDs,
-and IOCP for Windows planned. They all sit behind one completion API.
+backend in 0.1.0. An epoll fallback for older Linux kernels, kqueue for
+macOS and the BSDs, and IOCP for Windows are planned, all behind the
+same completion API.
 
 You choose the scheduler explicitly. `affine` is thread-per-core with
 tasks pinned to their thread, and `stealing` is work-stealing with tasks
@@ -57,8 +58,8 @@ that move toward idle workers.
 
 ## Features
 
-- Completion-native I/O on io_uring, with epoll and kqueue behind the
-  same API.
+- Completion-native I/O on io_uring, with epoll and kqueue planned
+  behind the same API.
 - Two schedulers you pick explicitly: thread-per-core (`affine`) and
   work-stealing (`stealing`).
 - Enum-based dispatch, with no trait objects or vtables in the runtime.
@@ -127,8 +128,8 @@ minimum supported version is treated as a minor-version change.
 ## Supported Linux kernels
 
 > [!IMPORTANT]
-> io_uring needs Linux 5.11 or newer. On older kernels Kwokka falls back
-> to epoll automatically.
+> 0.1.0 requires io_uring, which needs Linux 5.11 or newer. An epoll
+> fallback for older kernels is planned.
 
 Some io_uring features, such as provided buffers and zero-copy send, need
 newer kernels and turn on only when the running kernel supports them.
@@ -138,6 +139,12 @@ newer kernels and turn on only when the running kernel supports them.
 Contributions are welcome. Open an issue to discuss a change, or send a
 pull request. See [CONTRIBUTING.md](.github/CONTRIBUTING.md) for the full
 contributor guide.
+
+## Security
+
+Report a vulnerability privately through GitHub Security Advisories
+rather than a public issue. See [SECURITY.md](.github/SECURITY.md) for
+the disclosure process.
 
 ## License
 
