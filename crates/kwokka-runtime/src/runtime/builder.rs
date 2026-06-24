@@ -88,7 +88,7 @@ impl RuntimeBuilder {
                 "task_capacity exceeds the wake-inbox capacity",
             ));
         }
-        if self.workers > crate::runtime::stealing::MAX_WORKERS {
+        if self.workers > crate::runtime::crew::MAX_WORKERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker count must not exceed the crew cap",

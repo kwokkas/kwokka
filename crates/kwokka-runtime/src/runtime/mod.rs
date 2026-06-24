@@ -4,6 +4,7 @@
 mod affine;
 mod bootstrap;
 mod builder;
+mod crew;
 mod handle;
 mod stealing;
 

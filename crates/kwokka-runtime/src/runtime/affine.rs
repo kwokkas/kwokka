@@ -22,8 +22,8 @@ use kwokka_io::{DriverType, wake};
 use crate::{
     runtime::{
         bootstrap,
+        crew::{Crew, CrewKind, MAX_WORKERS, sibling_id},
         handle::Runtime,
-        stealing::{Crew, CrewKind, MAX_WORKERS, sibling_id},
     },
     task::Affine,
     worker::{WorkerId, cycle::Tick, park::wake::wake_local, registry, shard::WorkerShard},

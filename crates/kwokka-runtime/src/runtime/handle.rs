@@ -11,7 +11,7 @@ use std::io;
 use kwokka_io::wake;
 
 use crate::{
-    runtime::{builder::RuntimeBuilder, stealing::Crew},
+    runtime::{builder::RuntimeBuilder, crew::Crew},
     task::{Affine, Mode},
     worker::{registry, shard::WorkerShard},
 };
