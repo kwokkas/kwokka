@@ -1,6 +1,6 @@
 [package]
 name = "kwokka"
-version = "0.1.0-rc.1"
+version = "0.1.0-rc.2"
 description = "completion-based async runtime with optional orchestration"
 readme = "../../README.md"
 edition.workspace = true
