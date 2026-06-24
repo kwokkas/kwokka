@@ -34,7 +34,7 @@ use crate::{
 /// # async fn run() {
 /// use core::time::Duration;
 ///
-/// use kwokka_runtime::task::sleep;
+/// use kwokka_runtime::timer::sleep;
 ///
 /// sleep(Duration::from_millis(10)).await;
 /// # }
