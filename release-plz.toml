@@ -1,0 +1,27 @@
+[workspace]
+changelog_update = true
+git_tag_enable = true
+git_release_enable = false
+semver_check = false
+# no-scope title for the pr-title gate
+pr_name = "chore: release{% if version %} v{{ version }}{% endif %}"
+
+# Facade: the stable public surface.
+[[package]]
+name = "kwokka"
+semver_check = true
+git_release_enable = true
+
+[changelog]
+commit_parsers = [
+  { message = "^feat", group = "Features" },
+  { message = "^fix", group = "Bug fixes" },
+  { message = "^perf", group = "Performance" },
+  { message = "^refactor", group = "Refactor" },
+  { message = "^docs", group = "Documentation" },
+  { message = "^test", group = "Testing" },
+  { message = "^build", group = "Build" },
+  { message = "^revert", group = "Reverts" },
+  { message = "^ci", skip = true },
+  { message = "^chore", skip = true },
+]
