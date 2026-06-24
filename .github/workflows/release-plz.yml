@@ -1,10 +1,13 @@
 name: release-plz
 
-# Dormant until 0.1.0 stable: add `push: { branches: [main] }` to activate.
+# Opens a release PR on each push to main; publishing happens only when that
+# release PR is merged (release_always = false in release-plz.toml).
 # Auth: a GitHub App (not GITHUB_TOKEN) so the release PR triggers CI;
 # crates.io publishing uses trusted publishing (OIDC), so no registry token.
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
