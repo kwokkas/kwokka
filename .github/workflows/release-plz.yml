@@ -1,6 +1,8 @@
 name: release-plz
 
 # Dormant until 0.1.0 stable: add `push: { branches: [main] }` to activate.
+# Auth: a GitHub App (not GITHUB_TOKEN) so the release PR triggers CI;
+# crates.io publishing uses trusted publishing (OIDC), so no registry token.
 on:
   workflow_dispatch:
 
@@ -14,31 +16,43 @@ jobs:
       contents: write
       pull-requests: write
     steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_KEY }}
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: release-plz/action@v0.5
         with:
           command: release-pr
         env:
-          # App or PAT, not GITHUB_TOKEN, so the release PR triggers CI.
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
 
   release:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: read
       id-token: write
     steps:
+      - uses: actions/create-github-app-token@v2
+        id: app-token
+        with:
+          app-id: ${{ vars.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_KEY }}
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
           persist-credentials: false
+          token: ${{ steps.app-token.outputs.token }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: release-plz/action@v0.5
         with:
           command: release
         env:
-          GITHUB_TOKEN: ${{ secrets.RELEASE_PLZ_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
