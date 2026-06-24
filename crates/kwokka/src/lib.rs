@@ -16,10 +16,9 @@
 //!
 //! Network and filesystem endpoints live under the `net` and `fs`
 //! modules, each gated behind its own feature (`net`, `fs`, or `full`)
-//! so a minimal build pulls in neither. [`Pip`] is the tree-structured
-//! task identity every runtime task carries; runtime-issued ids surface
-//! through task introspection in a later release, so today the type is
-//! constructible but not yet handed back by the runtime.
+//! so a minimal build pulls in neither. Every runtime task carries a
+//! tree-structured identity for tracing, but the runtime does not hand
+//! it back yet.
 //!
 //! # Examples
 //!
@@ -38,5 +37,4 @@ pub mod runtime;
 pub mod task;
 pub mod time;
 
-pub use kwokka_core::id::{Pip, PipError};
 pub use kwokka_macros::main;
