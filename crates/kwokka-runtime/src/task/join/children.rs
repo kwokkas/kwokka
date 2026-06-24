@@ -20,7 +20,7 @@
 
 use core::fmt;
 
-use crate::task::{TaskRef, header::TaskHeader};
+use crate::task::{TaskRef, cell::header::TaskHeader};
 
 /// Lookup interface for resolving a [`TaskRef`] into a [`TaskHeader`].
 ///
@@ -232,7 +232,7 @@ mod tests {
     use kwokka_core::{Generation, id::Pip, namespace::Namespace};
 
     use super::*;
-    use crate::task::header::Slot;
+    use crate::task::cell::header::Slot;
 
     struct InertFuture;
 

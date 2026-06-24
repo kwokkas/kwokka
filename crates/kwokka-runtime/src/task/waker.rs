@@ -57,7 +57,7 @@ const fn task_ref_to_data(task_ref: TaskRef) -> *const () {
 
 /// Recovers a [`TaskRef`] from a waker's `data` pointer.
 ///
-/// `pub(crate)` so [`scope`](crate::task::scope) can decode the polling task's
+/// `pub(crate)` so [`scope`](crate::task::join::scope) can decode the polling task's
 /// `TaskRef` from `cx.waker()`. Sound only when the waker's vtable is [`VTABLE`]
 /// (the caller verifies that first); a foreign data pointer decodes to a garbage
 /// `TaskRef`.
@@ -69,7 +69,7 @@ pub(crate) fn data_to_task_ref(data: *const ()) -> TaskRef {
 
 /// Process-wide vtable shared by every kwokka task waker.
 ///
-/// `pub(crate)` so [`scope`](crate::task::scope) can compare a waker's vtable
+/// `pub(crate)` so [`scope`](crate::task::join::scope) can compare a waker's vtable
 /// pointer against this address: a different vtable means the waker did not come
 /// from [`waker_from_task_ref`], so its data is not a decodable [`TaskRef`].
 pub(crate) static VTABLE: RawWakerVTable =

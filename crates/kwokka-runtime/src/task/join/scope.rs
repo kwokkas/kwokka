@@ -44,9 +44,8 @@ use kwokka_core::{id::Pip, namespace::Namespace};
 use crate::{
     task::{
         TaskRef,
-        header::Slot,
+        cell::{header::Slot, slot::TaskSlot},
         marker::{Affine, Mode, Stealing},
-        slot::TaskSlot,
         waker,
     },
     worker::{WorkerId, inbox::PendingSpawn, polling},
@@ -328,7 +327,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        task::{header::WakeData, slot::TaskSlot},
+        task::cell::{header::WakeData, slot::TaskSlot},
         worker::{
             frame::PollFrame,
             inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},

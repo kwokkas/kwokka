@@ -142,7 +142,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        task::{TaskRef, header::WakeData, slot::TaskSlot, waker::waker_from_task_ref},
+        task::{
+            TaskRef,
+            cell::{header::WakeData, slot::TaskSlot},
+            waker::waker_from_task_ref,
+        },
         timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
         worker::{
             WorkerId,

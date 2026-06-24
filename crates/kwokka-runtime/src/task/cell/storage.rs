@@ -1,12 +1,16 @@
 //! [`TaskStorage`] over the per-worker [`Slab`], resolving a [`TaskRef`] to its
 //! [`TaskHeader`] so the children-list helpers drive the production slab.
 //!
-//! The trait lives in [`children`](crate::task::children) as pure list logic;
+//! The trait lives in [`children`](crate::task::join::children) as pure list logic;
 //! this is its one concrete production implementor.
 
 use kwokka_core::slab::{Slab, SlabKey};
 
-use crate::task::{TaskRef, children::TaskStorage, header::TaskHeader, slot::TaskSlot};
+use crate::task::{
+    TaskRef,
+    cell::{header::TaskHeader, slot::TaskSlot},
+    join::children::TaskStorage,
+};
 
 impl TaskStorage for Slab<TaskSlot> {
     fn get(&self, task_ref: TaskRef) -> Option<&TaskHeader> {

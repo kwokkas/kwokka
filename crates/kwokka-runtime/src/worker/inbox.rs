@@ -13,7 +13,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use crate::task::{TaskRef, slot::TaskSlot};
+use crate::task::{TaskRef, cell::slot::TaskSlot};
 
 /// Per-worker spawn inbox capacity. A power of two, sized to absorb a burst of
 /// child spawns within one poll before the worker drains the inbox.
@@ -113,7 +113,7 @@ mod tests {
     use kwokka_core::{id::Pip, namespace::Namespace};
 
     use super::*;
-    use crate::task::header::Slot;
+    use crate::task::cell::header::Slot;
 
     /// Pending future that records its own drop, so a test can prove the
     /// inbox releases undrained cells.

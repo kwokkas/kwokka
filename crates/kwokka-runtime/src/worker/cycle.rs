@@ -20,7 +20,7 @@ use crate::scheduler::stealing::relocate::ForwardTable;
 use crate::worker::wake::wake_or_forward;
 use crate::{
     scheduler::{dispatch::PollOutcome, queue::LocalRunQueue},
-    task::{TaskRef, children::push_child, slot::TaskSlot},
+    task::{TaskRef, cell::slot::TaskSlot, join::children::push_child},
     timer::{
         clock::Clock,
         request::{TIMER_INBOX_CAPACITY, TimerInbox},
@@ -203,7 +203,10 @@ mod tests {
     use super::{Tick, drain_spawns, tick};
     use crate::{
         scheduler::{dispatch::spawn_insert, queue::LocalRunQueue},
-        task::{header::Slot, slot::TaskSlot, state::TaskState},
+        task::{
+            cell::{header::Slot, slot::TaskSlot},
+            state::TaskState,
+        },
         timer::{
             clock::Clock,
             request::{TIMER_INBOX_CAPACITY, TimerInbox},

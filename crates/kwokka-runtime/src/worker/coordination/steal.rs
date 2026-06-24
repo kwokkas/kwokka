@@ -265,7 +265,7 @@ mod tests {
 
         use crate::{
             scheduler::stealing::relocate::{HandoffMsg, move_out},
-            task::{header::Slot, slot::TaskSlot},
+            task::cell::{header::Slot, slot::TaskSlot},
         };
 
         let mut victim = Slab::<TaskSlot>::new(1);

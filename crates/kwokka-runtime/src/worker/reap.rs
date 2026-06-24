@@ -1,6 +1,6 @@
 //! Post-poll reaping of settled scope children.
 //!
-//! A [`scope`](crate::task::scope) awaits its children to settlement, but a
+//! A [`scope`](crate::task::join::scope) awaits its children to settlement, but a
 //! settled child keeps its slab slot until the worker slab drops. When a scope
 //! settles inside a poll it records its parent here through the poll frame; the
 //! run-loop drains the queue after the tick -- outside any poll borrow -- and
@@ -18,8 +18,8 @@ use kwokka_core::slab::{Slab, SlabKey};
 
 use crate::task::{
     TaskRef,
-    children::{iter_children, remove_child},
-    slot::TaskSlot,
+    cell::slot::TaskSlot,
+    join::children::{iter_children, remove_child},
     state::TaskState,
 };
 
@@ -162,7 +162,7 @@ mod tests {
     use kwokka_core::{id::Pip, namespace::Namespace};
 
     use super::*;
-    use crate::task::{children::push_child, header::Slot, state::TaskState};
+    use crate::task::{cell::header::Slot, join::children::push_child, state::TaskState};
 
     /// A child future that never completes; tests drive its state directly.
     struct Inert;

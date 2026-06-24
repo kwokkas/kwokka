@@ -2,7 +2,7 @@
 
 use kwokka_core::slab::Slab;
 
-use crate::task::{TaskRef, slot::TaskSlot};
+use crate::task::{TaskRef, cell::slot::TaskSlot};
 
 /// FIFO run queue using the intrusive `next_runnable` link in [`TaskHeader`].
 ///
@@ -10,7 +10,7 @@ use crate::task::{TaskRef, slot::TaskSlot};
 /// the `next_runnable` pointer stored inside each task's header. This
 /// avoids any separate node allocation.
 ///
-/// [`TaskHeader`]: crate::task::header::TaskHeader
+/// [`TaskHeader`]: crate::task::cell::header::TaskHeader
 pub(crate) struct LocalRunQueue {
     head: Option<TaskRef>,
     tail: Option<TaskRef>,
@@ -85,7 +85,7 @@ mod tests {
             task::{Context, Poll},
         };
 
-        use crate::task::header::Slot;
+        use crate::task::cell::header::Slot;
 
         struct DummyFut;
         impl Future for DummyFut {

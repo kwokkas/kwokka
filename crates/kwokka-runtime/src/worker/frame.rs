@@ -25,7 +25,11 @@ use kwokka_io::{
 };
 
 use crate::{
-    task::{JoinError, TaskRef, header::WakeData, slot::TaskSlot, state::TaskState},
+    task::{
+        JoinError, TaskRef,
+        cell::{header::WakeData, slot::TaskSlot},
+        state::TaskState,
+    },
     timer::request::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest},
     worker::{
         inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
@@ -350,7 +354,7 @@ mod tests {
 
     use super::*;
     use crate::task::{
-        header::{Slot, WakeData},
+        cell::header::{Slot, WakeData},
         state::TaskState,
     };
 

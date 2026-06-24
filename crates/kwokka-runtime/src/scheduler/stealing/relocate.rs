@@ -27,7 +27,7 @@ use kwokka_core::{
     slab::{Slab, SlabKey},
 };
 
-use crate::task::{TaskRef, slot::TaskSlot, state::AtomicTaskState};
+use crate::task::{TaskRef, cell::slot::TaskSlot, state::AtomicTaskState};
 
 /// A task body in flight between a victim slab and a thief slab.
 ///
@@ -366,7 +366,7 @@ mod tests {
     use kwokka_core::{Generation, id::Pip, namespace::Namespace};
 
     use super::*;
-    use crate::task::{header::Slot, state::TaskState};
+    use crate::task::{cell::header::Slot, state::TaskState};
 
     struct Inert;
     impl Future for Inert {

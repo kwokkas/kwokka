@@ -18,7 +18,7 @@ use core::{
 
 use kwokka_core::{id::Pip, namespace::Namespace};
 
-pub(crate) use crate::task::lifecycle::Slot;
+pub(crate) use crate::task::cell::layout::Slot;
 use crate::task::{TaskRef, state::AtomicTaskState};
 
 /// I/O completion data stored by the worker drain loop for the task's
