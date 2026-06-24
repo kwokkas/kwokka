@@ -545,4 +545,19 @@ mod tests {
             "the seam-routed in-flight child must complete on its issuing worker",
         );
     }
+
+    #[test]
+    fn a_dropped_stealing_runtime_lets_the_next_one_build() {
+        // A single-worker stealing runtime sets `STEALING_LIVE` at build but
+        // claims a single id, so its drop takes the `count <= 1` path that once
+        // skipped the static reset. With the reset skipped this second build
+        // fails as already live.
+        let Ok(first) = RuntimeBuilder::new().stealing() else {
+            panic!("the first single-worker stealing runtime must build");
+        };
+        drop(first);
+        let Ok(_second) = RuntimeBuilder::new().stealing() else {
+            panic!("a stealing runtime must build after the previous one dropped");
+        };
+    }
 }
