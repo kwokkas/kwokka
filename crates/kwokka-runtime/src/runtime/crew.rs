@@ -87,12 +87,16 @@ impl Crew {
     pub(crate) fn release_ids(&self, lead: WorkerId) {
         if self.count <= 1 {
             registry::release(lead);
-            return;
+        } else {
+            registry::release_block(lead, self.count);
         }
-        registry::release_block(lead, self.count);
+        // A single-worker stealing runtime still sets `STEALING_LIVE` at build,
+        // so its drop must reset the statics even though it claimed one id. The
+        // solo affine path sets no liveness flag, so it has nothing to reset.
         match self.kind {
             CrewKind::Affine => crate::runtime::affine::reset_statics(),
-            CrewKind::Stealing | CrewKind::Solo => crate::runtime::stealing::reset_statics(),
+            CrewKind::Stealing => crate::runtime::stealing::reset_statics(),
+            CrewKind::Solo => {}
         }
     }
 }
