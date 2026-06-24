@@ -1,16 +1,15 @@
 [workspace]
 changelog_update = true
-git_tag_enable = true
+git_tag_enable = false
 git_release_enable = false
+release_always = false
 semver_check = false
 pr_labels = ["release"]
 publish_timeout = "10m"
-pr_name = "chore: release{% if version %} v{{ version }}{% endif %}"
 
 [[package]]
 name = "kwokka"
 semver_check = true
-git_release_enable = true
 
 [changelog]
 commit_parsers = [
