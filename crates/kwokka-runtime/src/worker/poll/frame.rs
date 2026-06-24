@@ -31,7 +31,7 @@ use crate::{
         state::TaskState,
     },
     timer::request::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest},
-    worker::{
+    worker::queue::{
         inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
         reap::{REAP_QUEUE_CAPACITY, ReapQueue},
     },

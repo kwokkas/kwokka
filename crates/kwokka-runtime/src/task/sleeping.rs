@@ -20,7 +20,7 @@ use core::{
 use crate::{
     task::waker,
     timer::clock::TICK_NS,
-    worker::{WorkerId, polling},
+    worker::{WorkerId, poll::polling},
 };
 
 /// Returns a future that completes after `duration`.
@@ -150,10 +150,14 @@ mod tests {
         timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
         worker::{
             WorkerId,
-            frame::PollFrame,
-            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-            polling::{clear, install},
-            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+            poll::{
+                frame::PollFrame,
+                polling::{clear, install},
+            },
+            queue::{
+                inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+                reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+            },
         },
     };
 

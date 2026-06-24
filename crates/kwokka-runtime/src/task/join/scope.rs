@@ -48,7 +48,7 @@ use crate::{
         marker::{Affine, Mode, Stealing},
         waker,
     },
-    worker::{WorkerId, inbox::PendingSpawn, polling},
+    worker::{WorkerId, poll::polling, queue::inbox::PendingSpawn},
 };
 
 /// The structured scope of the running task.
@@ -329,10 +329,14 @@ mod tests {
     use crate::{
         task::cell::{header::WakeData, slot::TaskSlot},
         worker::{
-            frame::PollFrame,
-            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-            polling::{clear, install},
-            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+            poll::{
+                frame::PollFrame,
+                polling::{clear, install},
+            },
+            queue::{
+                inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+                reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+            },
         },
     };
 

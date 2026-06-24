@@ -26,7 +26,7 @@ use crate::{
         stealing::{Crew, CrewKind, MAX_WORKERS, sibling_id},
     },
     task::Affine,
-    worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard, wake::wake_local},
+    worker::{WorkerId, cycle::Tick, park::wake::wake_local, registry, shard::WorkerShard},
 };
 
 /// One multi-worker affine runtime per process: the crew shares the

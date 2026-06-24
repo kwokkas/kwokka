@@ -22,8 +22,10 @@ use crate::{
     },
     worker::{
         WorkerId,
-        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        queue::{
+            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        },
     },
 };
 

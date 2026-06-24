@@ -16,7 +16,7 @@
 #[cfg(not(loom))]
 use crate::sync::mpsc::MpscRing;
 #[cfg(not(loom))]
-use crate::worker::endpoint::EndpointCell;
+use crate::worker::park::endpoint::EndpointCell;
 use crate::{task::TaskRef, worker::WorkerId};
 
 /// Per-worker inbox capacity. A power of two for the ring mask, sized to

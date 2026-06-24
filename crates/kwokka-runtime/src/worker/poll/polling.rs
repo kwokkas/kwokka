@@ -38,9 +38,11 @@ use crate::{
     timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
     worker::{
         WorkerId,
-        frame::PollFrame,
-        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        poll::frame::PollFrame,
+        queue::{
+            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        },
     },
 };
 
@@ -241,7 +243,7 @@ mod tests {
             cell::header::{Slot, WakeData},
             state::TaskState,
         },
-        worker::{
+        worker::queue::{
             inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },
