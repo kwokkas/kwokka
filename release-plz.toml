@@ -4,8 +4,6 @@
 changelog_update = true
 git_tag_enable = true
 git_release_enable = false
-# Publish only when the release PR is merged, not on every push to main.
-release_always = false
 semver_check = false
 pr_labels = ["release"]
 publish_timeout = "10m"
