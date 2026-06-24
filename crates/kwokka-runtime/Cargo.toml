@@ -1,6 +1,6 @@
 [package]
 name = "kwokka-runtime"
-version = "0.0.1"
+version = "0.0.2"
 description = "scheduler, worker, task, memory, timer, and sync primitives"
 readme = "README.md"
 edition.workspace = true
