@@ -17,6 +17,14 @@ name = "kwokka"
 semver_check = true
 git_release_enable = true
 
+# Excluded from release-plz: kwokka-macros dev-depends on the facade, forming a
+# cycle that breaks release-plz's publish-order graph (fs/net end up ordered
+# before runtime). macros changes rarely and stays at its published version;
+# the facade depends on that version. Re-enable when the cycle is resolved.
+[[package]]
+name = "kwokka-macros"
+release = false
+
 [changelog]
 commit_parsers = [
   { message = "^feat", group = "Features" },
