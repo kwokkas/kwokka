@@ -68,7 +68,8 @@ impl WakeData {
 /// # Field semantics
 ///
 /// * `state` -- atomic CAS-based lifecycle (see [`AtomicTaskState`]).
-/// * `pip` -- observability identity, propagated to children via `Pip::child`.
+/// * `pip` -- observability identity: a flat, per-worker-unique id. It carries no parent-child
+///   relation; the tree lives in the `first_child` / `next_sibling` list below.
 /// * `namespace` -- logical scope; the per-process interning is decided at the call site, not here.
 /// * `first_child` / `next_sibling` -- intrusive children list, manipulated by helpers in the
 ///   `children` module. Both are [`Option<TaskRef>`] so absence is type-level rather than encoded
