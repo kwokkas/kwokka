@@ -1,6 +1,6 @@
-//! Internal-op I/O future -- the completion-path keystone.
+//! Internal-op submit probe -- the completion-path keystone.
 //!
-//! [`TimerFuture`] submits one internal timeout op through the poll frame and
+//! [`SubmitProbe`] submits one internal timeout op through the poll frame and
 //! resolves with the kernel result when the completion drain delivers it. It
 //! proves the submit -> CQE -> wake -> result path end to end against the
 //! smallest op that carries no buffer; real file and socket futures build on the
@@ -8,11 +8,11 @@
 
 #![allow(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) on the module-private TimerFuture"
+    reason = "pub(crate) on the module-private SubmitProbe"
 )]
 #![allow(
     dead_code,
-    reason = "TimerFuture is the internal-op submit-path proof, exercised end to end under cfg(test)"
+    reason = "SubmitProbe is the internal-op submit-path proof, exercised end to end under cfg(test)"
 )]
 
 use core::{
@@ -35,14 +35,14 @@ use crate::{
 /// [`TaskRef`](crate::task::TaskRef) from the waker for the `user_data`
 /// round-trip -- and yields `Pending`; a later poll, woken by the completion
 /// drain, reads the result the drain cached on the frame at poll entry.
-pub(crate) struct TimerFuture {
+pub(crate) struct SubmitProbe {
     /// Timeout in nanoseconds, submitted on the first poll.
     duration_ns: u64,
     /// Whether the op has been submitted; gates the submit-once transition.
     is_submitted: bool,
 }
 
-impl TimerFuture {
+impl SubmitProbe {
     /// Constructs a timer future for `duration_ns` nanoseconds.
     pub(crate) const fn new(duration_ns: u64) -> Self {
         Self {
@@ -52,7 +52,7 @@ impl TimerFuture {
     }
 }
 
-impl Future for TimerFuture {
+impl Future for SubmitProbe {
     type Output = i32;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<i32> {
@@ -63,11 +63,11 @@ impl Future for TimerFuture {
             ptr::from_ref(cx.waker().vtable()),
             ptr::from_ref(&waker::VTABLE),
         ) {
-            panic!("TimerFuture requires the runtime task waker; await it directly");
+            panic!("SubmitProbe requires the runtime task waker; await it directly");
         }
         let task_ref = waker::data_to_task_ref(cx.waker().data());
         let Ok(worker) = WorkerId::new(task_ref.worker_id()) else {
-            panic!("TimerFuture decoded a non-routable worker id from the waker");
+            panic!("SubmitProbe decoded a non-routable worker id from the waker");
         };
         let this = self.get_mut();
         if this.is_submitted {
@@ -108,7 +108,7 @@ mod tests {
     /// worker never sees an idle tick and never parks -- the deferred
     /// task-work starvation shape on a `DEFER_TASKRUN` ring.
     struct BusyTimer {
-        timer: TimerFuture,
+        timer: SubmitProbe,
     }
 
     impl Future for BusyTimer {
@@ -130,7 +130,7 @@ mod tests {
         // still post: the completion drain flushes deferred task work
         // itself, or this test hangs.
         let result = runtime.block_on(BusyTimer {
-            timer: TimerFuture::new(1_000_000),
+            timer: SubmitProbe::new(1_000_000),
         });
         assert!(
             result < 0,
@@ -143,7 +143,7 @@ mod tests {
         let Ok(mut runtime) = Runtime::affine() else {
             panic!("the affine runtime must build on this host");
         };
-        let result = runtime.block_on(TimerFuture::new(1_000));
+        let result = runtime.block_on(SubmitProbe::new(1_000));
         // An io_uring timeout completes with -ETIME (errno 62), a negative
         // -errno -- never 0. Proves submit -> CQE -> drain -> wake -> result.
         assert!(
@@ -164,7 +164,7 @@ mod tests {
         let Ok(()) = kwokka_io::wake::signal_wake_fd(runtime.wake_fd) else {
             panic!("signaling the runtime wake fd must succeed");
         };
-        let result = runtime.block_on(TimerFuture::new(1_000));
+        let result = runtime.block_on(SubmitProbe::new(1_000));
         assert!(
             result < 0,
             "the timer resolves past the wake sentinel, got {result}",

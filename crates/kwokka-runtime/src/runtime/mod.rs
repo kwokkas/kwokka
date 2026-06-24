@@ -4,7 +4,9 @@
 mod affine;
 mod bootstrap;
 mod builder;
+mod crew;
 mod handle;
+mod probe;
 mod stealing;
 
 pub use builder::RuntimeBuilder;

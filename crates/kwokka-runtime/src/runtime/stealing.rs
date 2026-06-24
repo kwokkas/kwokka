@@ -37,15 +37,16 @@ use kwokka_io::{DriverType, wake};
 #[cfg(not(feature = "steal"))]
 use crate::worker::park::wake::wake_local;
 use crate::{
-    runtime::{bootstrap, handle::Runtime},
+    runtime::{
+        bootstrap,
+        crew::{Crew, CrewKind, MAX_WORKERS, sibling_id},
+        handle::Runtime,
+    },
     task::Stealing,
     worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard},
 };
 #[cfg(feature = "steal")]
 use crate::{scheduler::stealing::handoff, worker::park::wake::wake_or_forward};
-
-/// Most workers one stealing runtime drives -- the id-block allocator cap.
-pub(crate) const MAX_WORKERS: usize = 64;
 
 /// One stealing runtime per process: the crew shares the process-global
 /// wake tables, the shutdown flag, and a contiguous id block. Claimed at
@@ -64,85 +65,6 @@ static READY: AtomicUsize = AtomicUsize::new(0);
 /// turns it into an error.
 static BOOT_FAILED: AtomicBool = AtomicBool::new(false);
 
-/// The scheduler discipline a crew runs, selecting which shutdown barrier the
-/// join and reset paths raise.
-pub(crate) enum CrewKind {
-    /// A single-worker crew -- no siblings, no barrier.
-    Solo,
-    /// A work-stealing crew, joined through the stealing shutdown barrier.
-    Stealing,
-    /// A multi-worker affine crew, joined through the affine shutdown barrier.
-    Affine,
-}
-
-/// Sibling worker threads owned by the runtime handle.
-///
-/// The affine runtime carries a solo crew (no siblings) or a multi-worker
-/// affine crew; the stealing runtime carries one handle per spawned sibling.
-/// The handle's drop path joins the crew before the worker ids are released.
-pub(crate) struct Crew {
-    pub(crate) handles: [Option<thread::JoinHandle<()>>; MAX_WORKERS],
-    pub(crate) count: usize,
-    pub(crate) kind: CrewKind,
-}
-
-impl Crew {
-    /// A single-worker crew -- no siblings to spawn, signal, or join.
-    pub(crate) const fn solo() -> Self {
-        Self {
-            handles: [const { None }; MAX_WORKERS],
-            count: 1,
-            kind: CrewKind::Solo,
-        }
-    }
-
-    /// Raises the shutdown flag, unparks every sibling, and joins them.
-    ///
-    /// A no-op for a solo crew. Idempotent -- joined handles are taken, so
-    /// a second call finds nothing left to join.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a sibling worker thread itself panicked.
-    pub(crate) fn join_siblings(&mut self, lead: WorkerId) {
-        if self.count <= 1 {
-            return;
-        }
-        match self.kind {
-            CrewKind::Stealing => raise_shutdown(),
-            CrewKind::Affine => crate::runtime::affine::raise_shutdown(),
-            CrewKind::Solo => return,
-        }
-        for offset in 1..self.count {
-            registry::signal(sibling_id(lead, offset).raw());
-        }
-        for slot in &mut self.handles[..self.count - 1] {
-            let Some(handle) = slot.take() else {
-                continue;
-            };
-            let Ok(()) = handle.join() else {
-                panic!("a sibling worker thread panicked");
-            };
-        }
-    }
-
-    /// Releases the claimed worker ids and resets the crew statics.
-    ///
-    /// Runs after the sibling join and the lead's own drain, so a later
-    /// runtime claiming the same ids starts from clean slots.
-    pub(crate) fn release_ids(&self, lead: WorkerId) {
-        if self.count <= 1 {
-            registry::release(lead);
-            return;
-        }
-        registry::release_block(lead, self.count);
-        match self.kind {
-            CrewKind::Affine => crate::runtime::affine::reset_statics(),
-            CrewKind::Stealing | CrewKind::Solo => reset_statics(),
-        }
-    }
-}
-
 /// Resets the crew statics for the next stealing runtime in this process.
 pub(crate) fn reset_statics() {
     READY.store(0, Ordering::SeqCst);
@@ -155,22 +77,6 @@ pub(crate) fn reset_statics() {
 /// after its next pass and exits its loop.
 pub(crate) fn raise_shutdown() {
     SHUTDOWN.store(true, Ordering::SeqCst);
-}
-
-/// The sibling id at `offset` within the crew's contiguous block.
-///
-/// # Panics
-///
-/// Panics if the offset leaves the claimed block's id range, which the
-/// block allocator's contiguity contract rules out.
-pub(crate) fn sibling_id(lead: WorkerId, offset: usize) -> WorkerId {
-    let Ok(step) = u8::try_from(offset) else {
-        panic!("a crew offset fits a u8");
-    };
-    let Ok(id) = WorkerId::new(lead.raw() + step) else {
-        panic!("a claimed block stays inside the worker id space");
-    };
-    id
 }
 
 /// Builds the stealing runtime: claims the id block, builds the lead shard
@@ -510,8 +416,8 @@ mod tests {
     };
 
     use crate::{
-        runtime::builder::RuntimeBuilder,
-        task::{io::TimerFuture, scope_send},
+        runtime::{builder::RuntimeBuilder, probe::SubmitProbe},
+        task::scope_send,
     };
 
     /// Whether the io child completed on the thread of its first poll.
@@ -522,7 +428,7 @@ mod tests {
     static SLEEPER_MIGRATED: AtomicBool = AtomicBool::new(false);
 
     /// Submits one timeout through the cross-crate seam and resolves with the
-    /// drained result -- the seam-routed twin of [`TimerFuture`], standing in
+    /// drained result -- the seam-routed twin of [`SubmitProbe`], standing in
     /// for an I/O future hosted outside this crate.
     struct SeamTimer {
         /// Timeout in nanoseconds, submitted on the first poll.
@@ -553,7 +459,7 @@ mod tests {
                     Poll::Pending
                 }
                 // No seam, no driver, or a rejected op: resolve with -EINVAL
-                // rather than hang, mirroring TimerFuture's fallback.
+                // rather than hang, mirroring SubmitProbe's fallback.
                 _ => Poll::Ready(-22),
             }
         }
@@ -598,7 +504,7 @@ mod tests {
                 // The submit raises the in-flight counter before the child
                 // suspends, so there is no sleeping-with-zero window; the
                 // serve sweep must decline this child until the CQE lands.
-                let result = TimerFuture::new(50_000_000).await;
+                let result = SubmitProbe::new(50_000_000).await;
                 assert!(
                     result < 0,
                     "a completed timeout returns a negative -errno, got {result}",
@@ -638,5 +544,20 @@ mod tests {
             SEAM_IO_STAYED.load(Ordering::Relaxed),
             "the seam-routed in-flight child must complete on its issuing worker",
         );
+    }
+
+    #[test]
+    fn a_dropped_stealing_runtime_lets_the_next_one_build() {
+        // A single-worker stealing runtime sets `STEALING_LIVE` at build but
+        // claims a single id, so its drop takes the `count <= 1` path that once
+        // skipped the static reset. With the reset skipped this second build
+        // fails as already live.
+        let Ok(first) = RuntimeBuilder::new().stealing() else {
+            panic!("the first single-worker stealing runtime must build");
+        };
+        drop(first);
+        let Ok(_second) = RuntimeBuilder::new().stealing() else {
+            panic!("a stealing runtime must build after the previous one dropped");
+        };
     }
 }

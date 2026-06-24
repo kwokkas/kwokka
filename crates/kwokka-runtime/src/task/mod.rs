@@ -2,7 +2,6 @@
 
 pub(crate) mod cell;
 mod identity;
-pub(crate) mod io;
 pub(crate) mod join;
 mod marker;
 pub(crate) mod state;
