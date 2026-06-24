@@ -17,10 +17,10 @@ use kwokka_io::DriverType;
 #[cfg(feature = "steal")]
 use crate::scheduler::stealing::relocate::ForwardTable;
 #[cfg(feature = "steal")]
-use crate::worker::wake::wake_or_forward;
+use crate::worker::park::wake::wake_or_forward;
 use crate::{
     scheduler::{dispatch::PollOutcome, queue::LocalRunQueue},
-    task::{TaskRef, children::push_child, slot::TaskSlot},
+    task::{TaskRef, cell::slot::TaskSlot, join::children::push_child},
     timer::{
         clock::Clock,
         request::{TIMER_INBOX_CAPACITY, TimerInbox},
@@ -28,10 +28,12 @@ use crate::{
     },
     worker::{
         WorkerId,
-        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-        polling::poll_one,
-        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
-        wake::wake_local,
+        park::wake::wake_local,
+        poll::polling::poll_one,
+        queue::{
+            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        },
     },
 };
 
@@ -203,7 +205,10 @@ mod tests {
     use super::{Tick, drain_spawns, tick};
     use crate::{
         scheduler::{dispatch::spawn_insert, queue::LocalRunQueue},
-        task::{header::Slot, slot::TaskSlot, state::TaskState},
+        task::{
+            cell::{header::Slot, slot::TaskSlot},
+            state::TaskState,
+        },
         timer::{
             clock::Clock,
             request::{TIMER_INBOX_CAPACITY, TimerInbox},
@@ -211,8 +216,10 @@ mod tests {
         },
         worker::{
             WorkerId,
-            inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
-            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+            queue::{
+                inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
+                reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+            },
         },
     };
 

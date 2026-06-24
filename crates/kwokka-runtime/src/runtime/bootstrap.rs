@@ -28,15 +28,16 @@ use crate::{
     timer::clock::SystemClock,
     worker::{
         cycle::{self, Tick},
-        reap, registry,
+        park::wake::wake_local,
+        queue::reap,
+        registry,
         shard::WorkerShard,
-        wake::wake_local,
     },
 };
 #[cfg(feature = "steal")]
 use crate::{
     scheduler::stealing::{handoff, relocate::SettledNote},
-    worker::wake::wake_or_forward,
+    worker::park::wake::wake_or_forward,
 };
 
 /// Arms the worker's wake fd on its ring so a remote signal can complete a

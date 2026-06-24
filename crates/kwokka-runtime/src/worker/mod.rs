@@ -7,14 +7,11 @@
 
 pub(crate) mod coordination;
 pub(crate) mod cycle;
-pub(crate) mod endpoint;
-pub(crate) mod frame;
 mod id;
-pub(crate) mod inbox;
-pub(crate) mod polling;
-pub(crate) mod reap;
+pub(crate) mod park;
+pub(crate) mod poll;
+pub(crate) mod queue;
 pub(crate) mod shard;
-pub(crate) mod wake;
 
 pub(crate) use coordination as registry;
 pub use id::{WorkerError, WorkerId};

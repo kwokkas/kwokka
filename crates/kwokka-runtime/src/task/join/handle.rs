@@ -28,7 +28,7 @@ use kwokka_core::id::Pip;
 
 use crate::{
     task::{TaskRef, marker::Mode},
-    worker::{WorkerId, polling},
+    worker::{WorkerId, poll::polling},
 };
 
 /// Owning handle to a spawned task.

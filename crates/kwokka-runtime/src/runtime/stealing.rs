@@ -35,14 +35,14 @@ use kwokka_core::slab::SlabKey;
 use kwokka_io::{DriverType, wake};
 
 #[cfg(not(feature = "steal"))]
-use crate::worker::wake::wake_local;
+use crate::worker::park::wake::wake_local;
 use crate::{
     runtime::{bootstrap, handle::Runtime},
     task::Stealing,
     worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard},
 };
 #[cfg(feature = "steal")]
-use crate::{scheduler::stealing::handoff, worker::wake::wake_or_forward};
+use crate::{scheduler::stealing::handoff, worker::park::wake::wake_or_forward};
 
 /// Most workers one stealing runtime drives -- the id-block allocator cap.
 pub(crate) const MAX_WORKERS: usize = 64;

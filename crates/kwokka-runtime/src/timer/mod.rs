@@ -11,10 +11,8 @@
 )]
 
 pub(crate) mod clock;
-pub(crate) mod entry;
-pub(crate) mod handle;
 pub(crate) mod request;
-pub(crate) mod slot;
+mod sleeping;
 pub(crate) mod wheel;
 
-pub(crate) use handle::{TimerHandle, nz_to_slab, slab_to_nz};
+pub use sleeping::{Sleep, sleep};

@@ -22,8 +22,10 @@ use core::{
 use kwokka_core::{id::Pip, namespace::Namespace};
 
 use crate::task::{
-    header::{TaskHeader, TaskVTable},
-    slot::TaskSlot,
+    cell::{
+        header::{TaskHeader, TaskVTable},
+        slot::TaskSlot,
+    },
     state::TaskState,
 };
 
@@ -292,7 +294,7 @@ impl<F: Future> Slot<F> {
 /// Type-erased operations on the slab-stored [`TaskSlot`] cell.
 ///
 /// All pointer reinterpretation of the erased cell lives here -- an
-/// already-permitted-unsafe module -- so [`slot`](crate::task::slot) stays
+/// already-permitted-unsafe module -- so [`slot`](crate::task::cell::slot) stays
 /// free of the `unsafe` keyword (its `Drop` calls [`TaskSlot::drop_via_vtable`]).
 impl TaskSlot {
     /// Borrows the [`TaskHeader`] at the cell's offset 0.
@@ -470,7 +472,10 @@ mod tests {
     };
 
     use super::*;
-    use crate::task::{header::WakeData, slot::TaskSlot, state::TaskState};
+    use crate::task::{
+        cell::{header::WakeData, slot::TaskSlot},
+        state::TaskState,
+    };
 
     /// Counts how many times each side of the cell has been dropped, used by
     /// `drop_in_place` branching tests.

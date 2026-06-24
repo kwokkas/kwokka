@@ -25,8 +25,8 @@ use core::{
 use kwokka_io::operation::{IoRequest, SubmitResult};
 
 use crate::{
-    task::{header::WakeData, waker},
-    worker::{WorkerId, polling},
+    task::{cell::header::WakeData, waker},
+    worker::{WorkerId, poll::polling},
 };
 
 /// A future that submits one internal timeout op and resolves with its result.

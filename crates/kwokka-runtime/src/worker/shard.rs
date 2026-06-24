@@ -14,7 +14,7 @@ use kwokka_io::DriverType;
 use crate::scheduler::stealing::{handoff::ForwardOrigin, relocate::ForwardTable};
 use crate::{
     scheduler::queue::LocalRunQueue,
-    task::slot::TaskSlot,
+    task::cell::slot::TaskSlot,
     timer::{
         clock::SystemClock,
         request::{TIMER_INBOX_CAPACITY, TimerInbox},
@@ -22,8 +22,10 @@ use crate::{
     },
     worker::{
         WorkerId,
-        inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
-        reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        queue::{
+            inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
+            reap::{REAP_QUEUE_CAPACITY, ReapQueue},
+        },
     },
 };
 

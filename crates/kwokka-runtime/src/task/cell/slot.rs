@@ -13,7 +13,7 @@ use core::{cell::UnsafeCell, mem::MaybeUninit};
 /// `Slot<F>` (header plus the future cell, sized per `F`) cannot be stored
 /// directly. Instead every task occupies a fixed [`Self::CELL_BYTES`]-byte,
 /// [`Self::CELL_ALIGN`]-aligned cell into which the concrete `Slot<F>` is
-/// written by [`Slot::into_erased`](crate::task::header::Slot::into_erased),
+/// written by [`Slot::into_erased`](crate::task::cell::header::Slot::into_erased),
 /// header at offset 0. Type-erased `poll` and `drop` reach the future
 /// through the header vtable.
 ///
@@ -44,7 +44,7 @@ impl TaskSlot {
     /// Uninitialized cell.
     ///
     /// The returned value must be filled via
-    /// [`Slot::into_erased`](crate::task::header::Slot::into_erased) before it
+    /// [`Slot::into_erased`](crate::task::cell::header::Slot::into_erased) before it
     /// is dropped or read; dropping an unfilled cell would invoke the vtable
     /// on garbage. `into_erased` is the sole caller and fills it with no
     /// intervening panic point.
