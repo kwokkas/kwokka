@@ -21,6 +21,8 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_PLZ_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
@@ -45,6 +47,8 @@ jobs:
         with:
           app-id: ${{ vars.RELEASE_PLZ_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_KEY }}
+          permission-contents: write
+          permission-pull-requests: read
       - uses: actions/checkout@v6
         with:
           fetch-depth: 0
