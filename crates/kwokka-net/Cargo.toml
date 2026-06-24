@@ -16,7 +16,7 @@ categories = ["asynchronous", "network-programming"]
 kwokka-io.workspace = true
 
 [dev-dependencies]
-kwokka-runtime.workspace = true
+kwokka-runtime = { path = "../kwokka-runtime" }
 
 [lints]
 workspace = true
