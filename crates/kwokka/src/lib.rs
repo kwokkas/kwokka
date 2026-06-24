@@ -17,8 +17,8 @@
 //! Network and filesystem endpoints live under the `net` and `fs`
 //! modules, each gated behind its own feature (`net`, `fs`, or `full`)
 //! so a minimal build pulls in neither. Every runtime task carries a
-//! tree-structured identity for tracing; the runtime does not hand it
-//! back yet, and task introspection surfaces it in a later release.
+//! tree-structured identity for tracing, but the runtime does not hand
+//! it back yet.
 //!
 //! # Examples
 //!
