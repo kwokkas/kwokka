@@ -7,7 +7,12 @@ use kwokka_core::slab::{Slab, SlabError};
 use crate::{
     task::TaskRef,
     timer::{
-        TimerHandle, clock::Clock, entry::TimerEntry, nz_to_slab, slab_to_nz, slot::WheelLevel,
+        clock::Clock,
+        wheel::{
+            entry::TimerEntry,
+            handle::{TimerHandle, nz_to_slab, slab_to_nz},
+            slot::WheelLevel,
+        },
     },
 };
 
