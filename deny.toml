@@ -32,6 +32,11 @@ private = { ignore = false }
 # duplicate version is a defect to resolve, not to tolerate.
 multiple-versions = "deny"
 wildcards = "deny"
+# kwokka-macros dev-depends on the facade through a path-only entry (no
+# version, so cargo drops it when packaging and the publish order cannot
+# deadlock). A path-only dependency reads as a wildcard; allow it for path
+# entries while registry wildcards stay denied.
+allow-wildcard-paths = true
 
 [advisories]
 db-path = "~/.cargo/advisory-db"
