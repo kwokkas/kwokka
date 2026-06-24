@@ -1,6 +1,6 @@
 [package]
 name = "kwokka-fs"
-version = "0.0.1"
+version = "0.0.2"
 description = "asynchronous file I/O for the kwokka runtime"
 readme = "README.md"
 edition.workspace = true
