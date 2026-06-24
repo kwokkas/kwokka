@@ -3,11 +3,12 @@
 // replacing the declarative labeler.yml plus the actions/labeler step.
 //
 //   1. Area `A-*` labels from changed paths (crate, ci, build, docs).
-//   2. `unsafe` when a .rs diff adds a real unsafe construct (unsafe
+//   2. Module `M-*` labels from changed paths under a subsystem directory.
+//   3. `unsafe` when a .rs diff adds a real unsafe construct (unsafe
 //      fn/impl/trait/extern, or an unsafe block). Comment and string
 //      mentions of the word do not count.
-//   3. `kwokka` (a maintainer work unit) when the author is OWNER or MEMBER.
-//   4. Require at least one `A-*` area label, failing the PR otherwise.
+//   4. `kwokka` (a maintainer work unit) when the author is OWNER or MEMBER.
+//   5. Require at least one `A-*` area label, failing the PR otherwise.
 
 const areaFor = (path) => {
   const crate = path.match(/^crates\/kwokka-([a-z]+)\//);
@@ -32,6 +33,24 @@ const areaFor = (path) => {
   return null;
 };
 
+// Module `M-*` labels from changed paths: a diff under a subsystem's
+// directory (or its dedicated runtime file) tags the matching module.
+const moduleFor = (path) => {
+  const rt = path.match(/^crates\/kwokka-runtime\/src\/(task|worker|timer|sync)\//);
+  if (rt) return `M-${rt[1]}`;
+  if (/^crates\/kwokka-runtime\/src\/scheduler\/affine\//.test(path)) return "M-affine";
+  if (/^crates\/kwokka-runtime\/src\/scheduler\/stealing\//.test(path)) return "M-stealing";
+  if (/^crates\/kwokka-runtime\/src\/scheduler\//.test(path)) return "M-scheduler";
+  if (/^crates\/kwokka-runtime\/src\/runtime\/affine\b/.test(path)) return "M-affine";
+  if (/^crates\/kwokka-runtime\/src\/runtime\/stealing\b/.test(path)) return "M-stealing";
+  const io = path.match(
+    /^crates\/kwokka-io\/src\/(buffer|uring|epoll|kqueue|iocp|operation)\//,
+  );
+  if (io) return `M-${io[1]}`;
+  if (/^crates\/kwokka-io\/src\/(driver|dispatch)\.rs$/.test(path)) return "M-driver";
+  return null;
+};
+
 module.exports = async ({ github, context, core }) => {
   const { owner, repo } = context.repo;
   const pr = context.payload.pull_request;
@@ -48,6 +67,8 @@ module.exports = async ({ github, context, core }) => {
   for (const f of files) {
     const area = areaFor(f.filename);
     if (area) labels.add(area);
+    const mod = moduleFor(f.filename);
+    if (mod) labels.add(mod);
   }
 
   // Only an added line of real Rust code (not a comment) that uses an
