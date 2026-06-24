@@ -12,4 +12,7 @@
 
 pub(crate) mod clock;
 pub(crate) mod request;
+mod sleeping;
 pub(crate) mod wheel;
+
+pub use sleeping::{Sleep, sleep};

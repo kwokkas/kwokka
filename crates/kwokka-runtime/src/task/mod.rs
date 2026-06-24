@@ -5,7 +5,6 @@ mod identity;
 pub(crate) mod io;
 pub(crate) mod join;
 mod marker;
-mod sleeping;
 pub(crate) mod state;
 pub(crate) mod waker;
 mod yielding;
@@ -16,5 +15,4 @@ pub use join::{
     scope::{Scope, SpawnError, scope, scope_send},
 };
 pub use marker::{Affine, Mode, Stealing};
-pub use sleeping::{Sleep, sleep};
 pub use yielding::{YieldNow, yield_now};

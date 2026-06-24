@@ -4,4 +4,4 @@
 //! and resumes it once the runtime timer fires. The returned [`Sleep`]
 //! future parks the task rather than spinning while it waits.
 
-pub use kwokka_runtime::task::{Sleep, sleep};
+pub use kwokka_runtime::timer::{Sleep, sleep};
