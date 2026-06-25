@@ -166,3 +166,18 @@ jobs:
       - uses: ./.github/actions/rust-env
       - run: rustup target add aarch64-unknown-linux-gnu
       - run: cargo check --workspace --all-features --target aarch64-unknown-linux-gnu
+
+  # Time-boxed fuzzing of the cargo-fuzz targets. cargo-fuzz drives libFuzzer
+  # under ASAN; a short per-target budget catches regressions on the daily
+  # sweep without an unbounded campaign. The corpus is gitignored, so each run
+  # starts fresh from the structured Arbitrary inputs.
+  fuzz:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ inputs.ref || github.ref }}
+      - uses: dtolnay/rust-toolchain@nightly
+      - run: cargo install cargo-fuzz --locked
+      - run: cargo +nightly fuzz run addr_pack -- -max_total_time=60
