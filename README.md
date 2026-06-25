@@ -8,6 +8,7 @@
 [![crates.io](https://img.shields.io/crates/v/kwokka.svg)](https://crates.io/crates/kwokka)
 [![docs.rs](https://docs.rs/kwokka/badge.svg)](https://docs.rs/kwokka)
 [![CI](https://github.com/kwokkas/kwokka/actions/workflows/test.yml/badge.svg)](https://github.com/kwokkas/kwokka/actions/workflows/test.yml)
+[![codecov](https://codecov.io/gh/kwokkas/kwokka/branch/main/graph/badge.svg)](https://codecov.io/gh/kwokkas/kwokka)
 [![MSRV](https://img.shields.io/badge/MSRV-1.85.0-blue.svg)](#supported-rust-versions)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 

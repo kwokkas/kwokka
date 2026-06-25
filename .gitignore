@@ -6,6 +6,8 @@
 *.profraw
 *.profdata
 /coverage
+/codecov.json
+/coverage.txt
 perf.data*
 
 # Editor / IDE
