@@ -486,7 +486,18 @@ mod tests {
         }
     }
 
+    /// Both cases build the process-singleton stealing runtime guarded by
+    /// `STEALING_LIVE`. A single `#[test]` entry runs them in sequence so a
+    /// shared-process test binary never overlaps the two builds; the first
+    /// helper's runtime drops at its scope end, releasing the guard before the
+    /// second builds. Process-isolated runners do not need this, but it keeps
+    /// the suite correct under both.
     #[test]
+    fn stealing_runtime_singleton_cases() {
+        an_in_flight_op_completes_on_its_issuing_worker();
+        a_dropped_stealing_runtime_lets_the_next_one_build();
+    }
+
     fn an_in_flight_op_completes_on_its_issuing_worker() {
         let Ok(mut runtime) = RuntimeBuilder::new().workers(2).stealing() else {
             panic!("a two-worker stealing runtime must build on this host");
@@ -546,7 +557,6 @@ mod tests {
         );
     }
 
-    #[test]
     fn a_dropped_stealing_runtime_lets_the_next_one_build() {
         // A single-worker stealing runtime sets `STEALING_LIVE` at build but
         // claims a single id, so its drop takes the `count <= 1` path that once
