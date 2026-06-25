@@ -3,3 +3,7 @@
 
 # Keep the CI helper scripts out of the repo language statistics.
 .github/scripts/** linguist-vendored
+
+# Keep the Nix dev shell out of the repo language statistics.
+flake.nix linguist-vendored
+flake.lock linguist-generated
