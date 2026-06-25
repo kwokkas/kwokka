@@ -104,8 +104,11 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: Measure coverage
         shell: bash
+        run: cargo llvm-cov nextest --workspace --all-features --no-report
+      - name: Report coverage to the run summary
+        shell: bash
         run: |
-          cargo llvm-cov nextest --workspace --all-features --summary-only | tee coverage.txt
+          cargo llvm-cov report --summary-only | tee coverage.txt
           {
             echo '### Coverage'
             echo ''
@@ -113,3 +116,11 @@ jobs:
             cat coverage.txt
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: Generate the codecov report
+        run: cargo llvm-cov report --codecov --output-path codecov.json
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v5
+        with:
+          files: codecov.json
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
