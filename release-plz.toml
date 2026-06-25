@@ -5,7 +5,7 @@ git_release_enable = false
 release_always = false
 semver_check = false
 release_commits = '^(feat|fix|perf|refactor|docs|build)(\(.+?\))?!?:'
-pr_name = "chore: release{% if package and version %} {{ package }} v{{ version }}{% endif %}"
+pr_name = "chore: release{% if package is defined and version is defined %} {{ package }} v{{ version }}{% endif %}"
 pr_labels = ["release"]
 publish_timeout = "10m"
 
