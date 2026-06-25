@@ -4,6 +4,7 @@ git_tag_enable = false
 git_release_enable = false
 release_always = false
 semver_check = false
+release_commits = "^(feat|fix|perf|refactor|docs|build)[(:]"
 pr_labels = ["release"]
 publish_timeout = "10m"
 
@@ -19,7 +20,6 @@ commit_parsers = [
   { message = "^refactor", group = "Refactor" },
   { message = "^docs", group = "Documentation" },
   { message = "^build", group = "Build" },
-  { message = "^revert", group = "Reverts" },
-  { message = "^(ci|chore|test)", skip = true },
+  { message = "^(ci|chore|test|revert)", skip = true },
   { message = ".*", group = "Other" },
 ]
