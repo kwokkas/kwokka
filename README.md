@@ -12,10 +12,9 @@
 [![MSRV](https://img.shields.io/badge/MSRV-1.85.0-blue.svg)](#supported-rust-versions)
 [![license](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 
-> [!WARNING]
-> Kwokka is at 0.1.0. The public API is settled but pre-1.0 and can
-> still change before 1.0. Orchestration and a Tokio compatibility layer
-> arrive in later releases.
+A completion-native async runtime for Rust on io_uring. You pick the
+scheduler, and the kernel completes your I/O while the hot path stays
+off the heap.
 
 ## Getting started
 
@@ -59,8 +58,8 @@ that move toward idle workers.
 
 ## Features
 
-- Completion-native I/O on io_uring, with epoll and kqueue planned
-  behind the same API.
+- Completion-native I/O on io_uring, with epoll, kqueue, and IOCP
+  planned behind the same API.
 - Two schedulers you pick explicitly: thread-per-core (`affine`) and
   work-stealing (`stealing`).
 - Enum-based dispatch, with no trait objects or vtables in the runtime.
@@ -72,6 +71,8 @@ that move toward idle workers.
   reference counting.
 - Structured concurrency through scopes, so a scope waits for its
   children.
+- Wall-clock timers: `time::sleep` suspends a task without blocking its
+  worker.
 - TCP and file I/O behind the `net` and `fs` features.
 
 ## Examples
