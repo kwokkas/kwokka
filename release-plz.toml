@@ -18,10 +18,8 @@ commit_parsers = [
   { message = "^perf", group = "Performance" },
   { message = "^refactor", group = "Refactor" },
   { message = "^docs", group = "Documentation" },
-  { message = "^test", group = "Testing" },
   { message = "^build", group = "Build" },
-  { message = "^security", group = "Security" },
   { message = "^revert", group = "Reverts" },
-  { message = "^(ci|chore)", skip = true },
+  { message = "^(ci|chore|test)", skip = true },
   { message = ".*", group = "Other" },
 ]
