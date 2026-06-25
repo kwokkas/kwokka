@@ -1,0 +1,27 @@
+[package]
+name = "kwokka-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+# Independent workspace: keeps fuzz out of the parent `cargo build --workspace`.
+# libfuzzer needs nightly plus the sanitizer, so fuzz builds only under
+# `cargo +nightly fuzz`.
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+
+[dependencies.kwokka-io]
+path = "../crates/kwokka-io"
+
+[[bin]]
+name = "addr_pack"
+path = "fuzz_targets/addr_pack.rs"
+test = false
+doc = false
+bench = false
