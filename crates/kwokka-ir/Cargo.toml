@@ -1,0 +1,15 @@
+[package]
+name = "kwokka-ir"
+version = "0.0.1"
+description = "language-neutral typed IR for kwokka orchestration specs"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["async", "runtime", "kwokka"]
+categories = ["asynchronous", "data-structures"]
+
+[lints]
+workspace = true

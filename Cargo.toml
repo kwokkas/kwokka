@@ -8,6 +8,7 @@ members = [
     "crates/kwokka-core",
     "crates/kwokka-fs",
     "crates/kwokka-io",
+    "crates/kwokka-ir",
     "crates/kwokka-macros",
     "crates/kwokka-net",
     "crates/kwokka-runtime",
@@ -35,6 +36,7 @@ kwokka = { path = "crates/kwokka" }
 kwokka-core = { path = "crates/kwokka-core", version = "0.0.1" }
 kwokka-fs = { path = "crates/kwokka-fs", version = "0.0.2" }
 kwokka-io = { path = "crates/kwokka-io", version = "0.0.1" }
+kwokka-ir = { path = "crates/kwokka-ir", version = "0.0.1" }
 kwokka-macros = { path = "crates/kwokka-macros", version = "0.0.1" }
 kwokka-net = { path = "crates/kwokka-net", version = "0.0.2" }
 kwokka-runtime = { path = "crates/kwokka-runtime", version = "0.0.2" }

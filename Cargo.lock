@@ -131,6 +131,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "kwokka-ir"
+version = "0.0.1"
+
+[[package]]
 name = "kwokka-macros"
 version = "0.0.1"
 dependencies = [
