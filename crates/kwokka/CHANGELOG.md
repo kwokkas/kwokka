@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1](https://github.com/kwokkas/kwokka/compare/kwokka-v0.1.0...kwokka-v0.1.1) - 2026-06-25
+
+### Documentation
+
+- align the readme intro and features to 0.1.0 ([#159](https://github.com/kwokkas/kwokka/pull/159))
+
 ## [0.1.0](https://github.com/kwokkas/kwokka/compare/kwokka-v0.1.0-rc.1...kwokka-v0.1.0) - 2026-06-24
 
 ### Build
