@@ -2,11 +2,11 @@
 
 /// A validated kwokka IR blob.
 ///
-/// Wraps the raw bytes of an IR blob. Construct via
-/// [`KwokkaIr::from_trusted`] for in-arena bytes the writer produced in
-/// this process, or via the validating reader for untrusted wire input
-/// (added in a later step). Accessors return already-bounds-checked
-/// views.
+/// Wraps the raw bytes of an IR blob. The only safe public way to obtain
+/// one will be the validating reader (added next); the in-process
+/// construction path is `pub(crate)` so an untrusted caller cannot
+/// fabricate a `KwokkaIr` that skips validation. Accessors return
+/// already-bounds-checked views.
 #[derive(Debug, Clone, Copy)]
 pub struct KwokkaIr<'a> {
     bytes: &'a [u8],
@@ -15,12 +15,18 @@ pub struct KwokkaIr<'a> {
 impl<'a> KwokkaIr<'a> {
     /// Wraps trusted in-process bytes, skipping validation.
     ///
-    /// The caller guarantees `bytes` is a blob produced by this crate's
-    /// writer in the same process, so its structure is already sound.
-    /// Bytes from outside the process must go through the validating
-    /// reader instead.
+    /// Crate-internal: the validating reader is the only safe public
+    /// entry point. The caller guarantees `bytes` is a blob this crate's
+    /// writer produced in the same process, so its structure is sound.
     #[must_use]
-    pub const fn from_trusted(bytes: &'a [u8]) -> Self {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the validating reader, added next, is the first caller"
+        )
+    )]
+    pub(crate) const fn from_trusted(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
 
@@ -28,5 +34,17 @@ impl<'a> KwokkaIr<'a> {
     #[must_use]
     pub const fn as_bytes(&self) -> &'a [u8] {
         self.bytes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_trusted_round_trips() {
+        let bytes = [0x4b, 0x57, 0x49, 0x52];
+        let ir = KwokkaIr::from_trusted(&bytes);
+        assert_eq!(ir.as_bytes(), &bytes);
     }
 }
