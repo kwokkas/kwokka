@@ -3,12 +3,12 @@
 //! [`validate`] is the only safe public way to obtain a [`KwokkaIr`] from
 //! wire-loaded bytes. It bounds-checks the header and the root record
 //! frame before any structural read, upholding the two-tier trust model:
-//! in-process bytes are trusted ([`KwokkaIr::from_trusted`]), wire bytes
+//! in-process bytes are trusted (`KwokkaIr::from_trusted`), wire bytes
 //! are not.
 
 use crate::{
     error::IrError,
-    flat::{HEADER_LEN, MAGIC, VERSION},
+    flat::{HEADER_LEN, MAGIC, VERSION, header::ROOT_OFFSET_FIELD},
     node::{KwokkaIr, NodeTag},
 };
 
@@ -19,19 +19,12 @@ const RECORD_HEADER_LEN: usize = 8;
 const RECORD_ALIGN: usize = 8;
 
 /// A bounds-checked view of one record frame.
-struct RecordView<'a> {
+pub(crate) struct RecordView<'a> {
     /// The decoded record tag.
-    tag: NodeTag,
+    pub(crate) tag: NodeTag,
     /// The record body: the bytes after the frame header, up to the
     /// record length.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the conductor and policy views, added next, read the body"
-        )
-    )]
-    body: &'a [u8],
+    pub(crate) body: &'a [u8],
 }
 
 /// Reads a little-endian `u16` at `offset`.
@@ -52,7 +45,7 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IrError> {
 /// # Errors
 ///
 /// Returns [`IrError::Truncated`] if `offset..offset + 4` is out of range.
-fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IrError> {
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IrError> {
     let end = offset.checked_add(4).ok_or(IrError::Truncated)?;
     match bytes.get(offset..end) {
         Some(&[a, b, c, d]) => Ok(u32::from_le_bytes([a, b, c, d])),
@@ -69,7 +62,7 @@ fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IrError> {
 /// blob or its length cannot hold the frame header, [`IrError::Truncated`]
 /// if the frame header itself is out of range, and [`IrError::BadTag`] if
 /// the tag is not a recognized record kind.
-fn read_record(bytes: &[u8], offset: usize) -> Result<RecordView<'_>, IrError> {
+pub(crate) fn read_record(bytes: &[u8], offset: usize) -> Result<RecordView<'_>, IrError> {
     if offset % RECORD_ALIGN != 0 {
         return Err(IrError::Misaligned);
     }
@@ -123,7 +116,7 @@ pub fn validate(bytes: &[u8]) -> Result<KwokkaIr<'_>, IrError> {
     if total_len != bytes.len() {
         return Err(IrError::Truncated);
     }
-    let root_offset = read_u32(bytes, 12)? as usize;
+    let root_offset = read_u32(bytes, ROOT_OFFSET_FIELD)? as usize;
     let root = read_record(bytes, root_offset)?;
     if root.tag != NodeTag::ConductorSpec {
         return Err(IrError::BadTag {

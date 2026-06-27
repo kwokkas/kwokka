@@ -19,3 +19,6 @@ pub const VERSION: u16 = 1;
 
 /// Total byte length of the header.
 pub const HEADER_LEN: usize = 16;
+
+/// Byte offset of the `root_offset` field within the header.
+pub(crate) const ROOT_OFFSET_FIELD: usize = 12;
