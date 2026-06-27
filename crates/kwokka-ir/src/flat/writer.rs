@@ -645,8 +645,10 @@ mod tests {
         };
         let mut buf = [0u8; 128];
         let written = write_conductor(&mut buf, &blob).unwrap_or(0);
-        let result = validate(&buf[..written]).and_then(|ir| ir.conductor());
-        assert_eq!(result, Err(IrError::OrdinalOutOfRange));
+        assert!(matches!(
+            validate(&buf[..written]),
+            Err(IrError::OrdinalOutOfRange)
+        ));
     }
 
     #[test]
@@ -664,8 +666,10 @@ mod tests {
         };
         let mut buf = [0u8; 128];
         let written = write_conductor(&mut buf, &blob).unwrap_or(0);
-        let result = validate(&buf[..written]).and_then(|ir| ir.conductor());
-        assert_eq!(result, Err(IrError::OrdinalOutOfRange));
+        assert!(matches!(
+            validate(&buf[..written]),
+            Err(IrError::OrdinalOutOfRange)
+        ));
     }
 
     #[test]

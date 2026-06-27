@@ -152,6 +152,7 @@ pub fn validate(bytes: &[u8]) -> Result<KwokkaIr<'_>, IrError> {
             tag: root.tag as u16,
         });
     }
+    crate::conductor::ConductorView::parse(root.body)?;
     Ok(KwokkaIr::from_trusted(bytes))
 }
 
@@ -178,9 +179,24 @@ mod tests {
         blob
     }
 
+    /// A blob whose root `ConductorSpec` carries a valid 24-byte empty
+    /// conductor body, so eager `validate` accepts it.
+    fn valid_conductor_blob() -> [u8; 48] {
+        let mut blob = [0u8; 48];
+        blob[..MAGIC.len()].copy_from_slice(&MAGIC);
+        blob[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        blob[8..12].copy_from_slice(&le32(48));
+        blob[12..16].copy_from_slice(&le32(ROOT_OFFSET));
+        blob[16..18].copy_from_slice(&(NodeTag::ConductorSpec as u16).to_le_bytes());
+        blob[20..24].copy_from_slice(&le32(RECORD_HEADER_LEN + 24));
+        blob[32..36].copy_from_slice(&le32(24));
+        blob[36..40].copy_from_slice(&le32(24));
+        blob
+    }
+
     #[test]
     fn accepts_a_minimal_valid_blob() {
-        let blob = valid_blob();
+        let blob = valid_conductor_blob();
         assert_eq!(validate(&blob).map(|ir| ir.as_bytes()), Ok(&blob[..]));
     }
 
