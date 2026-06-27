@@ -18,8 +18,10 @@ pub mod conductor;
 pub mod error;
 pub mod flat;
 pub mod node;
+pub mod policy;
 
-pub use conductor::{ConductorView, EdgeView};
+pub use conductor::{ConductorView, EdgeView, StageView};
 pub use error::IrError;
 pub use flat::validate;
 pub use node::{KwokkaIr, NodeTag};
+pub use policy::{BreakerView, LimiterView, PolicyKind, RetryView, TimeoutView};
