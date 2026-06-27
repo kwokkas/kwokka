@@ -19,4 +19,5 @@ pub mod flat;
 pub mod node;
 
 pub use error::IrError;
+pub use flat::validate;
 pub use node::{KwokkaIr, NodeTag};
