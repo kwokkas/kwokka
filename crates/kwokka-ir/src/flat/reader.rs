@@ -40,6 +40,15 @@ fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IrError> {
     }
 }
 
+/// Reads a `u8` at `offset`.
+///
+/// # Errors
+///
+/// Returns [`IrError::Truncated`] if `offset` is out of range.
+pub(crate) fn read_u8(bytes: &[u8], offset: usize) -> Result<u8, IrError> {
+    bytes.get(offset).copied().ok_or(IrError::Truncated)
+}
+
 /// Reads a little-endian `u32` at `offset`.
 ///
 /// # Errors
@@ -51,6 +60,20 @@ pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Result<u32, IrError> {
         Some(&[a, b, c, d]) => Ok(u32::from_le_bytes([a, b, c, d])),
         _ => Err(IrError::Truncated),
     }
+}
+
+/// Reads a little-endian `u64` at `offset`.
+///
+/// # Errors
+///
+/// Returns [`IrError::Truncated`] if `offset..offset + 8` is out of range.
+pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Result<u64, IrError> {
+    let end = offset.checked_add(8).ok_or(IrError::Truncated)?;
+    let chunk: [u8; 8] = bytes
+        .get(offset..end)
+        .and_then(|slice| slice.try_into().ok())
+        .ok_or(IrError::Truncated)?;
+    Ok(u64::from_le_bytes(chunk))
 }
 
 /// Reads and bounds-checks the record frame at `offset`.

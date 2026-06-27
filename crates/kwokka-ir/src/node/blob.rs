@@ -71,18 +71,20 @@ mod tests {
         assert_eq!(ir.as_bytes(), &bytes);
     }
 
-    fn conductor_blob() -> [u8; 48] {
-        let mut blob = [0u8; 48];
+    fn conductor_blob() -> [u8; 80] {
+        let mut blob = [0u8; 80];
         blob[..MAGIC.len()].copy_from_slice(&MAGIC);
         blob[4..6].copy_from_slice(&VERSION.to_le_bytes());
-        blob[8..12].copy_from_slice(&48u32.to_le_bytes());
+        blob[8..12].copy_from_slice(&80u32.to_le_bytes());
         blob[12..16].copy_from_slice(&16u32.to_le_bytes());
         blob[16..18].copy_from_slice(&(NodeTag::ConductorSpec as u16).to_le_bytes());
-        blob[20..24].copy_from_slice(&32u32.to_le_bytes());
+        blob[20..24].copy_from_slice(&64u32.to_le_bytes());
         blob[24..28].copy_from_slice(&2u32.to_le_bytes());
         blob[28..32].copy_from_slice(&1u32.to_le_bytes());
-        blob[36..40].copy_from_slice(&16u32.to_le_bytes());
-        blob[42..44].copy_from_slice(&1u16.to_le_bytes());
+        blob[32..36].copy_from_slice(&16u32.to_le_bytes());
+        blob[36..40].copy_from_slice(&48u32.to_le_bytes());
+        blob[72..74].copy_from_slice(&0u16.to_le_bytes());
+        blob[74..76].copy_from_slice(&1u16.to_le_bytes());
         blob
     }
 
