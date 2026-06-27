@@ -120,9 +120,10 @@ impl StageSpec {
         Ok(total)
     }
 
-    /// The four slots' record body lengths in `guard()` order, `None` when
-    /// the slot is empty.
-    const fn record_body_lens(&self) -> [Option<usize>; 4] {
+    /// The slots' record body lengths in `guard()` order, `None` when the
+    /// slot is empty. The array length is pinned to [`PolicyKind::COUNT`],
+    /// so adding a policy kind without a slot here fails to compile.
+    const fn record_body_lens(&self) -> [Option<usize>; PolicyKind::COUNT] {
         [
             match self.limiter {
                 Some(_) => Some(LimiterView::LEN),

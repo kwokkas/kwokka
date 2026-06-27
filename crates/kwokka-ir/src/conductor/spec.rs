@@ -87,6 +87,7 @@ impl<'a> ConductorView<'a> {
         }
         check_edge_ordinals(edge_table, stage_count)?;
         check_stage_policies(body, stage_table, stage_span, edge_span)?;
+        check_record_overlaps(body, stage_table)?;
         Ok(Self {
             body,
             stage_count,
@@ -234,29 +235,83 @@ fn check_policy_slot(
     stage_span: Span,
     edge_span: Span,
 ) -> Result<(), IrError> {
-    let slot_offset = read_u32(entry, kind.slot_field())? as usize;
-    if slot_offset == 0 {
+    let Some(record_span) = record_span_at(body, entry, kind)? else {
         return Ok(());
-    }
-    if slot_offset < CONDUCTOR_HEADER_LEN {
-        return Err(IrError::OutOfBounds);
-    }
-    let record = read_record(body, slot_offset)?;
+    };
+    let record = read_record(body, record_span.offset)?;
     if record.tag != kind.node_tag() {
         return Err(IrError::BadTag {
             tag: record.tag as u16,
         });
     }
     kind.validate_body(record.body)?;
-    let record_len = RECORD_HEADER_LEN
-        .checked_add(record.body.len())
-        .ok_or(IrError::OutOfBounds)?;
-    let record_span = Span {
-        offset: slot_offset,
-        len: record_len,
-    };
     if ranges_overlap(record_span, stage_span) || ranges_overlap(record_span, edge_span) {
         return Err(IrError::OutOfBounds);
+    }
+    Ok(())
+}
+
+/// The byte span of the policy record a slot points at, or `None` when the
+/// slot is empty.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if the slot offset aliases the header,
+/// plus the record-framing variants.
+fn record_span_at(body: &[u8], entry: &[u8], kind: PolicyKind) -> Result<Option<Span>, IrError> {
+    let slot_offset = read_u32(entry, kind.slot_field())? as usize;
+    if slot_offset == 0 {
+        return Ok(None);
+    }
+    if slot_offset < CONDUCTOR_HEADER_LEN {
+        return Err(IrError::OutOfBounds);
+    }
+    let record = read_record(body, slot_offset)?;
+    let len = RECORD_HEADER_LEN
+        .checked_add(record.body.len())
+        .ok_or(IrError::OutOfBounds)?;
+    Ok(Some(Span {
+        offset: slot_offset,
+        len,
+    }))
+}
+
+/// The span of the `n`-th policy record across all stage slots in
+/// `[stage, kind]` order, or `None` when that slot is empty.
+fn nth_record_span(body: &[u8], stage_table: &[u8], n: usize) -> Result<Option<Span>, IrError> {
+    let offset = (n / PolicyKind::COUNT)
+        .checked_mul(STAGE_ENTRY_LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let end = offset
+        .checked_add(STAGE_ENTRY_LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let entry = stage_table.get(offset..end).ok_or(IrError::OutOfBounds)?;
+    let kind = PolicyKind::ALL[n % PolicyKind::COUNT];
+    record_span_at(body, entry, kind)
+}
+
+/// Rejects two policy records whose byte spans overlap.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if any two records intersect, plus the
+/// record-framing variants.
+fn check_record_overlaps(body: &[u8], stage_table: &[u8]) -> Result<(), IrError> {
+    let total = (stage_table.len() / STAGE_ENTRY_LEN)
+        .checked_mul(PolicyKind::COUNT)
+        .ok_or(IrError::OutOfBounds)?;
+    for a in 0..total {
+        let Some(span_a) = nth_record_span(body, stage_table, a)? else {
+            continue;
+        };
+        for b in (a + 1)..total {
+            let Some(span_b) = nth_record_span(body, stage_table, b)? else {
+                continue;
+            };
+            if ranges_overlap(span_a, span_b) {
+                return Err(IrError::OutOfBounds);
+            }
+        }
     }
     Ok(())
 }
@@ -475,6 +530,25 @@ mod tests {
     #[test]
     fn rejects_a_record_table_overlap() {
         let body = record_in_table_body();
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    fn shared_record_body() -> [u8; 64] {
+        let mut body = [0u8; 64];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[8..12].copy_from_slice(&16u32.to_le_bytes());
+        body[12..16].copy_from_slice(&48u32.to_le_bytes());
+        body[20..24].copy_from_slice(&48u32.to_le_bytes());
+        body[36..40].copy_from_slice(&48u32.to_le_bytes());
+        body[48..50].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
+        body[52..56].copy_from_slice(&16u32.to_le_bytes());
+        body[56..64].copy_from_slice(&5_000u64.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn rejects_a_shared_record() {
+        let body = shared_record_body();
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 }
