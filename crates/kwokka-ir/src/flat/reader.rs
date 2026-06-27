@@ -141,10 +141,8 @@ mod tests {
     const TOTAL_LEN: usize = HEADER_LEN + RECORD_HEADER_LEN;
 
     fn le32(value: usize) -> [u8; 4] {
-        let Ok(narrowed) = u32::try_from(value) else {
-            panic!("test value must fit in u32");
-        };
-        narrowed.to_le_bytes()
+        let [a, b, c, d, ..] = value.to_le_bytes();
+        [a, b, c, d]
     }
 
     fn valid_blob() -> [u8; TOTAL_LEN] {
@@ -161,20 +159,16 @@ mod tests {
     #[test]
     fn accepts_a_minimal_valid_blob() {
         let blob = valid_blob();
-        let Ok(ir) = validate(&blob) else {
-            panic!("a minimal valid blob must validate");
-        };
-        assert_eq!(ir.as_bytes(), &blob);
+        assert_eq!(validate(&blob).map(|ir| ir.as_bytes()), Ok(&blob[..]));
     }
 
     #[test]
     fn reads_the_root_record_body() {
         let blob = valid_blob();
-        let Ok(record) = read_record(&blob, ROOT_OFFSET) else {
-            panic!("the root record frame must parse");
-        };
-        assert_eq!(record.tag, NodeTag::ConductorSpec);
-        assert!(record.body.is_empty());
+        assert!(matches!(
+            read_record(&blob, ROOT_OFFSET),
+            Ok(record) if record.tag == NodeTag::ConductorSpec && record.body.is_empty()
+        ));
     }
 
     #[test]
@@ -272,6 +266,18 @@ mod tests {
     fn rejects_a_truncated_root_frame() {
         let mut blob = valid_blob();
         blob[12..16].copy_from_slice(&le32(TOTAL_LEN));
+        assert_eq!(validate(&blob), Err(IrError::Truncated));
+    }
+
+    #[test]
+    fn rejects_a_len_field_overrun() {
+        let mut blob = [0u8; 20];
+        let total = blob.len();
+        blob[..MAGIC.len()].copy_from_slice(&MAGIC);
+        blob[4..6].copy_from_slice(&VERSION.to_le_bytes());
+        blob[8..12].copy_from_slice(&le32(total));
+        blob[12..16].copy_from_slice(&le32(HEADER_LEN));
+        blob[16..18].copy_from_slice(&(NodeTag::ConductorSpec as u16).to_le_bytes());
         assert_eq!(validate(&blob), Err(IrError::Truncated));
     }
 }
