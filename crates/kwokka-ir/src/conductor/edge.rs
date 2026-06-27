@@ -17,6 +17,16 @@ impl EdgeView {
     /// Byte length of one edge entry on the wire.
     pub(crate) const LEN: usize = 8;
 
+    /// Constructs an edge from a source to a target stage ordinal.
+    #[must_use]
+    pub const fn new(from_ordinal: u16, to_ordinal: u16, input_index: u16) -> Self {
+        Self {
+            from_ordinal,
+            to_ordinal,
+            input_index,
+        }
+    }
+
     /// Decodes one edge entry, or `None` if `bytes` is not [`EdgeView::LEN`]
     /// bytes long.
     pub(crate) fn parse(bytes: &[u8]) -> Option<Self> {

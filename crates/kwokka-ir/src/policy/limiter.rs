@@ -23,6 +23,16 @@ impl LimiterView {
     /// Byte length of a limiter policy body on the wire.
     pub(crate) const LEN: usize = 16;
 
+    /// Constructs a token-bucket limiter policy.
+    #[must_use]
+    pub const fn new(capacity: u32, refill_tokens: u32, refill_period_ns: u64) -> Self {
+        Self {
+            capacity,
+            refill_tokens,
+            refill_period_ns,
+        }
+    }
+
     /// Decodes a limiter policy body.
     ///
     /// # Errors

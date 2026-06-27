@@ -37,6 +37,24 @@ impl RetryView {
     /// Byte length of a retry policy body on the wire.
     pub(crate) const LEN: usize = 24;
 
+    /// Constructs a retry policy from its attempt budget and backoff schedule.
+    #[must_use]
+    pub const fn new(
+        max_attempts: u32,
+        backoff_kind: u8,
+        jitter_kind: u8,
+        base_delay_ns: u64,
+        max_delay_ns: u64,
+    ) -> Self {
+        Self {
+            max_attempts,
+            backoff_kind,
+            jitter_kind,
+            base_delay_ns,
+            max_delay_ns,
+        }
+    }
+
     /// Decodes a retry policy body.
     ///
     /// # Errors
