@@ -22,6 +22,6 @@ pub mod policy;
 
 pub use conductor::{ConductorView, EdgeView, StageView};
 pub use error::IrError;
-pub use flat::validate;
+pub use flat::{StageSpec, WriteError, validate, write_conductor};
 pub use node::{KwokkaIr, NodeTag};
 pub use policy::{BreakerView, LimiterView, PolicyKind, RetryView, TimeoutView};

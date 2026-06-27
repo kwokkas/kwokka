@@ -3,7 +3,7 @@
 use crate::{
     conductor::{EdgeView, StageView},
     error::IrError,
-    flat::reader::{read_record, read_u32},
+    flat::reader::{RECORD_HEADER_LEN, read_record, read_u32},
     policy::PolicyKind,
 };
 
@@ -25,6 +25,18 @@ const CONDUCTOR_HEADER_LEN: usize = 16;
 /// Byte length of one stage-table entry: one u32 policy-record offset per
 /// [`PolicyKind`] slot.
 const STAGE_ENTRY_LEN: usize = PolicyKind::COUNT * 4;
+
+/// A byte range within the conductor body, checked for cross-section overlap.
+#[derive(Clone, Copy)]
+struct Span {
+    offset: usize,
+    len: usize,
+}
+
+/// Reports whether two byte ranges overlap.
+const fn ranges_overlap(left: Span, right: Span) -> bool {
+    left.offset < right.offset + right.len && right.offset < left.offset + left.len
+}
 
 /// The conductor DAG spec: the stage table and the edge table.
 ///
@@ -50,19 +62,32 @@ impl<'a> ConductorView<'a> {
     /// # Errors
     ///
     /// Returns [`IrError::OutOfBounds`] if a table offset aliases the
-    /// header or extends past the body, [`IrError::Truncated`] if a count
-    /// or offset field is out of range, [`IrError::OrdinalOutOfRange`] if
-    /// an edge names a stage ordinal at or beyond `stage_count`, and
-    /// [`IrError::BadTag`] if a policy slot points at a record whose tag
-    /// does not match its slot kind.
+    /// header, a section overlaps another, or a structure extends past the
+    /// body; [`IrError::Truncated`] if a count or offset field is out of
+    /// range; [`IrError::OrdinalOutOfRange`] if an edge names a stage
+    /// ordinal at or beyond `stage_count`; and [`IrError::BadTag`] if a
+    /// policy slot points at a record whose tag does not match its kind.
     pub(crate) fn parse(body: &'a [u8]) -> Result<Self, IrError> {
         let stage_count = read_u32(body, STAGE_COUNT_FIELD)?;
         let edge_count = read_u32(body, EDGE_COUNT_FIELD)?;
-        let stage_table =
+        let (stage_off, stage_table) =
             slice_table(body, STAGE_TABLE_OFFSET_FIELD, stage_count, STAGE_ENTRY_LEN)?;
-        let edge_table = slice_table(body, EDGE_TABLE_OFFSET_FIELD, edge_count, EdgeView::LEN)?;
+        let (edge_off, edge_table) =
+            slice_table(body, EDGE_TABLE_OFFSET_FIELD, edge_count, EdgeView::LEN)?;
+        let stage_span = Span {
+            offset: stage_off,
+            len: stage_table.len(),
+        };
+        let edge_span = Span {
+            offset: edge_off,
+            len: edge_table.len(),
+        };
+        if ranges_overlap(stage_span, edge_span) {
+            return Err(IrError::OutOfBounds);
+        }
         check_edge_ordinals(edge_table, stage_count)?;
-        check_stage_policies(body, stage_table)?;
+        check_stage_policies(body, stage_table, stage_span, edge_span)?;
+        check_record_overlaps(body, stage_table)?;
         Ok(Self {
             body,
             stage_count,
@@ -128,7 +153,7 @@ fn slice_table(
     offset_field: usize,
     count: u32,
     entry_len: usize,
-) -> Result<&[u8], IrError> {
+) -> Result<(usize, &[u8]), IrError> {
     let table_offset = read_u32(body, offset_field)? as usize;
     if table_offset < CONDUCTOR_HEADER_LEN {
         return Err(IrError::OutOfBounds);
@@ -137,7 +162,8 @@ fn slice_table(
         .checked_mul(entry_len)
         .ok_or(IrError::OutOfBounds)?;
     let end = table_offset.checked_add(span).ok_or(IrError::OutOfBounds)?;
-    body.get(table_offset..end).ok_or(IrError::OutOfBounds)
+    let slice = body.get(table_offset..end).ok_or(IrError::OutOfBounds)?;
+    Ok((table_offset, slice))
 }
 
 /// Checks that every edge names stage ordinals within `stage_count`.
@@ -174,7 +200,12 @@ fn check_edge_ordinals(edge_table: &[u8], stage_count: u32) -> Result<(), IrErro
 ///
 /// Returns [`IrError::OutOfBounds`] on a malformed entry, plus the
 /// record-framing or slot-kind [`IrError::BadTag`] variants.
-fn check_stage_policies(body: &[u8], stage_table: &[u8]) -> Result<(), IrError> {
+fn check_stage_policies(
+    body: &[u8],
+    stage_table: &[u8],
+    stage_span: Span,
+    edge_span: Span,
+) -> Result<(), IrError> {
     let mut offset = 0;
     while offset < stage_table.len() {
         let entry_end = offset
@@ -184,7 +215,7 @@ fn check_stage_policies(body: &[u8], stage_table: &[u8]) -> Result<(), IrError> 
             .get(offset..entry_end)
             .ok_or(IrError::OutOfBounds)?;
         for kind in PolicyKind::ALL {
-            check_policy_slot(body, entry, kind)?;
+            check_policy_slot(body, entry, kind, stage_span, edge_span)?;
         }
         offset += STAGE_ENTRY_LEN;
     }
@@ -197,21 +228,92 @@ fn check_stage_policies(body: &[u8], stage_table: &[u8]) -> Result<(), IrError> 
 ///
 /// Returns [`IrError::BadTag`] if the slot record's tag does not match
 /// `kind`, plus the record-framing and body-length variants.
-fn check_policy_slot(body: &[u8], entry: &[u8], kind: PolicyKind) -> Result<(), IrError> {
-    let slot_offset = read_u32(entry, kind.slot_field())? as usize;
-    if slot_offset == 0 {
+fn check_policy_slot(
+    body: &[u8],
+    entry: &[u8],
+    kind: PolicyKind,
+    stage_span: Span,
+    edge_span: Span,
+) -> Result<(), IrError> {
+    let Some(record_span) = record_span_at(body, entry, kind)? else {
         return Ok(());
-    }
-    if slot_offset < CONDUCTOR_HEADER_LEN {
-        return Err(IrError::OutOfBounds);
-    }
-    let record = read_record(body, slot_offset)?;
+    };
+    let record = read_record(body, record_span.offset)?;
     if record.tag != kind.node_tag() {
         return Err(IrError::BadTag {
             tag: record.tag as u16,
         });
     }
-    kind.validate_body(record.body)
+    kind.validate_body(record.body)?;
+    if ranges_overlap(record_span, stage_span) || ranges_overlap(record_span, edge_span) {
+        return Err(IrError::OutOfBounds);
+    }
+    Ok(())
+}
+
+/// The byte span of the policy record a slot points at, or `None` when the
+/// slot is empty.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if the slot offset aliases the header,
+/// plus the record-framing variants.
+fn record_span_at(body: &[u8], entry: &[u8], kind: PolicyKind) -> Result<Option<Span>, IrError> {
+    let slot_offset = read_u32(entry, kind.slot_field())? as usize;
+    if slot_offset == 0 {
+        return Ok(None);
+    }
+    if slot_offset < CONDUCTOR_HEADER_LEN {
+        return Err(IrError::OutOfBounds);
+    }
+    let record = read_record(body, slot_offset)?;
+    let len = RECORD_HEADER_LEN
+        .checked_add(record.body.len())
+        .ok_or(IrError::OutOfBounds)?;
+    Ok(Some(Span {
+        offset: slot_offset,
+        len,
+    }))
+}
+
+/// The span of the `n`-th policy record across all stage slots in
+/// `[stage, kind]` order, or `None` when that slot is empty.
+fn nth_record_span(body: &[u8], stage_table: &[u8], n: usize) -> Result<Option<Span>, IrError> {
+    let offset = (n / PolicyKind::COUNT)
+        .checked_mul(STAGE_ENTRY_LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let end = offset
+        .checked_add(STAGE_ENTRY_LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let entry = stage_table.get(offset..end).ok_or(IrError::OutOfBounds)?;
+    let kind = PolicyKind::ALL[n % PolicyKind::COUNT];
+    record_span_at(body, entry, kind)
+}
+
+/// Rejects two policy records whose byte spans overlap.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if any two records intersect, plus the
+/// record-framing variants.
+fn check_record_overlaps(body: &[u8], stage_table: &[u8]) -> Result<(), IrError> {
+    let total = (stage_table.len() / STAGE_ENTRY_LEN)
+        .checked_mul(PolicyKind::COUNT)
+        .ok_or(IrError::OutOfBounds)?;
+    for a in 0..total {
+        let Some(span_a) = nth_record_span(body, stage_table, a)? else {
+            continue;
+        };
+        for b in (a + 1)..total {
+            let Some(span_b) = nth_record_span(body, stage_table, b)? else {
+                continue;
+            };
+            if ranges_overlap(span_a, span_b) {
+                return Err(IrError::OutOfBounds);
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -403,6 +505,50 @@ mod tests {
     fn rejects_a_header_slot() {
         let mut body = timeout_body();
         body[20..24].copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    #[test]
+    fn rejects_overlapping_tables() {
+        let mut body = no_policy_body();
+        body[12..16].copy_from_slice(&16u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    fn record_in_table_body() -> [u8; 48] {
+        let mut body = [0u8; 48];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[8..12].copy_from_slice(&16u32.to_le_bytes());
+        body[12..16].copy_from_slice(&48u32.to_le_bytes());
+        body[20..24].copy_from_slice(&32u32.to_le_bytes());
+        body[32..34].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
+        body[36..40].copy_from_slice(&16u32.to_le_bytes());
+        body[40..48].copy_from_slice(&5_000u64.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn rejects_a_record_table_overlap() {
+        let body = record_in_table_body();
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    fn shared_record_body() -> [u8; 64] {
+        let mut body = [0u8; 64];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[8..12].copy_from_slice(&16u32.to_le_bytes());
+        body[12..16].copy_from_slice(&48u32.to_le_bytes());
+        body[20..24].copy_from_slice(&48u32.to_le_bytes());
+        body[36..40].copy_from_slice(&48u32.to_le_bytes());
+        body[48..50].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
+        body[52..56].copy_from_slice(&16u32.to_le_bytes());
+        body[56..64].copy_from_slice(&5_000u64.to_le_bytes());
+        body
+    }
+
+    #[test]
+    fn rejects_a_shared_record() {
+        let body = shared_record_body();
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 }

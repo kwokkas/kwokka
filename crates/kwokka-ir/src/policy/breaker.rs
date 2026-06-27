@@ -36,6 +36,34 @@ impl BreakerView {
     /// Byte length of a breaker policy body on the wire.
     pub(crate) const LEN: usize = 32;
 
+    /// Constructs a breaker policy from its sliding-window trip parameters.
+    ///
+    /// Parameters in order: `window_kind` (see [`BreakerView::WINDOW_COUNT`]
+    /// and [`BreakerView::WINDOW_TIME`]), `failure_rate_percent` (0-100),
+    /// `minimum_calls`, `window_span`, `half_open_max_calls`,
+    /// `half_open_success_threshold`, and `open_duration_ns`. Intended for
+    /// the conductor lowering and the imperative builder.
+    #[must_use]
+    pub const fn new(
+        window_kind: u8,
+        failure_rate_percent: u8,
+        minimum_calls: u32,
+        window_span: u64,
+        half_open_max_calls: u32,
+        half_open_success_threshold: u32,
+        open_duration_ns: u64,
+    ) -> Self {
+        Self {
+            window_kind,
+            failure_rate_percent,
+            minimum_calls,
+            window_span,
+            half_open_max_calls,
+            half_open_success_threshold,
+            open_duration_ns,
+        }
+    }
+
     /// Decodes a breaker policy body.
     ///
     /// # Errors

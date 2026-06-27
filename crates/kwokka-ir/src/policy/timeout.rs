@@ -20,6 +20,12 @@ impl TimeoutView {
     /// Byte length of a timeout policy body on the wire.
     pub(crate) const LEN: usize = 8;
 
+    /// Constructs a timeout policy with the given overall deadline.
+    #[must_use]
+    pub const fn new(duration_ns: u64) -> Self {
+        Self { duration_ns }
+    }
+
     /// Decodes a timeout policy body.
     ///
     /// # Errors

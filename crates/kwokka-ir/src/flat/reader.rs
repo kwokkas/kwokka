@@ -13,7 +13,7 @@ use crate::{
 };
 
 /// Byte length of a record frame header (`tag u16 | _pad u16 | len u32`).
-const RECORD_HEADER_LEN: usize = 8;
+pub(crate) const RECORD_HEADER_LEN: usize = 8;
 
 /// Required alignment of a record offset and of a record length.
 const RECORD_ALIGN: usize = 8;
