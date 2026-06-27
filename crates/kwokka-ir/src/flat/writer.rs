@@ -1,23 +1,30 @@
 //! Single-pass flat writer that encodes a conductor DAG into an IR blob.
 //!
 //! [`write_conductor`] computes every section offset up front from the
-//! stage and edge counts, then writes the blob front-to-back with no
-//! backfill: header, root `ConductorSpec` frame, body header, stage
-//! table, edge table, and the policy-record payload heap. The bytes it
-//! produces are exactly what [`crate::validate`] accepts.
+//! conductor inputs, then writes the blob front-to-back with no backfill:
+//! header, root `ConductorSpec` frame, body header, stage table, edge
+//! table, the policy-record payload heap, the optional registry and config
+//! sections, and the trailing string heap. The bytes it produces are
+//! exactly what [`crate::validate`] accepts.
 
 use crate::{
     conductor::EdgeView,
+    config::{ConfigBindingView, ScalarValue},
     flat::{HEADER_LEN, MAGIC, VERSION, reader::RECORD_HEADER_LEN},
     node::NodeTag,
     policy::{BreakerView, LimiterView, PolicyKind, RetryView, TimeoutView},
+    registry::RegistryView,
 };
 
 /// Byte length of the fixed conductor body header; mirrors the reader.
-const CONDUCTOR_HEADER_LEN: usize = 16;
+const CONDUCTOR_HEADER_LEN: usize = 24;
 
 /// Byte length of one stage-table entry: one u32 policy slot per kind.
 const STAGE_ENTRY_LEN: usize = PolicyKind::COUNT * 4;
+
+/// Byte length of the fixed config-section header: a `u32` binding count
+/// and `u32` padding before the entry array.
+const CONFIG_HEADER_LEN: usize = 8;
 
 /// An error from encoding an IR blob.
 #[non_exhaustive]
@@ -32,13 +39,23 @@ pub enum WriteError {
     },
     /// The spec exceeds the wire offset range (64-bit unreachable).
     SpecTooLarge,
+    /// A registry's name or sorted-ordinal count disagrees with the stage
+    /// count; the writer requires one of each per stage.
+    RegistryArity {
+        /// The number of names supplied.
+        names: usize,
+        /// The number of sorted ordinals supplied.
+        sorted: usize,
+        /// The number of stages.
+        stages: usize,
+    },
 }
 
 /// The four policy slots of a stage in `guard()` order.
 ///
 /// A `None` slot means the stage carries no policy of that kind. This is
-/// the per-stage writer input, paired with the edge list passed to
-/// [`write_conductor`].
+/// the per-stage writer input, paired with the edge list passed via
+/// [`ConductorBlob`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct StageSpec {
     /// Rate limiter slot; `None` if this stage carries no rate limit.
@@ -51,45 +68,161 @@ pub struct StageSpec {
     pub breaker: Option<BreakerView>,
 }
 
-/// Pre-computed section offsets for one conductor blob.
+/// The stage-name registry input: one name per stage plus a name-sorted
+/// ordinal index.
+///
+/// `names[i]` is stage `i`'s name; `sorted` lists every stage ordinal in
+/// ascending name order for the reader's binary search. Both must have one
+/// entry per stage. Sorting is the caller's responsibility: the writer is
+/// allocation-free and copies `sorted` verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RegistrySpec<'a> {
+    /// Stage names in ordinal order; `names.len()` must equal the stage count.
+    pub names: &'a [&'a [u8]],
+    /// Stage ordinals in ascending name order; one per stage.
+    pub sorted: &'a [u16],
+}
+
+/// One config binding input: which policy field of which stage to bind, the
+/// external config key, and a default value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigBindingSpec<'a> {
+    /// The target stage ordinal.
+    pub node_ordinal: u16,
+    /// The bound policy field; see the `ConfigBindingView::FIELD_*` constants.
+    pub field_tag: u16,
+    /// The external config key bytes.
+    pub key: &'a [u8],
+    /// The default value applied when the config source omits the key.
+    pub default_value: ScalarValue,
+}
+
+/// The full input to [`write_conductor`]: stages, edges, and the optional
+/// registry and config sections.
+///
+/// Named `ConductorBlob` rather than `ConductorSpec` to avoid colliding with
+/// the read-side wire record of that name.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConductorBlob<'a> {
+    /// The stage table; slot `i` carries stage `i`'s policies.
+    pub stages: &'a [StageSpec],
+    /// The DAG edges connecting stage ordinals.
+    pub edges: &'a [EdgeView],
+    /// The optional stage-name registry; `None` emits no registry section.
+    pub registry: Option<RegistrySpec<'a>>,
+    /// The config bindings; an empty slice emits no config section.
+    pub config: &'a [ConfigBindingSpec<'a>],
+}
+
+/// Pre-computed section offsets for one conductor blob. Offsets are
+/// body-relative; an absent registry or config section stores offset 0.
 struct Layout {
     total: usize,
     spec_record_len: usize,
     stage_count: u32,
     edge_count: u32,
     edge_table_off: usize,
-    payload_off: usize,
+    policy_heap_off: usize,
+    registry_off: usize,
+    config_off: usize,
+    heap_off: usize,
+}
+
+/// Rounds `value` up to the next multiple of 8.
+fn align8(value: usize) -> Result<usize, WriteError> {
+    let bumped = value.checked_add(7).ok_or(WriteError::SpecTooLarge)?;
+    Ok(bumped & !7)
+}
+
+/// Verifies a registry supplies exactly one name and one sorted ordinal per
+/// stage.
+///
+/// # Errors
+///
+/// Returns [`WriteError::RegistryArity`] if the name or sorted-ordinal count
+/// disagrees with the stage count.
+const fn validate_registry_arity(blob: &ConductorBlob) -> Result<(), WriteError> {
+    let Some(registry) = &blob.registry else {
+        return Ok(());
+    };
+    if registry.names.len() != blob.stages.len() || registry.sorted.len() != blob.stages.len() {
+        return Err(WriteError::RegistryArity {
+            names: registry.names.len(),
+            sorted: registry.sorted.len(),
+            stages: blob.stages.len(),
+        });
+    }
+    Ok(())
 }
 
 impl Layout {
-    /// Computes the section offsets, or an error if the spec overflows.
-    fn compute(stages: &[StageSpec], edges: &[EdgeView]) -> Result<Self, WriteError> {
-        let stage_count = u32::try_from(stages.len())
+    /// Computes the section offsets, or an error if the spec overflows or a
+    /// registry's arity is wrong.
+    fn compute(blob: &ConductorBlob) -> Result<Self, WriteError> {
+        let stage_count = u32::try_from(blob.stages.len())
             .ok()
             .ok_or(WriteError::SpecTooLarge)?;
-        let edge_count = u32::try_from(edges.len())
+        let edge_count = u32::try_from(blob.edges.len())
             .ok()
             .ok_or(WriteError::SpecTooLarge)?;
-        let stage_table_len = stages
+        validate_registry_arity(blob)?;
+
+        let stage_table_len = blob
+            .stages
             .len()
             .checked_mul(STAGE_ENTRY_LEN)
             .ok_or(WriteError::SpecTooLarge)?;
         let edge_table_off = CONDUCTOR_HEADER_LEN
             .checked_add(stage_table_len)
             .ok_or(WriteError::SpecTooLarge)?;
-        let edge_table_len = edges
+        let edge_table_len = blob
+            .edges
             .len()
             .checked_mul(EdgeView::LEN)
             .ok_or(WriteError::SpecTooLarge)?;
-        let payload_off = edge_table_off
+        let policy_heap_off = edge_table_off
             .checked_add(edge_table_len)
             .ok_or(WriteError::SpecTooLarge)?;
-        let mut body_len = payload_off;
-        for stage in stages {
-            body_len = body_len
+        let mut after_policies = policy_heap_off;
+        for stage in blob.stages {
+            after_policies = after_policies
                 .checked_add(stage.payload_len()?)
                 .ok_or(WriteError::SpecTooLarge)?;
         }
+
+        let (registry_off, after_registry) = if blob.registry.is_some() {
+            let len = registry_len(blob.stages.len())?;
+            let end = after_policies
+                .checked_add(len)
+                .ok_or(WriteError::SpecTooLarge)?;
+            (after_policies, end)
+        } else {
+            (0, after_policies)
+        };
+
+        let (config_off, after_config) = if blob.config.is_empty() {
+            (0, after_registry)
+        } else {
+            let entries_len = blob
+                .config
+                .len()
+                .checked_mul(ConfigBindingView::LEN)
+                .ok_or(WriteError::SpecTooLarge)?;
+            let len = CONFIG_HEADER_LEN
+                .checked_add(entries_len)
+                .ok_or(WriteError::SpecTooLarge)?;
+            let end = after_registry
+                .checked_add(len)
+                .ok_or(WriteError::SpecTooLarge)?;
+            (after_registry, end)
+        };
+
+        let heap_off = after_config;
+        let body_len = align8(
+            heap_off
+                .checked_add(string_heap_len(blob)?)
+                .ok_or(WriteError::SpecTooLarge)?,
+        )?;
         let spec_record_len = RECORD_HEADER_LEN
             .checked_add(body_len)
             .ok_or(WriteError::SpecTooLarge)?;
@@ -103,9 +236,41 @@ impl Layout {
             stage_count,
             edge_count,
             edge_table_off,
-            payload_off,
+            policy_heap_off,
+            registry_off,
+            config_off,
+            heap_off,
         })
     }
+}
+
+/// Total 8-aligned byte length of a registry section for `stage_count` stages.
+fn registry_len(stage_count: usize) -> Result<usize, WriteError> {
+    let names = stage_count
+        .checked_mul(RegistryView::NAME_ENTRY_LEN)
+        .ok_or(WriteError::SpecTooLarge)?;
+    let sorted = stage_count
+        .checked_mul(RegistryView::SORTED_ENTRY_LEN)
+        .ok_or(WriteError::SpecTooLarge)?;
+    align8(names.checked_add(sorted).ok_or(WriteError::SpecTooLarge)?)
+}
+
+/// Total byte length of the string heap: every registry name and config key.
+fn string_heap_len(blob: &ConductorBlob) -> Result<usize, WriteError> {
+    let mut total = 0usize;
+    if let Some(registry) = &blob.registry {
+        for name in registry.names {
+            total = total
+                .checked_add(name.len())
+                .ok_or(WriteError::SpecTooLarge)?;
+        }
+    }
+    for binding in blob.config {
+        total = total
+            .checked_add(binding.key.len())
+            .ok_or(WriteError::SpecTooLarge)?;
+    }
+    Ok(total)
 }
 
 impl StageSpec {
@@ -150,33 +315,39 @@ const BODY_OFFSET: usize = HEADER_LEN + RECORD_HEADER_LEN;
 
 /// Encodes a conductor DAG into `buf`, returning the byte length written.
 ///
-/// Stage `i`'s policy slots come from `stages[i]`; edges connect stage
-/// ordinals. When every edge ordinal is within `[0, stages.len())`, the
-/// output is a validated-shape blob: feeding the written prefix to
-/// [`crate::validate`] round-trips back to these inputs. Out-of-range
-/// ordinals are encoded verbatim and rejected by the reader, not here.
+/// Stage `i`'s policy slots come from `blob.stages[i]`; edges connect stage
+/// ordinals; the optional registry and config sections follow. When every
+/// edge and binding ordinal is within `[0, stages.len())`, the output is a
+/// validated-shape blob: feeding the written prefix to [`crate::validate`]
+/// round-trips back to these inputs. Out-of-range ordinals are encoded
+/// verbatim and rejected by the reader, not here.
 ///
 /// # Errors
 ///
 /// Returns [`WriteError::BufferTooSmall`] if `buf` cannot hold the blob,
-/// and [`WriteError::SpecTooLarge`] if the offset arithmetic overflows the
-/// wire range.
-pub fn write_conductor(
-    buf: &mut [u8],
-    stages: &[StageSpec],
-    edges: &[EdgeView],
-) -> Result<usize, WriteError> {
-    let layout = Layout::compute(stages, edges)?;
+/// [`WriteError::SpecTooLarge`] if the offset arithmetic overflows the wire
+/// range, and [`WriteError::RegistryArity`] if a registry's name or sorted
+/// count does not match the stage count.
+pub fn write_conductor(buf: &mut [u8], blob: &ConductorBlob) -> Result<usize, WriteError> {
+    let layout = Layout::compute(blob)?;
     if buf.len() < layout.total {
         return Err(WriteError::BufferTooSmall {
             needed: layout.total,
             available: buf.len(),
         });
     }
+    buf[..layout.total].fill(0);
     write_header(buf, &layout);
-    write_stage_table(buf, &layout, stages);
-    write_edge_table(buf, &layout, edges);
-    write_policy_records(buf, &layout, stages);
+    write_stage_table(buf, &layout, blob.stages);
+    write_edge_table(buf, &layout, blob.edges);
+    write_policy_records(buf, &layout, blob.stages);
+    let mut heap = layout.heap_off;
+    if let Some(registry) = &blob.registry {
+        write_registry(buf, &layout, registry, &mut heap);
+    }
+    if !blob.config.is_empty() {
+        write_config(buf, &layout, blob.config, &mut heap);
+    }
     Ok(layout.total)
 }
 
@@ -194,13 +365,15 @@ fn write_header(buf: &mut [u8], layout: &Layout) {
     put_u32(buf, BODY_OFFSET + 4, layout.edge_count);
     put_offset(buf, BODY_OFFSET + 8, CONDUCTOR_HEADER_LEN);
     put_offset(buf, BODY_OFFSET + 12, layout.edge_table_off);
+    put_offset(buf, BODY_OFFSET + 16, layout.registry_off);
+    put_offset(buf, BODY_OFFSET + 20, layout.config_off);
 }
 
 /// Writes the fixed-stride stage table, filling each policy slot with the
 /// body-relative offset of its record (0 when the slot is empty).
 fn write_stage_table(buf: &mut [u8], layout: &Layout, stages: &[StageSpec]) {
     let table = BODY_OFFSET + CONDUCTOR_HEADER_LEN;
-    let mut payload = layout.payload_off;
+    let mut payload = layout.policy_heap_off;
     for (i, stage) in stages.iter().enumerate() {
         let entry = table + i * STAGE_ENTRY_LEN;
         for (slot, len) in stage.record_body_lens().into_iter().enumerate() {
@@ -230,7 +403,7 @@ fn write_edge_table(buf: &mut [u8], layout: &Layout, edges: &[EdgeView]) {
 /// Writes the policy records into the payload heap in the same slot order
 /// the stage table reserved.
 fn write_policy_records(buf: &mut [u8], layout: &Layout, stages: &[StageSpec]) {
-    let mut payload = layout.payload_off;
+    let mut payload = layout.policy_heap_off;
     for stage in stages {
         if let Some(v) = stage.limiter {
             let body = write_frame(buf, payload, NodeTag::PolicyLimiter, LimiterView::LEN);
@@ -269,6 +442,54 @@ fn write_policy_records(buf: &mut [u8], layout: &Layout, stages: &[StageSpec]) {
     }
 }
 
+/// Writes the registry's ordinal-to-name table, the sorted-ordinal index,
+/// and the name bytes into the string heap, advancing `heap`.
+fn write_registry(buf: &mut [u8], layout: &Layout, registry: &RegistrySpec, heap: &mut usize) {
+    let name_table = BODY_OFFSET + layout.registry_off;
+    let sorted_table = name_table + (layout.stage_count as usize) * RegistryView::NAME_ENTRY_LEN;
+    for (i, name) in registry.names.iter().enumerate() {
+        let entry = name_table + i * RegistryView::NAME_ENTRY_LEN;
+        put_offset(buf, entry, *heap);
+        put_offset(buf, entry + 4, name.len());
+        write_bytes(buf, heap, name);
+    }
+    for (k, ordinal) in registry.sorted.iter().enumerate() {
+        put_u16(
+            buf,
+            sorted_table + k * RegistryView::SORTED_ENTRY_LEN,
+            *ordinal,
+        );
+    }
+}
+
+/// Writes the config-section header, the binding entries, and the key bytes
+/// into the string heap, advancing `heap`.
+fn write_config(buf: &mut [u8], layout: &Layout, config: &[ConfigBindingSpec], heap: &mut usize) {
+    let section = BODY_OFFSET + layout.config_off;
+    put_offset(buf, section, config.len());
+    put_u32(buf, section + 4, 0);
+    let entries = section + CONFIG_HEADER_LEN;
+    for (i, binding) in config.iter().enumerate() {
+        let entry = entries + i * ConfigBindingView::LEN;
+        put_u16(buf, entry, binding.node_ordinal);
+        put_u16(buf, entry + 2, binding.field_tag);
+        put_offset(buf, entry + 4, binding.key.len());
+        put_offset(buf, entry + 8, *heap);
+        put_u32(buf, entry + 12, 0);
+        put_u64(buf, entry + 16, u64::from(binding.default_value.kind()));
+        put_u64(buf, entry + 24, binding.default_value.raw_value());
+        write_bytes(buf, heap, binding.key);
+    }
+}
+
+/// Copies `bytes` into the string heap at the current `heap` cursor and
+/// advances the cursor.
+fn write_bytes(buf: &mut [u8], heap: &mut usize, bytes: &[u8]) {
+    let start = BODY_OFFSET + *heap;
+    buf[start..start + bytes.len()].copy_from_slice(bytes);
+    *heap += bytes.len();
+}
+
 /// Writes a record frame at body-relative `payload`, returning the
 /// absolute offset of the record body.
 fn write_frame(buf: &mut [u8], payload: usize, tag: NodeTag, body_len: usize) -> usize {
@@ -305,7 +526,7 @@ fn put_u64(buf: &mut [u8], offset: usize, value: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::validate;
+    use crate::{IrError, validate};
 
     #[test]
     fn round_trips_a_full_stage() {
@@ -315,9 +536,12 @@ mod tests {
             retry: Some(RetryView::new(5, 2, 1, 1_000, 60_000)),
             breaker: Some(BreakerView::new(1, 50, 20, 10_000, 3, 2, 30_000)),
         }];
-        let edges: [EdgeView; 0] = [];
+        let blob = ConductorBlob {
+            stages: &stages,
+            ..Default::default()
+        };
         let mut buf = [0u8; 256];
-        let written = write_conductor(&mut buf, &stages, &edges).unwrap_or(0);
+        let written = write_conductor(&mut buf, &blob).unwrap_or(0);
         let got = validate(&buf[..written])
             .and_then(|ir| ir.conductor())
             .ok()
@@ -337,8 +561,13 @@ mod tests {
     fn round_trips_edges_and_slots() {
         let stages = [StageSpec::default(), StageSpec::default()];
         let edges = [EdgeView::new(0, 1, 0)];
+        let blob = ConductorBlob {
+            stages: &stages,
+            edges: &edges,
+            ..Default::default()
+        };
         let mut buf = [0u8; 128];
-        let written = write_conductor(&mut buf, &stages, &edges).unwrap_or(0);
+        let written = write_conductor(&mut buf, &blob).unwrap_or(0);
         let spec = validate(&buf[..written]).and_then(|ir| ir.conductor());
         assert!(matches!(
             spec,
@@ -352,13 +581,128 @@ mod tests {
     }
 
     #[test]
+    fn round_trips_a_registry() {
+        let stages = [StageSpec::default(), StageSpec::default()];
+        let names: [&[u8]; 2] = [b"beta", b"alpha"];
+        let sorted = [1u16, 0];
+        let blob = ConductorBlob {
+            stages: &stages,
+            registry: Some(RegistrySpec {
+                names: &names,
+                sorted: &sorted,
+            }),
+            ..Default::default()
+        };
+        let mut buf = [0u8; 256];
+        let written = write_conductor(&mut buf, &blob).unwrap_or(0);
+        let registry = validate(&buf[..written])
+            .and_then(|ir| ir.conductor())
+            .ok()
+            .and_then(|spec| spec.registry());
+        let lookups = registry.map(|r| (r.name(0), r.lookup(b"alpha"), r.lookup(b"beta")));
+        assert_eq!(lookups, Some((Some(&b"beta"[..]), Some(1), Some(0))));
+    }
+
+    #[test]
+    fn round_trips_config_bindings() {
+        let stages = [StageSpec::default(), StageSpec::default()];
+        let config = [ConfigBindingSpec {
+            node_ordinal: 1,
+            field_tag: ConfigBindingView::FIELD_TIMEOUT_DURATION_NS,
+            key: b"ttl",
+            default_value: ScalarValue::new(ScalarValue::KIND_DURATION_NS, 5_000),
+        }];
+        let blob = ConductorBlob {
+            stages: &stages,
+            config: &config,
+            ..Default::default()
+        };
+        let mut buf = [0u8; 256];
+        let written = write_conductor(&mut buf, &blob).unwrap_or(0);
+        let spec = validate(&buf[..written]).and_then(|ir| ir.conductor());
+        let binding = spec.ok().and_then(|s| s.config_binding(0));
+        let fields = binding.map(|b| (b.node_ordinal(), b.key(), b.default_value().raw_value()));
+        assert_eq!(fields, Some((1, &b"ttl"[..], 5_000)));
+        let count = validate(&buf[..written])
+            .and_then(|ir| ir.conductor())
+            .map(|s| s.config_bindings().count());
+        assert_eq!(count, Ok(1));
+    }
+
+    #[test]
+    fn rejects_bad_config_ordinal() {
+        let stages = [StageSpec::default()];
+        let config = [ConfigBindingSpec {
+            node_ordinal: 5,
+            field_tag: ConfigBindingView::FIELD_TIMEOUT_DURATION_NS,
+            key: b"k",
+            default_value: ScalarValue::new(ScalarValue::KIND_U64, 0),
+        }];
+        let blob = ConductorBlob {
+            stages: &stages,
+            config: &config,
+            ..Default::default()
+        };
+        let mut buf = [0u8; 128];
+        let written = write_conductor(&mut buf, &blob).unwrap_or(0);
+        assert!(matches!(
+            validate(&buf[..written]),
+            Err(IrError::OrdinalOutOfRange)
+        ));
+    }
+
+    #[test]
+    fn rejects_bad_sorted_ordinal() {
+        let stages = [StageSpec::default(), StageSpec::default()];
+        let names: [&[u8]; 2] = [b"a", b"b"];
+        let sorted = [5u16, 0];
+        let blob = ConductorBlob {
+            stages: &stages,
+            registry: Some(RegistrySpec {
+                names: &names,
+                sorted: &sorted,
+            }),
+            ..Default::default()
+        };
+        let mut buf = [0u8; 128];
+        let written = write_conductor(&mut buf, &blob).unwrap_or(0);
+        assert!(matches!(
+            validate(&buf[..written]),
+            Err(IrError::OrdinalOutOfRange)
+        ));
+    }
+
+    #[test]
     fn rejects_a_small_buffer() {
         let stages = [StageSpec::default()];
-        let edges: [EdgeView; 0] = [];
+        let blob = ConductorBlob {
+            stages: &stages,
+            ..Default::default()
+        };
         let mut buf = [0u8; 8];
         assert!(matches!(
-            write_conductor(&mut buf, &stages, &edges),
+            write_conductor(&mut buf, &blob),
             Err(WriteError::BufferTooSmall { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_a_registry_arity_mismatch() {
+        let stages = [StageSpec::default(), StageSpec::default()];
+        let names: [&[u8]; 1] = [b"only"];
+        let sorted = [0u16];
+        let blob = ConductorBlob {
+            stages: &stages,
+            registry: Some(RegistrySpec {
+                names: &names,
+                sorted: &sorted,
+            }),
+            ..Default::default()
+        };
+        let mut buf = [0u8; 128];
+        assert!(matches!(
+            write_conductor(&mut buf, &blob),
+            Err(WriteError::RegistryArity { .. })
         ));
     }
 }

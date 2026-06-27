@@ -7,4 +7,6 @@ pub mod writer;
 
 pub use header::{HEADER_LEN, MAGIC, VERSION};
 pub use reader::validate;
-pub use writer::{StageSpec, WriteError, write_conductor};
+pub use writer::{
+    ConductorBlob, ConfigBindingSpec, RegistrySpec, StageSpec, WriteError, write_conductor,
+};

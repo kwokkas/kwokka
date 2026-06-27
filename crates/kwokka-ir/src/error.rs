@@ -24,4 +24,7 @@ pub enum IrError {
     },
     /// A graph edge names a stage ordinal past the end of the stage table.
     OrdinalOutOfRange,
+    /// The registry's sorted index is not ordered by stage name, so the
+    /// name lookup would be unreliable.
+    RegistryUnsorted,
 }

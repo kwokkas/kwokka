@@ -2,9 +2,11 @@
 
 use crate::{
     conductor::{EdgeView, StageView},
+    config::ConfigBindingView,
     error::IrError,
     flat::reader::{RECORD_HEADER_LEN, read_record, read_u32},
     policy::PolicyKind,
+    registry::RegistryView,
 };
 
 /// Byte offset of the stage-count field within a `ConductorSpec` body.
@@ -19,12 +21,24 @@ const STAGE_TABLE_OFFSET_FIELD: usize = 8;
 /// Byte offset of the edge-table-offset field within a `ConductorSpec` body.
 const EDGE_TABLE_OFFSET_FIELD: usize = 12;
 
-/// Byte length of the fixed `ConductorSpec` body header (four u32 fields).
-const CONDUCTOR_HEADER_LEN: usize = 16;
+/// Byte offset of the registry-table-offset field within a `ConductorSpec`
+/// body (0 when the conductor carries no registry).
+const REGISTRY_TABLE_OFFSET_FIELD: usize = 16;
+
+/// Byte offset of the config-table-offset field within a `ConductorSpec`
+/// body (0 when the conductor carries no config bindings).
+const CONFIG_TABLE_OFFSET_FIELD: usize = 20;
+
+/// Byte length of the fixed `ConductorSpec` body header (six u32 fields).
+const CONDUCTOR_HEADER_LEN: usize = 24;
 
 /// Byte length of one stage-table entry: one u32 policy-record offset per
 /// [`PolicyKind`] slot.
 const STAGE_ENTRY_LEN: usize = PolicyKind::COUNT * 4;
+
+/// Byte length of the fixed config-section header: a `u32` binding count
+/// and `u32` padding before the entry array.
+const CONFIG_HEADER_LEN: usize = 8;
 
 /// A byte range within the conductor body, checked for cross-section overlap.
 #[derive(Clone, Copy)]
@@ -33,9 +47,26 @@ struct Span {
     len: usize,
 }
 
+impl Span {
+    /// An empty span; pads the fixed section array for the unused slots.
+    const ZERO: Self = Self { offset: 0, len: 0 };
+
+    /// A span starting at `offset` covering `len` bytes.
+    const fn new(offset: usize, len: usize) -> Self {
+        Self { offset, len }
+    }
+}
+
 /// Reports whether two byte ranges overlap.
 const fn ranges_overlap(left: Span, right: Span) -> bool {
     left.offset < right.offset + right.len && right.offset < left.offset + left.len
+}
+
+/// Reports whether `span` overlaps any of `sections`.
+fn overlaps_any(span: Span, sections: &[Span]) -> bool {
+    sections
+        .iter()
+        .any(|section| ranges_overlap(span, *section))
 }
 
 /// The conductor DAG spec: the stage table and the edge table.
@@ -54,6 +85,9 @@ pub struct ConductorView<'a> {
     edge_count: u32,
     stage_table: &'a [u8],
     edge_table: &'a [u8],
+    registry: Option<RegistryView<'a>>,
+    config_count: u32,
+    config_entries: &'a [u8],
 }
 
 impl<'a> ConductorView<'a> {
@@ -74,26 +108,47 @@ impl<'a> ConductorView<'a> {
             slice_table(body, STAGE_TABLE_OFFSET_FIELD, stage_count, STAGE_ENTRY_LEN)?;
         let (edge_off, edge_table) =
             slice_table(body, EDGE_TABLE_OFFSET_FIELD, edge_count, EdgeView::LEN)?;
-        let stage_span = Span {
-            offset: stage_off,
-            len: stage_table.len(),
-        };
-        let edge_span = Span {
-            offset: edge_off,
-            len: edge_table.len(),
-        };
-        if ranges_overlap(stage_span, edge_span) {
-            return Err(IrError::OutOfBounds);
+        let registry = parse_registry(body, stage_count)?;
+        let config = parse_config(body, stage_count)?;
+
+        let mut spans = [Span::ZERO; 5];
+        spans[0] = Span::new(stage_off, stage_table.len());
+        spans[1] = Span::new(edge_off, edge_table.len());
+        let mut count = 2;
+        if let Some(reg) = &registry {
+            spans[count] = reg.name_span;
+            spans[count + 1] = reg.sorted_span;
+            count += 2;
         }
+        if let Some(cfg) = &config {
+            spans[count] = cfg.section_span;
+            count += 1;
+        }
+        let sections = &spans[..count];
+
+        check_sections_disjoint(sections)?;
         check_edge_ordinals(edge_table, stage_count)?;
-        check_stage_policies(body, stage_table, stage_span, edge_span)?;
+        check_stage_policies(body, stage_table, sections)?;
         check_record_overlaps(body, stage_table)?;
+
+        let floor = heap_floor(sections, body, stage_table)?;
+        if let Some(reg) = &registry {
+            check_names_in_heap(reg.name_table, floor)?;
+            check_sorted_order(&reg.view, stage_count)?;
+        }
+        if let Some(cfg) = &config {
+            check_keys_in_heap(cfg.entries, floor)?;
+        }
+
         Ok(Self {
             body,
             stage_count,
             edge_count,
             stage_table,
             edge_table,
+            registry: registry.map(|reg| reg.view),
+            config_count: config.as_ref().map_or(0, |cfg| cfg.count),
+            config_entries: config.map_or(&[][..], |cfg| cfg.entries),
         })
     }
 
@@ -138,6 +193,37 @@ impl<'a> ConductorView<'a> {
         // edge(index) returns None only for index >= edge_count; the range
         // is bounded to 0..edge_count, so filter_map never drops an edge.
         (0..self.edge_count).filter_map(|index| self.edge(index))
+    }
+
+    /// Returns the stage-name registry, or `None` if the conductor carries
+    /// no registry.
+    #[must_use]
+    pub const fn registry(&self) -> Option<RegistryView<'a>> {
+        self.registry
+    }
+
+    /// The number of config bindings in the DAG.
+    #[must_use]
+    pub const fn config_count(&self) -> u32 {
+        self.config_count
+    }
+
+    /// Returns the config binding at `index`, or `None` if `index` is past
+    /// the last binding.
+    #[must_use]
+    pub fn config_binding(&self, index: u32) -> Option<ConfigBindingView<'a>> {
+        let offset = (index as usize).checked_mul(ConfigBindingView::LEN)?;
+        let end = offset.checked_add(ConfigBindingView::LEN)?;
+        let entry = self.config_entries.get(offset..end)?;
+        ConfigBindingView::parse(self.body, entry).ok()
+    }
+
+    /// Iterates the config bindings in wire order.
+    pub fn config_bindings(&self) -> impl Iterator<Item = ConfigBindingView<'a>> + '_ {
+        // config_binding(index) returns None only past config_count or for a
+        // malformed entry; parse already validated every entry, so the bounded
+        // range never drops a binding.
+        (0..self.config_count).filter_map(|index| self.config_binding(index))
     }
 }
 
@@ -200,12 +286,7 @@ fn check_edge_ordinals(edge_table: &[u8], stage_count: u32) -> Result<(), IrErro
 ///
 /// Returns [`IrError::OutOfBounds`] on a malformed entry, plus the
 /// record-framing or slot-kind [`IrError::BadTag`] variants.
-fn check_stage_policies(
-    body: &[u8],
-    stage_table: &[u8],
-    stage_span: Span,
-    edge_span: Span,
-) -> Result<(), IrError> {
+fn check_stage_policies(body: &[u8], stage_table: &[u8], sections: &[Span]) -> Result<(), IrError> {
     let mut offset = 0;
     while offset < stage_table.len() {
         let entry_end = offset
@@ -215,7 +296,7 @@ fn check_stage_policies(
             .get(offset..entry_end)
             .ok_or(IrError::OutOfBounds)?;
         for kind in PolicyKind::ALL {
-            check_policy_slot(body, entry, kind, stage_span, edge_span)?;
+            check_policy_slot(body, entry, kind, sections)?;
         }
         offset += STAGE_ENTRY_LEN;
     }
@@ -232,8 +313,7 @@ fn check_policy_slot(
     body: &[u8],
     entry: &[u8],
     kind: PolicyKind,
-    stage_span: Span,
-    edge_span: Span,
+    sections: &[Span],
 ) -> Result<(), IrError> {
     let Some(record_span) = record_span_at(body, entry, kind)? else {
         return Ok(());
@@ -245,7 +325,7 @@ fn check_policy_slot(
         });
     }
     kind.validate_body(record.body)?;
-    if ranges_overlap(record_span, stage_span) || ranges_overlap(record_span, edge_span) {
+    if overlaps_any(record_span, sections) {
         return Err(IrError::OutOfBounds);
     }
     Ok(())
@@ -316,31 +396,298 @@ fn check_record_overlaps(body: &[u8], stage_table: &[u8]) -> Result<(), IrError>
     Ok(())
 }
 
+/// A validated registry section: the view, its two table spans, and the
+/// name table for the string-heap containment check.
+struct ParsedRegistry<'a> {
+    view: RegistryView<'a>,
+    name_table: &'a [u8],
+    name_span: Span,
+    sorted_span: Span,
+}
+
+/// Parses the optional registry section, or `None` when the conductor
+/// carries no registry.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if a table offset aliases the header or
+/// runs past the body, [`IrError::Truncated`] if the offset field is out of
+/// range, and [`IrError::OrdinalOutOfRange`] if a sorted entry names a stage
+/// at or beyond `stage_count`.
+fn parse_registry(body: &[u8], stage_count: u32) -> Result<Option<ParsedRegistry<'_>>, IrError> {
+    let registry_offset = read_u32(body, REGISTRY_TABLE_OFFSET_FIELD)? as usize;
+    if registry_offset == 0 {
+        return Ok(None);
+    }
+    let (name_offset, name_table) = slice_table(
+        body,
+        REGISTRY_TABLE_OFFSET_FIELD,
+        stage_count,
+        RegistryView::NAME_ENTRY_LEN,
+    )?;
+    let sorted_offset = name_offset
+        .checked_add(name_table.len())
+        .ok_or(IrError::OutOfBounds)?;
+    let sorted_len = (stage_count as usize)
+        .checked_mul(RegistryView::SORTED_ENTRY_LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let sorted_end = sorted_offset
+        .checked_add(sorted_len)
+        .ok_or(IrError::OutOfBounds)?;
+    let sorted_index = body
+        .get(sorted_offset..sorted_end)
+        .ok_or(IrError::OutOfBounds)?;
+    let view = RegistryView::new(body, name_table, sorted_index, stage_count);
+    check_registry_names(&view, stage_count)?;
+    check_sorted_ordinals(sorted_index, stage_count)?;
+    Ok(Some(ParsedRegistry {
+        view,
+        name_table,
+        name_span: Span::new(name_offset, name_table.len()),
+        sorted_span: Span::new(sorted_offset, sorted_index.len()),
+    }))
+}
+
+/// Checks that every ordinal-to-name entry resolves within the blob.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if a name string-ref runs past the body.
+fn check_registry_names(view: &RegistryView, stage_count: u32) -> Result<(), IrError> {
+    for ordinal in 0..stage_count {
+        if view.name(ordinal).is_none() {
+            return Err(IrError::OutOfBounds);
+        }
+    }
+    Ok(())
+}
+
+/// Checks that every sorted-index entry names a stage within `stage_count`.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry and
+/// [`IrError::OrdinalOutOfRange`] if an ordinal is at or beyond
+/// `stage_count`.
+fn check_sorted_ordinals(sorted_index: &[u8], stage_count: u32) -> Result<(), IrError> {
+    let mut offset = 0;
+    while offset < sorted_index.len() {
+        let end = offset
+            .checked_add(RegistryView::SORTED_ENTRY_LEN)
+            .ok_or(IrError::OutOfBounds)?;
+        let &[a, b] = sorted_index.get(offset..end).ok_or(IrError::OutOfBounds)? else {
+            return Err(IrError::OutOfBounds);
+        };
+        if u32::from(u16::from_le_bytes([a, b])) >= stage_count {
+            return Err(IrError::OrdinalOutOfRange);
+        }
+        offset += RegistryView::SORTED_ENTRY_LEN;
+    }
+    Ok(())
+}
+
+/// A validated config section: the binding count, the entry slice, and the
+/// section span.
+struct ParsedConfig<'a> {
+    count: u32,
+    entries: &'a [u8],
+    section_span: Span,
+}
+
+/// Parses the optional config section, or `None` when the conductor carries
+/// no config bindings.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if the section offset aliases the header
+/// or the entry table runs past the body, [`IrError::Truncated`] if a field
+/// is out of range, and [`IrError::OrdinalOutOfRange`] if a binding names a
+/// stage at or beyond `stage_count`.
+fn parse_config(body: &[u8], stage_count: u32) -> Result<Option<ParsedConfig<'_>>, IrError> {
+    let config_offset = read_u32(body, CONFIG_TABLE_OFFSET_FIELD)? as usize;
+    if config_offset == 0 {
+        return Ok(None);
+    }
+    if config_offset < CONDUCTOR_HEADER_LEN {
+        return Err(IrError::OutOfBounds);
+    }
+    let count = read_u32(body, config_offset)?;
+    let entries_offset = config_offset
+        .checked_add(CONFIG_HEADER_LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let entries_len = (count as usize)
+        .checked_mul(ConfigBindingView::LEN)
+        .ok_or(IrError::OutOfBounds)?;
+    let entries_end = entries_offset
+        .checked_add(entries_len)
+        .ok_or(IrError::OutOfBounds)?;
+    let entries = body
+        .get(entries_offset..entries_end)
+        .ok_or(IrError::OutOfBounds)?;
+    check_config_entries(body, entries, stage_count)?;
+    let section_len = CONFIG_HEADER_LEN
+        .checked_add(entries_len)
+        .ok_or(IrError::OutOfBounds)?;
+    Ok(Some(ParsedConfig {
+        count,
+        entries,
+        section_span: Span::new(config_offset, section_len),
+    }))
+}
+
+/// Checks that every config entry decodes and names a stage within
+/// `stage_count`.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry or key string-ref,
+/// [`IrError::Truncated`] on a short entry, and [`IrError::OrdinalOutOfRange`]
+/// if a binding names a stage at or beyond `stage_count`.
+fn check_config_entries(body: &[u8], entries: &[u8], stage_count: u32) -> Result<(), IrError> {
+    let mut offset = 0;
+    while offset < entries.len() {
+        let end = offset
+            .checked_add(ConfigBindingView::LEN)
+            .ok_or(IrError::OutOfBounds)?;
+        let entry = entries.get(offset..end).ok_or(IrError::OutOfBounds)?;
+        let binding = ConfigBindingView::parse(body, entry)?;
+        if u32::from(binding.node_ordinal()) >= stage_count {
+            return Err(IrError::OrdinalOutOfRange);
+        }
+        offset += ConfigBindingView::LEN;
+    }
+    Ok(())
+}
+
+/// Rejects any two body sections whose byte spans overlap.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if any pair of sections intersects.
+fn check_sections_disjoint(sections: &[Span]) -> Result<(), IrError> {
+    for (index, &section) in sections.iter().enumerate() {
+        for &other in &sections[index + 1..] {
+            if ranges_overlap(section, other) {
+                return Err(IrError::OutOfBounds);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The body offset where the trailing string heap begins: past every
+/// structural section and policy record. Registry names and config keys
+/// must start at or beyond this floor to stay inside the heap.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if a policy-record span is malformed.
+fn heap_floor(sections: &[Span], body: &[u8], stage_table: &[u8]) -> Result<usize, IrError> {
+    let mut floor = 0;
+    for section in sections {
+        floor = floor.max(section.offset + section.len);
+    }
+    let total = (stage_table.len() / STAGE_ENTRY_LEN)
+        .checked_mul(PolicyKind::COUNT)
+        .ok_or(IrError::OutOfBounds)?;
+    for n in 0..total {
+        if let Some(span) = nth_record_span(body, stage_table, n)? {
+            floor = floor.max(span.offset + span.len);
+        }
+    }
+    Ok(floor)
+}
+
+/// Checks that every registry name string-ref starts at or beyond `floor`,
+/// keeping names inside the trailing heap rather than over a section.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry or a name that
+/// starts before the heap floor.
+fn check_names_in_heap(name_table: &[u8], floor: usize) -> Result<(), IrError> {
+    let mut offset = 0;
+    while offset < name_table.len() {
+        let end = offset
+            .checked_add(RegistryView::NAME_ENTRY_LEN)
+            .ok_or(IrError::OutOfBounds)?;
+        let entry = name_table.get(offset..end).ok_or(IrError::OutOfBounds)?;
+        if (read_u32(entry, 0)? as usize) < floor {
+            return Err(IrError::OutOfBounds);
+        }
+        offset += RegistryView::NAME_ENTRY_LEN;
+    }
+    Ok(())
+}
+
+/// Checks that every config key string-ref starts at or beyond `floor`.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry or a key that
+/// starts before the heap floor.
+fn check_keys_in_heap(entries: &[u8], floor: usize) -> Result<(), IrError> {
+    let mut offset = 0;
+    while offset < entries.len() {
+        let end = offset
+            .checked_add(ConfigBindingView::LEN)
+            .ok_or(IrError::OutOfBounds)?;
+        let entry = entries.get(offset..end).ok_or(IrError::OutOfBounds)?;
+        if (read_u32(entry, 8)? as usize) < floor {
+            return Err(IrError::OutOfBounds);
+        }
+        offset += ConfigBindingView::LEN;
+    }
+    Ok(())
+}
+
+/// Checks that the sorted index lists stage names in non-decreasing order,
+/// the invariant the name lookup's binary search relies on.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry and
+/// [`IrError::RegistryUnsorted`] if two adjacent names are out of order.
+fn check_sorted_order(view: &RegistryView<'_>, stage_count: u32) -> Result<(), IrError> {
+    let mut previous: Option<&[u8]> = None;
+    for rank in 0..stage_count {
+        let ordinal = view.sorted_ordinal(rank).ok_or(IrError::OutOfBounds)?;
+        let name = view.name(u32::from(ordinal)).ok_or(IrError::OutOfBounds)?;
+        if let Some(prev) = previous {
+            if name < prev {
+                return Err(IrError::RegistryUnsorted);
+            }
+        }
+        previous = Some(name);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::node::NodeTag;
 
-    fn no_policy_body() -> [u8; 56] {
-        let mut body = [0u8; 56];
+    fn no_policy_body() -> [u8; 64] {
+        let mut body = [0u8; 64];
         body[0..4].copy_from_slice(&2u32.to_le_bytes());
         body[4..8].copy_from_slice(&1u32.to_le_bytes());
-        body[8..12].copy_from_slice(&16u32.to_le_bytes());
-        body[12..16].copy_from_slice(&48u32.to_le_bytes());
-        body[48..50].copy_from_slice(&0u16.to_le_bytes());
-        body[50..52].copy_from_slice(&1u16.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&56u32.to_le_bytes());
+        body[56..58].copy_from_slice(&0u16.to_le_bytes());
+        body[58..60].copy_from_slice(&1u16.to_le_bytes());
         body
     }
 
-    fn timeout_body() -> [u8; 48] {
-        let mut body = [0u8; 48];
+    fn timeout_body() -> [u8; 56] {
+        let mut body = [0u8; 56];
         body[0..4].copy_from_slice(&1u32.to_le_bytes());
-        body[8..12].copy_from_slice(&16u32.to_le_bytes());
-        body[12..16].copy_from_slice(&32u32.to_le_bytes());
-        body[20..24].copy_from_slice(&32u32.to_le_bytes());
-        body[32..34].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
-        body[36..40].copy_from_slice(&16u32.to_le_bytes());
-        body[40..48].copy_from_slice(&5_000u64.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&40u32.to_le_bytes());
+        body[28..32].copy_from_slice(&40u32.to_le_bytes());
+        body[40..42].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
+        body[44..48].copy_from_slice(&16u32.to_le_bytes());
+        body[48..56].copy_from_slice(&5_000u64.to_le_bytes());
         body
     }
 
@@ -390,7 +737,7 @@ mod tests {
     #[test]
     fn rejects_a_slot_tag_mismatch() {
         let mut body = timeout_body();
-        body[32..34].copy_from_slice(&(NodeTag::PolicyRetry as u16).to_le_bytes());
+        body[40..42].copy_from_slice(&(NodeTag::PolicyRetry as u16).to_le_bytes());
         assert_eq!(
             ConductorView::parse(&body),
             Err(IrError::BadTag {
@@ -402,7 +749,7 @@ mod tests {
     #[test]
     fn rejects_an_ordinal_overrun() {
         let mut body = no_policy_body();
-        body[50..52].copy_from_slice(&5u16.to_le_bytes());
+        body[58..60].copy_from_slice(&5u16.to_le_bytes());
         assert_eq!(ConductorView::parse(&body), Err(IrError::OrdinalOutOfRange));
     }
 
@@ -448,82 +795,39 @@ mod tests {
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 
-    fn all_policy_body() -> [u8; 144] {
-        let mut body = [0u8; 144];
-        body[0..4].copy_from_slice(&1u32.to_le_bytes());
-        body[8..12].copy_from_slice(&16u32.to_le_bytes());
-        body[12..16].copy_from_slice(&144u32.to_le_bytes());
-        body[16..20].copy_from_slice(&32u32.to_le_bytes());
-        body[20..24].copy_from_slice(&56u32.to_le_bytes());
-        body[24..28].copy_from_slice(&72u32.to_le_bytes());
-        body[28..32].copy_from_slice(&104u32.to_le_bytes());
-        body[32..34].copy_from_slice(&(NodeTag::PolicyLimiter as u16).to_le_bytes());
-        body[36..40].copy_from_slice(&24u32.to_le_bytes());
-        body[40..44].copy_from_slice(&100u32.to_le_bytes());
-        body[44..48].copy_from_slice(&10u32.to_le_bytes());
-        body[48..56].copy_from_slice(&1_000u64.to_le_bytes());
-        body[56..58].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
-        body[60..64].copy_from_slice(&16u32.to_le_bytes());
-        body[64..72].copy_from_slice(&5_000u64.to_le_bytes());
-        body[72..74].copy_from_slice(&(NodeTag::PolicyRetry as u16).to_le_bytes());
-        body[76..80].copy_from_slice(&32u32.to_le_bytes());
-        body[80..84].copy_from_slice(&5u32.to_le_bytes());
-        body[84] = 2;
-        body[85] = 1;
-        body[88..96].copy_from_slice(&1_000u64.to_le_bytes());
-        body[96..104].copy_from_slice(&60_000u64.to_le_bytes());
-        body[104..106].copy_from_slice(&(NodeTag::PolicyBreaker as u16).to_le_bytes());
-        body[108..112].copy_from_slice(&40u32.to_le_bytes());
-        body[112] = 1;
-        body[113] = 50;
-        body[116..120].copy_from_slice(&20u32.to_le_bytes());
-        body[120..128].copy_from_slice(&10_000u64.to_le_bytes());
-        body[128..132].copy_from_slice(&3u32.to_le_bytes());
-        body[132..136].copy_from_slice(&2u32.to_le_bytes());
-        body[136..144].copy_from_slice(&30_000u64.to_le_bytes());
-        body
-    }
-
     #[test]
-    fn reads_every_stage_policy() {
-        let body = all_policy_body();
-        let stage = ConductorView::parse(&body)
-            .ok()
-            .and_then(|view| view.stage(0));
-        let got = stage.map(|s| {
-            (
-                s.limiter().map(|policy| policy.capacity()),
-                s.timeout().map(|policy| policy.duration_ns()),
-                s.retry().map(|policy| policy.max_attempts()),
-                s.breaker().map(|policy| policy.failure_rate_percent()),
-            )
-        });
-        assert_eq!(got, Some((Some(100), Some(5_000), Some(5), Some(50))));
+    fn registry_and_config_absent() {
+        let body = no_policy_body();
+        let view = ConductorView::parse(&body);
+        assert!(matches!(
+            view,
+            Ok(spec) if spec.registry().is_none() && spec.config_count() == 0
+        ));
     }
 
     #[test]
     fn rejects_a_header_slot() {
         let mut body = timeout_body();
-        body[20..24].copy_from_slice(&8u32.to_le_bytes());
+        body[28..32].copy_from_slice(&8u32.to_le_bytes());
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 
     #[test]
     fn rejects_overlapping_tables() {
         let mut body = no_policy_body();
-        body[12..16].copy_from_slice(&16u32.to_le_bytes());
+        body[12..16].copy_from_slice(&24u32.to_le_bytes());
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 
-    fn record_in_table_body() -> [u8; 48] {
-        let mut body = [0u8; 48];
+    fn record_in_table_body() -> [u8; 56] {
+        let mut body = [0u8; 56];
         body[0..4].copy_from_slice(&2u32.to_le_bytes());
-        body[8..12].copy_from_slice(&16u32.to_le_bytes());
-        body[12..16].copy_from_slice(&48u32.to_le_bytes());
-        body[20..24].copy_from_slice(&32u32.to_le_bytes());
-        body[32..34].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
-        body[36..40].copy_from_slice(&16u32.to_le_bytes());
-        body[40..48].copy_from_slice(&5_000u64.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&56u32.to_le_bytes());
+        body[28..32].copy_from_slice(&40u32.to_le_bytes());
+        body[40..42].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
+        body[44..48].copy_from_slice(&16u32.to_le_bytes());
+        body[48..56].copy_from_slice(&5_000u64.to_le_bytes());
         body
     }
 
@@ -533,22 +837,120 @@ mod tests {
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 
-    fn shared_record_body() -> [u8; 64] {
-        let mut body = [0u8; 64];
+    fn shared_record_body() -> [u8; 72] {
+        let mut body = [0u8; 72];
         body[0..4].copy_from_slice(&2u32.to_le_bytes());
-        body[8..12].copy_from_slice(&16u32.to_le_bytes());
-        body[12..16].copy_from_slice(&48u32.to_le_bytes());
-        body[20..24].copy_from_slice(&48u32.to_le_bytes());
-        body[36..40].copy_from_slice(&48u32.to_le_bytes());
-        body[48..50].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
-        body[52..56].copy_from_slice(&16u32.to_le_bytes());
-        body[56..64].copy_from_slice(&5_000u64.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&56u32.to_le_bytes());
+        body[28..32].copy_from_slice(&56u32.to_le_bytes());
+        body[44..48].copy_from_slice(&56u32.to_le_bytes());
+        body[56..58].copy_from_slice(&(NodeTag::PolicyTimeout as u16).to_le_bytes());
+        body[60..64].copy_from_slice(&16u32.to_le_bytes());
+        body[64..72].copy_from_slice(&5_000u64.to_le_bytes());
         body
     }
 
     #[test]
     fn rejects_a_shared_record() {
         let body = shared_record_body();
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    #[test]
+    fn rejects_a_config_header_alias() {
+        let mut body = [0u8; 40];
+        body[0..4].copy_from_slice(&1u32.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&40u32.to_le_bytes());
+        body[20..24].copy_from_slice(&8u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    #[test]
+    fn rejects_a_name_ref_overrun() {
+        let mut body = [0u8; 50];
+        body[0..4].copy_from_slice(&1u32.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&40u32.to_le_bytes());
+        body[16..20].copy_from_slice(&40u32.to_le_bytes());
+        body[44..48].copy_from_slice(&999u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    /// A valid 2-stage registry: ord 0 = "a", ord 1 = "b", names in the heap
+    /// at offsets 76/77, sorted index `[0, 1]`.
+    fn registry_body() -> [u8; 80] {
+        let mut body = [0u8; 80];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&56u32.to_le_bytes());
+        body[16..20].copy_from_slice(&56u32.to_le_bytes());
+        body[56..60].copy_from_slice(&76u32.to_le_bytes());
+        body[60..64].copy_from_slice(&1u32.to_le_bytes());
+        body[64..68].copy_from_slice(&77u32.to_le_bytes());
+        body[68..72].copy_from_slice(&1u32.to_le_bytes());
+        body[72..74].copy_from_slice(&0u16.to_le_bytes());
+        body[74..76].copy_from_slice(&1u16.to_le_bytes());
+        body[76] = b'a';
+        body[77] = b'b';
+        body
+    }
+
+    #[test]
+    fn reads_a_registry() {
+        let body = registry_body();
+        let found = ConductorView::parse(&body).ok().and_then(|view| {
+            let registry = view.registry()?;
+            Some((registry.name(0)?, registry.lookup(b"b")?))
+        });
+        assert_eq!(found, Some((&b"a"[..], 1)));
+    }
+
+    #[test]
+    fn rejects_a_name_below_heap() {
+        let mut body = registry_body();
+        body[56..60].copy_from_slice(&24u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    #[test]
+    fn rejects_an_unsorted_registry() {
+        let mut body = registry_body();
+        body[72..74].copy_from_slice(&1u16.to_le_bytes());
+        body[74..76].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::RegistryUnsorted));
+    }
+
+    /// A valid 1-stage config: one binding with key "k" in the heap at
+    /// offset 80, default `ScalarValue` zero.
+    fn config_body() -> [u8; 88] {
+        let mut body = [0u8; 88];
+        body[0..4].copy_from_slice(&1u32.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&40u32.to_le_bytes());
+        body[20..24].copy_from_slice(&40u32.to_le_bytes());
+        body[40..44].copy_from_slice(&1u32.to_le_bytes());
+        body[50..52].copy_from_slice(&ConfigBindingView::FIELD_TIMEOUT_DURATION_NS.to_le_bytes());
+        body[52..56].copy_from_slice(&1u32.to_le_bytes());
+        body[56..60].copy_from_slice(&80u32.to_le_bytes());
+        body[80] = b'k';
+        body
+    }
+
+    #[test]
+    fn reads_a_config() {
+        let body = config_body();
+        let key = ConductorView::parse(&body)
+            .ok()
+            .and_then(|view| view.config_binding(0))
+            .map(|binding| binding.key());
+        assert_eq!(key, Some(&b"k"[..]));
+    }
+
+    #[test]
+    fn rejects_a_key_below_heap() {
+        let mut body = config_body();
+        body[56..60].copy_from_slice(&24u32.to_le_bytes());
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 }
