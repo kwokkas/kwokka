@@ -267,4 +267,11 @@ mod tests {
         blob[20..24].copy_from_slice(&0xFFFF_FFF8_u32.to_le_bytes());
         assert_eq!(validate(&blob), Err(IrError::OutOfBounds));
     }
+
+    #[test]
+    fn rejects_a_truncated_root_frame() {
+        let mut blob = valid_blob();
+        blob[12..16].copy_from_slice(&le32(TOTAL_LEN));
+        assert_eq!(validate(&blob), Err(IrError::Truncated));
+    }
 }
