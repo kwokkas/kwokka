@@ -29,3 +29,22 @@ pub enum NodeTag {
     /// External config binding descriptor.
     ConfigBinding = 9,
 }
+
+impl NodeTag {
+    /// Decodes a raw discriminant into a known tag, or `None` if the value
+    /// is not a recognized record kind.
+    pub(crate) const fn from_u16(value: u16) -> Option<Self> {
+        match value {
+            1 => Some(Self::ConductorSpec),
+            2 => Some(Self::StageNode),
+            3 => Some(Self::Edge),
+            4 => Some(Self::PolicyRetry),
+            5 => Some(Self::PolicyBreaker),
+            6 => Some(Self::PolicyLimiter),
+            7 => Some(Self::PolicyTimeout),
+            8 => Some(Self::RegistryEntry),
+            9 => Some(Self::ConfigBinding),
+            _ => None,
+        }
+    }
+}

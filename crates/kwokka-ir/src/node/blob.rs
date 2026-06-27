@@ -3,11 +3,10 @@
 /// A validated kwokka IR blob.
 ///
 /// Wraps the raw bytes of an IR blob. The only safe public way to obtain
-/// one will be the validating reader (added next); the in-process
-/// construction path is `pub(crate)` so an untrusted caller cannot
-/// fabricate a `KwokkaIr` that skips validation. Accessors return
-/// already-bounds-checked views.
-#[derive(Debug, Clone, Copy)]
+/// one is [`crate::validate`]; the in-process construction path is
+/// `pub(crate)` so an untrusted caller cannot fabricate a `KwokkaIr` that
+/// skips validation. Accessors return already-bounds-checked views.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KwokkaIr<'a> {
     bytes: &'a [u8],
 }
@@ -19,13 +18,6 @@ impl<'a> KwokkaIr<'a> {
     /// entry point. The caller guarantees `bytes` is a blob this crate's
     /// writer produced in the same process, so its structure is sound.
     #[must_use]
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the validating reader, added next, is the first caller"
-        )
-    )]
     pub(crate) const fn from_trusted(bytes: &'a [u8]) -> Self {
         Self { bytes }
     }
