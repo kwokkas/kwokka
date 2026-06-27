@@ -40,10 +40,10 @@ impl BreakerView {
     ///
     /// # Errors
     ///
-    /// Returns [`IrError::Truncated`] if the body is shorter than
+    /// Returns [`IrError::Truncated`] if the body length is not exactly
     /// [`BreakerView::LEN`].
     pub(crate) fn parse(body: &[u8]) -> Result<Self, IrError> {
-        if body.len() < Self::LEN {
+        if body.len() != Self::LEN {
             return Err(IrError::Truncated);
         }
         Ok(Self {
@@ -138,6 +138,11 @@ mod tests {
     #[test]
     fn rejects_a_short_body() {
         assert_eq!(BreakerView::parse(&[0u8; 16]), Err(IrError::Truncated));
+    }
+
+    #[test]
+    fn rejects_a_long_body() {
+        assert_eq!(BreakerView::parse(&[0u8; 40]), Err(IrError::Truncated));
     }
 
     #[test]
