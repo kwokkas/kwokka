@@ -32,7 +32,7 @@ pub(crate) struct RecordView<'a> {
 /// # Errors
 ///
 /// Returns [`IrError::Truncated`] if `offset..offset + 2` is out of range.
-fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IrError> {
+pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Result<u16, IrError> {
     let end = offset.checked_add(2).ok_or(IrError::Truncated)?;
     match bytes.get(offset..end) {
         Some(&[a, b]) => Ok(u16::from_le_bytes([a, b])),
@@ -114,6 +114,12 @@ pub(crate) fn read_record(bytes: &[u8], offset: usize) -> Result<RecordView<'_>,
 /// frame so every later accessor reads within bounds. Graph
 /// well-formedness (cycles, edge arity, topological order) is the
 /// consumer's responsibility, not the codec's.
+///
+/// String-ref disjointness is not enforced: a registry name or config key
+/// is bounds-checked against the blob, but the codec does not reject a
+/// string that overlaps another string or a table section. This is
+/// memory-safe -- strings are read-only byte slices -- and any uniqueness
+/// requirement is the consumer's to impose on externally-supplied blobs.
 ///
 /// # Errors
 ///
