@@ -115,11 +115,11 @@ pub(crate) fn read_record(bytes: &[u8], offset: usize) -> Result<RecordView<'_>,
 /// well-formedness (cycles, edge arity, topological order) is the
 /// consumer's responsibility, not the codec's.
 ///
-/// String-ref disjointness is not enforced: a registry name or config key
-/// is bounds-checked against the blob, but the codec does not reject a
-/// string that overlaps another string or a table section. This is
-/// memory-safe -- strings are read-only byte slices -- and any uniqueness
-/// requirement is the consumer's to impose on externally-supplied blobs.
+/// Registry names and config keys must lie in the trailing string heap,
+/// past every section and policy record; a string-ref pointing into a
+/// section is rejected. Two strings may still alias each other within the
+/// heap (a deduplicating writer may share bytes), so name uniqueness is the
+/// consumer's to impose on externally-supplied blobs.
 ///
 /// # Errors
 ///

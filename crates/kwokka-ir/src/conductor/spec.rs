@@ -131,6 +131,15 @@ impl<'a> ConductorView<'a> {
         check_stage_policies(body, stage_table, sections)?;
         check_record_overlaps(body, stage_table)?;
 
+        let floor = heap_floor(sections, body, stage_table)?;
+        if let Some(reg) = &registry {
+            check_names_in_heap(reg.name_table, floor)?;
+            check_sorted_order(&reg.view, stage_count)?;
+        }
+        if let Some(cfg) = &config {
+            check_keys_in_heap(cfg.entries, floor)?;
+        }
+
         Ok(Self {
             body,
             stage_count,
@@ -387,9 +396,11 @@ fn check_record_overlaps(body: &[u8], stage_table: &[u8]) -> Result<(), IrError>
     Ok(())
 }
 
-/// A validated registry section: the view plus its two table spans.
+/// A validated registry section: the view, its two table spans, and the
+/// name table for the string-heap containment check.
 struct ParsedRegistry<'a> {
     view: RegistryView<'a>,
+    name_table: &'a [u8],
     name_span: Span,
     sorted_span: Span,
 }
@@ -431,6 +442,7 @@ fn parse_registry(body: &[u8], stage_count: u32) -> Result<Option<ParsedRegistry
     check_sorted_ordinals(sorted_index, stage_count)?;
     Ok(Some(ParsedRegistry {
         view,
+        name_table,
         name_span: Span::new(name_offset, name_table.len()),
         sorted_span: Span::new(sorted_offset, sorted_index.len()),
     }))
@@ -559,6 +571,94 @@ fn check_sections_disjoint(sections: &[Span]) -> Result<(), IrError> {
                 return Err(IrError::OutOfBounds);
             }
         }
+    }
+    Ok(())
+}
+
+/// The body offset where the trailing string heap begins: past every
+/// structural section and policy record. Registry names and config keys
+/// must start at or beyond this floor to stay inside the heap.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] if a policy-record span is malformed.
+fn heap_floor(sections: &[Span], body: &[u8], stage_table: &[u8]) -> Result<usize, IrError> {
+    let mut floor = 0;
+    for section in sections {
+        floor = floor.max(section.offset + section.len);
+    }
+    let total = (stage_table.len() / STAGE_ENTRY_LEN)
+        .checked_mul(PolicyKind::COUNT)
+        .ok_or(IrError::OutOfBounds)?;
+    for n in 0..total {
+        if let Some(span) = nth_record_span(body, stage_table, n)? {
+            floor = floor.max(span.offset + span.len);
+        }
+    }
+    Ok(floor)
+}
+
+/// Checks that every registry name string-ref starts at or beyond `floor`,
+/// keeping names inside the trailing heap rather than over a section.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry or a name that
+/// starts before the heap floor.
+fn check_names_in_heap(name_table: &[u8], floor: usize) -> Result<(), IrError> {
+    let mut offset = 0;
+    while offset < name_table.len() {
+        let end = offset
+            .checked_add(RegistryView::NAME_ENTRY_LEN)
+            .ok_or(IrError::OutOfBounds)?;
+        let entry = name_table.get(offset..end).ok_or(IrError::OutOfBounds)?;
+        if (read_u32(entry, 0)? as usize) < floor {
+            return Err(IrError::OutOfBounds);
+        }
+        offset += RegistryView::NAME_ENTRY_LEN;
+    }
+    Ok(())
+}
+
+/// Checks that every config key string-ref starts at or beyond `floor`.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry or a key that
+/// starts before the heap floor.
+fn check_keys_in_heap(entries: &[u8], floor: usize) -> Result<(), IrError> {
+    let mut offset = 0;
+    while offset < entries.len() {
+        let end = offset
+            .checked_add(ConfigBindingView::LEN)
+            .ok_or(IrError::OutOfBounds)?;
+        let entry = entries.get(offset..end).ok_or(IrError::OutOfBounds)?;
+        if (read_u32(entry, 8)? as usize) < floor {
+            return Err(IrError::OutOfBounds);
+        }
+        offset += ConfigBindingView::LEN;
+    }
+    Ok(())
+}
+
+/// Checks that the sorted index lists stage names in non-decreasing order,
+/// the invariant the name lookup's binary search relies on.
+///
+/// # Errors
+///
+/// Returns [`IrError::OutOfBounds`] on a malformed entry and
+/// [`IrError::RegistryUnsorted`] if two adjacent names are out of order.
+fn check_sorted_order(view: &RegistryView<'_>, stage_count: u32) -> Result<(), IrError> {
+    let mut previous: Option<&[u8]> = None;
+    for rank in 0..stage_count {
+        let ordinal = view.sorted_ordinal(rank).ok_or(IrError::OutOfBounds)?;
+        let name = view.name(u32::from(ordinal)).ok_or(IrError::OutOfBounds)?;
+        if let Some(prev) = previous {
+            if name < prev {
+                return Err(IrError::RegistryUnsorted);
+            }
+        }
+        previous = Some(name);
     }
     Ok(())
 }
@@ -774,6 +874,83 @@ mod tests {
         body[12..16].copy_from_slice(&40u32.to_le_bytes());
         body[16..20].copy_from_slice(&40u32.to_le_bytes());
         body[44..48].copy_from_slice(&999u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    /// A valid 2-stage registry: ord 0 = "a", ord 1 = "b", names in the heap
+    /// at offsets 76/77, sorted index `[0, 1]`.
+    fn registry_body() -> [u8; 80] {
+        let mut body = [0u8; 80];
+        body[0..4].copy_from_slice(&2u32.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&56u32.to_le_bytes());
+        body[16..20].copy_from_slice(&56u32.to_le_bytes());
+        body[56..60].copy_from_slice(&76u32.to_le_bytes());
+        body[60..64].copy_from_slice(&1u32.to_le_bytes());
+        body[64..68].copy_from_slice(&77u32.to_le_bytes());
+        body[68..72].copy_from_slice(&1u32.to_le_bytes());
+        body[72..74].copy_from_slice(&0u16.to_le_bytes());
+        body[74..76].copy_from_slice(&1u16.to_le_bytes());
+        body[76] = b'a';
+        body[77] = b'b';
+        body
+    }
+
+    #[test]
+    fn reads_a_registry() {
+        let body = registry_body();
+        let found = ConductorView::parse(&body).ok().and_then(|view| {
+            let registry = view.registry()?;
+            Some((registry.name(0)?, registry.lookup(b"b")?))
+        });
+        assert_eq!(found, Some((&b"a"[..], 1)));
+    }
+
+    #[test]
+    fn rejects_a_name_below_heap() {
+        let mut body = registry_body();
+        body[56..60].copy_from_slice(&24u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    #[test]
+    fn rejects_an_unsorted_registry() {
+        let mut body = registry_body();
+        body[72..74].copy_from_slice(&1u16.to_le_bytes());
+        body[74..76].copy_from_slice(&0u16.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::RegistryUnsorted));
+    }
+
+    /// A valid 1-stage config: one binding with key "k" in the heap at
+    /// offset 80, default `ScalarValue` zero.
+    fn config_body() -> [u8; 88] {
+        let mut body = [0u8; 88];
+        body[0..4].copy_from_slice(&1u32.to_le_bytes());
+        body[8..12].copy_from_slice(&24u32.to_le_bytes());
+        body[12..16].copy_from_slice(&40u32.to_le_bytes());
+        body[20..24].copy_from_slice(&40u32.to_le_bytes());
+        body[40..44].copy_from_slice(&1u32.to_le_bytes());
+        body[50..52].copy_from_slice(&ConfigBindingView::FIELD_TIMEOUT_DURATION_NS.to_le_bytes());
+        body[52..56].copy_from_slice(&1u32.to_le_bytes());
+        body[56..60].copy_from_slice(&80u32.to_le_bytes());
+        body[80] = b'k';
+        body
+    }
+
+    #[test]
+    fn reads_a_config() {
+        let body = config_body();
+        let key = ConductorView::parse(&body)
+            .ok()
+            .and_then(|view| view.config_binding(0))
+            .map(|binding| binding.key());
+        assert_eq!(key, Some(&b"k"[..]));
+    }
+
+    #[test]
+    fn rejects_a_key_below_heap() {
+        let mut body = config_body();
+        body[56..60].copy_from_slice(&24u32.to_le_bytes());
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 }
