@@ -11,6 +11,9 @@ const EDGE_COUNT_FIELD: usize = 4;
 /// Byte offset of the edge-table-offset field within a `ConductorSpec` body.
 const EDGE_TABLE_OFFSET_FIELD: usize = 12;
 
+/// Byte length of the fixed `ConductorSpec` body header (four u32 fields).
+const CONDUCTOR_HEADER_LEN: usize = 16;
+
 /// The conductor DAG spec: the stage count and the edge table.
 ///
 /// Obtained from [`KwokkaIr::conductor`]. Stage bodies (policies, names) are
@@ -39,6 +42,9 @@ impl<'a> ConductorView<'a> {
         let stage_count = read_u32(body, STAGE_COUNT_FIELD)?;
         let edge_count = read_u32(body, EDGE_COUNT_FIELD)?;
         let table_offset = read_u32(body, EDGE_TABLE_OFFSET_FIELD)? as usize;
+        if table_offset < CONDUCTOR_HEADER_LEN {
+            return Err(IrError::OutOfBounds);
+        }
         let span = (edge_count as usize)
             .checked_mul(EdgeView::LEN)
             .ok_or(IrError::OutOfBounds)?;
@@ -161,6 +167,13 @@ mod tests {
     fn rejects_an_edge_table_overrun() {
         let mut body = one_edge_body(2, 0, 1);
         body[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
+    }
+
+    #[test]
+    fn rejects_an_edge_table_overlap() {
+        let mut body = one_edge_body(2, 0, 1);
+        body[12..16].copy_from_slice(&0u32.to_le_bytes());
         assert_eq!(ConductorView::parse(&body), Err(IrError::OutOfBounds));
     }
 
