@@ -750,4 +750,26 @@ mod tests {
         assert_eq!(key.op_token, 0xBEEF);
         assert!(inbox.pop().is_none(), "the post-guard push was a no-op");
     }
+
+    #[test]
+    fn allocate_slot_returns_a_key() {
+        let Ok(mut slab) = InflightBufSlab::new(5, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(5, None, Some(NonNull::from(&mut slab)), None);
+        let Some(key) = seam.allocate_slot(0xABCD) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        assert_eq!(key.op_token, 0xABCD);
+        assert_eq!(key.worker_id, 5);
+    }
+
+    #[test]
+    fn allocate_slot_needs_a_slab() {
+        let seam = IoSeam::new(6, None, None, None);
+        assert!(
+            seam.allocate_slot(0).is_none(),
+            "a seam with no slab cannot allocate",
+        );
+    }
 }
