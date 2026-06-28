@@ -2,6 +2,7 @@
 name = "kwokka-ir"
 version = "0.0.1"
 description = "language-neutral typed IR for kwokka orchestration specs"
+readme = "README.md"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
