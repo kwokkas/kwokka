@@ -27,6 +27,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::{
     DriverType, IoDriver,
+    buffer::inflight::InflightSlotKey,
     operation::{IoBuf, IoBufMut, IoRequest, SubmitResult},
 };
 
@@ -320,6 +321,101 @@ impl Drop for SeamGuard {
     }
 }
 
+/// Per-worker cancel-inbox capacity.
+///
+/// Sized to one slot per possible in-flight buffered op, so a worker can queue
+/// a cancel for every occupied slot in the same tick. A power of two, as
+/// [`CancelInbox`] requires.
+pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize;
+
+/// Fixed-capacity ring of pending cancels for dropped buffered futures.
+///
+/// A buffered future whose op is still in flight cannot free its bytes on
+/// drop -- the kernel still holds the pointer. It instead pushes its
+/// [`InflightSlotKey`] here; the owning worker drains the ring each tick,
+/// submits a cancel SQE, and marks the slot retire-pending, and the completion
+/// drain frees the slot once the kernel signals the op is done.
+///
+/// The caller keeps an in-flight buffered op pinned to its worker, so every
+/// push runs on the owning worker thread. The ring is therefore single-writer
+/// and needs no atomics.
+///
+/// `N` must be a power of two. At [`CANCEL_INBOX_CAPACITY`] there is one slot
+/// per in-flight op, so overflow is a safety backstop rather than a
+/// steady-state case: a full ring drops the cancel, a bounded leak, and the
+/// op's own completion still reclaims the slot, so no byte storage leaks
+/// permanently.
+pub struct CancelInbox<const N: usize> {
+    /// Pending cancels, oldest at `head`. `InflightSlotKey` is `Copy`, so a
+    /// dropped entry leaks only the cancel request, never owned storage.
+    slots: [Option<InflightSlotKey>; N],
+    head: usize,
+    tail: usize,
+}
+
+impl<const N: usize> CancelInbox<N> {
+    /// Creates an empty cancel inbox.
+    ///
+    /// # Panics
+    ///
+    /// Compile-time panic if `N` is not a power of two or is zero.
+    #[must_use]
+    pub const fn new() -> Self {
+        const {
+            assert!(
+                N > 0 && N.is_power_of_two(),
+                "N must be a positive power of 2"
+            );
+        }
+        Self {
+            slots: [const { None }; N],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    /// Queues a cancel for a dropped buffered future's in-flight op.
+    ///
+    /// A full ring drops the cancel -- a bounded leak: the op's own completion
+    /// still reclaims the slot, so no byte storage leaks. The caller does not
+    /// retry; the original CQE frees the slot either way.
+    pub const fn push_cancel(&mut self, key: InflightSlotKey) {
+        if self.tail.wrapping_sub(self.head) >= N {
+            return;
+        }
+        self.slots[self.tail & (N - 1)] = Some(key);
+        self.tail = self.tail.wrapping_add(1);
+    }
+
+    /// Pops the oldest pending cancel, or `None` when the inbox is empty.
+    pub const fn pop(&mut self) -> Option<InflightSlotKey> {
+        if self.head == self.tail {
+            return None;
+        }
+        let key = self.slots[self.head & (N - 1)].take();
+        self.head = self.head.wrapping_add(1);
+        key
+    }
+
+    /// Number of pending cancels.
+    #[cfg(test)]
+    pub(crate) const fn len(&self) -> usize {
+        self.tail.wrapping_sub(self.head)
+    }
+
+    /// `true` when no cancels are pending.
+    #[cfg(test)]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl<const N: usize> Default for CancelInbox<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -428,5 +524,87 @@ mod tests {
             "the ring accepts a timeout op",
         );
         assert_eq!(seam.submitted(), 1, "a submitted op raises the count");
+    }
+
+    fn cancel_key(slot: u16) -> InflightSlotKey {
+        InflightSlotKey {
+            slot,
+            generation: 0,
+            worker_id: 3,
+            op_token: u64::from(slot),
+        }
+    }
+
+    #[test]
+    fn cancel_push_pop_fifo() {
+        let mut inbox = CancelInbox::<4>::new();
+        inbox.push_cancel(cancel_key(0));
+        inbox.push_cancel(cancel_key(1));
+        let Some(first) = inbox.pop() else {
+            panic!("pop must yield the first cancel");
+        };
+        assert_eq!(first.slot, 0);
+        let Some(second) = inbox.pop() else {
+            panic!("pop must yield the second cancel");
+        };
+        assert_eq!(second.slot, 1);
+        assert!(inbox.pop().is_none());
+    }
+
+    #[test]
+    fn cancel_full_inbox_leaks() {
+        let mut inbox = CancelInbox::<2>::new();
+        inbox.push_cancel(cancel_key(0));
+        inbox.push_cancel(cancel_key(1));
+        inbox.push_cancel(cancel_key(2));
+        assert_eq!(
+            inbox.len(),
+            2,
+            "a full inbox drops the overflow cancel as a bounded leak"
+        );
+        let Some(first) = inbox.pop() else {
+            panic!("the queued cancels survive the overflow");
+        };
+        assert_eq!(
+            first.slot, 0,
+            "the overflow did not displace a queued cancel"
+        );
+    }
+
+    #[test]
+    fn cancel_pop_empty_returns_none() {
+        let mut inbox = CancelInbox::<2>::new();
+        assert!(inbox.pop().is_none());
+    }
+
+    #[test]
+    fn cancel_len_empty_occupancy() {
+        let mut inbox = CancelInbox::<4>::new();
+        assert!(inbox.is_empty());
+        assert_eq!(inbox.len(), 0);
+        inbox.push_cancel(cancel_key(0));
+        assert_eq!(inbox.len(), 1);
+        assert!(!inbox.is_empty());
+        assert!(inbox.pop().is_some());
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn cancel_wrap_around_reuses_slots() {
+        let mut inbox = CancelInbox::<2>::new();
+        inbox.push_cancel(cancel_key(0));
+        assert!(inbox.pop().is_some());
+        inbox.push_cancel(cancel_key(1));
+        inbox.push_cancel(cancel_key(2));
+        let Some(second) = inbox.pop() else {
+            panic!("pop must yield after wrap");
+        };
+        assert_eq!(second.slot, 1);
+    }
+
+    #[test]
+    fn cancel_default_is_empty() {
+        let inbox = CancelInbox::<4>::default();
+        assert!(inbox.is_empty());
     }
 }
