@@ -19,7 +19,7 @@
 use core::{future::Future, ptr::NonNull};
 
 use kwokka_core::{namespace::Namespace, slab::SlabKey};
-use kwokka_io::{IoDriver, operation::Completion, wake};
+use kwokka_io::{IoDriver, boundary::CancelInboxGuard, operation::Completion, wake};
 
 use crate::{
     runtime::handle::Runtime,
@@ -73,6 +73,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         &mut shard.timer_requests,
         shard.id,
         Some(NonNull::from(&mut shard.driver)),
+        Some(NonNull::from(&mut shard.inflight_slab)),
         &shard.forward,
     );
     #[cfg(not(feature = "steal"))]
@@ -85,6 +86,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         &mut shard.timer_requests,
         shard.id,
         Some(NonNull::from(&mut shard.driver)),
+        Some(NonNull::from(&mut shard.inflight_slab)),
     );
     cycle::drain_spawns(
         &mut shard.tasks,
@@ -326,6 +328,8 @@ impl Runtime<Affine> {
     /// it terminates abnormally (cancelled or failed). A recoverable error is
     /// the future's own `Output` and does not panic.
     pub fn block_on<F: Future>(&mut self, future: F) -> F::Output {
+        let worker_id = self.shard.id.raw();
+        let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
         let root_key = spawn_root(&mut self.shard, future);
         arm_wake(&self.shard, self.wake_fd);
         loop {
