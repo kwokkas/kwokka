@@ -87,14 +87,16 @@ fn detect_capabilities(ring: &IoUring, tier: SetupTier) -> io::Result<Capability
         registered_files: true,
         max_register_slots: 1024,
 
-        buf_ring: kernel_version.at_least(5, 19),
-        multishot_accept: probe.is_supported(opcode::AcceptMulti::CODE),
-        multishot_recv: probe.is_supported(opcode::RecvMulti::CODE),
+        buf_ring: cfg!(feature = "uring-buf-ring") && kernel_version.at_least(5, 19),
+        multishot_accept: cfg!(feature = "uring-multishot")
+            && probe.is_supported(opcode::AcceptMulti::CODE),
+        multishot_recv: cfg!(feature = "uring-multishot")
+            && probe.is_supported(opcode::RecvMulti::CODE),
 
-        msg_ring: probe.is_supported(opcode::MsgRingData::CODE),
+        msg_ring: cfg!(feature = "uring-msg-ring") && probe.is_supported(opcode::MsgRingData::CODE),
 
-        send_zc: probe.is_supported(opcode::SendZc::CODE),
-        sendmsg_zc: probe.is_supported(opcode::SendMsgZc::CODE),
+        send_zc: cfg!(feature = "uring-send-zc") && probe.is_supported(opcode::SendZc::CODE),
+        sendmsg_zc: cfg!(feature = "uring-send-zc") && probe.is_supported(opcode::SendMsgZc::CODE),
         recv_zc: false,
 
         async_cancel: probe.is_supported(opcode::AsyncCancel::CODE),
@@ -206,6 +208,7 @@ mod tests {
         assert!(result.capabilities.async_cancel);
     }
 
+    #[cfg(feature = "uring-msg-ring")]
     #[cfg_attr(
         miri,
         ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
@@ -222,6 +225,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "uring-multishot")]
     #[cfg_attr(
         miri,
         ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
@@ -234,6 +238,21 @@ mod tests {
         };
         assert!(result.capabilities.multishot_accept);
         assert!(result.capabilities.multishot_recv);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[cfg(not(feature = "uring-send-zc"))]
+    #[test]
+    fn send_zc_feature_off_keeps_capability_false() {
+        let result = match probe_and_create(TEST_RING_ENTRIES) {
+            Ok(result) => result,
+            Err(error) => panic!("probe_and_create failed: {error}"),
+        };
+        assert!(!result.capabilities.send_zc);
+        assert!(!result.capabilities.sendmsg_zc);
     }
 
     #[cfg_attr(

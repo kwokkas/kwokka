@@ -1,4 +1,23 @@
 //! Backend capability snapshot and kernel version types.
+//!
+//! # Feature gating and fallback parity
+//!
+//! Each `io_uring` advanced capability sits behind a Cargo feature
+//! (compile-time) AND the runtime probe (kernel support): the flag is
+//! `true` only when both hold. Otherwise the caller takes the
+//! correctness-equivalent fallback, which compiles regardless of the
+//! feature, so turning a feature off never removes a working path.
+//!
+//! | Capability | Feature | Kernel | epoll / kqueue (completion via internal readiness) |
+//! |---|---|---|---|
+//! | `buf_ring` | `uring-buf-ring` (default) | 5.19 | userspace buffer pool selects the slot |
+//! | `multishot_accept` / `multishot_recv` | `uring-multishot` (default) | 5.19 / 6.0 | readiness loop synthesizes each completion |
+//! | `msg_ring` | `uring-msg-ring` (default) | 5.18 | eventfd or kqueue user-event wake completion |
+//! | `send_zc` / `sendmsg_zc` | `uring-send-zc` (opt-in) | 6.0 / 6.1 | plain send completion, no zero-copy |
+//!
+//! `io_uring` and `IOCP` are native completion backends; epoll and kqueue
+//! synthesize completions from internal readiness. The rightmost column
+//! is the parity contract for the eventual readiness backends.
 
 /// Kernel version triple.
 ///
