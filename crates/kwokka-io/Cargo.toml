@@ -12,6 +12,18 @@ homepage.workspace = true
 keywords = ["async", "io-uring", "epoll", "kqueue", "kwokka"]
 categories = ["asynchronous", "os"]
 
+[features]
+default = ["uring-buf-ring", "uring-multishot", "uring-msg-ring"]
+
+# Kernel-selected provided buffers (PBUF_RING, 5.19).
+uring-buf-ring = []
+# Multishot accept/recv (5.19 / 6.0); recv requires the provided-buffer ring.
+uring-multishot = ["uring-buf-ring"]
+# Cross-worker wake via MSG_RING (5.18); off falls back to eventfd.
+uring-msg-ring = []
+# Zero-copy send / sendmsg (SEND_ZC, 6.0 / 6.1). Opt-in.
+uring-send-zc = []
+
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
