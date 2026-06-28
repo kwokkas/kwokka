@@ -48,7 +48,7 @@ pub(crate) struct InflightSlotKey {
     /// Slot index in the owning worker's registry.
     pub(crate) slot: u16,
     /// Generation captured at allocation.
-    pub(crate) generation: u16,
+    pub(crate) generation: u64,
     /// Worker whose registry owns the slot.
     pub(crate) worker_id: u8,
     /// Submitted op `user_data`; the cancel target when the future drops.
@@ -64,10 +64,9 @@ pub(crate) struct InflightBufSlab {
     storage: MmapRegion,
     occupied: [u64; BITMAP_WORDS],
     retire_pending: [u64; BITMAP_WORDS],
-    /// Per-slot generation, bumped on free. Wraps at 65536: after that many
-    /// reuses of one slot without a stale handle surfacing, the ABA window
-    /// reopens. Distant at realistic buffered-op throughput.
-    generation: [u16; MAX_INFLIGHT_SLOTS],
+    /// Per-slot generation, bumped on free. A `u64` makes the ABA window
+    /// effectively unbounded: a slot would need 2^64 reuses to wrap.
+    generation: [u64; MAX_INFLIGHT_SLOTS],
     worker_id: u8,
     cap: u16,
     stride: u32,
@@ -199,15 +198,26 @@ impl InflightBufSlab {
         None
     }
 
-    /// Whether `key` names a live slot at the matching generation.
+    /// Whether `key` names a live slot this registry owns at the matching
+    /// generation.
     ///
-    /// This generation guard is what lets
+    /// Checks worker ownership and slot occupancy alongside the generation, so
+    /// a cross-worker handle or a fabricated key for an unallocated slot is
+    /// rejected, not just a stale one. This generation guard is what lets
     /// [`is_retire_pending`](Self::is_retire_pending) skip a generation
     /// parameter: [`free`](Self::free) clears the retire-pending bit and bumps
     /// the generation together, so any reuse of the slot begins with the bit
     /// clear and a stale mark cannot survive across a free.
     const fn is_live(&self, key: InflightSlotKey) -> bool {
-        key.slot < self.cap && self.generation[key.slot as usize] == key.generation
+        if key.worker_id != self.worker_id {
+            return false;
+        }
+        if key.slot >= self.cap {
+            return false;
+        }
+        let (word, bit) = word_bit(key.slot);
+        self.occupied[word] & (1u64 << bit) != 0
+            && self.generation[key.slot as usize] == key.generation
     }
 }
 
@@ -349,5 +359,36 @@ mod tests {
             panic!("a live handle yields a slice");
         };
         assert_eq!(bytes.len(), INFLIGHT_BUF_STRIDE as usize);
+    }
+
+    #[test]
+    fn unallocated_slot_is_not_live() {
+        let registry = slab(8);
+        let fabricated = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 3,
+            op_token: 0,
+        };
+        assert!(
+            registry.slot_ptr(fabricated).is_none(),
+            "a fabricated key for an unallocated slot is rejected",
+        );
+    }
+
+    #[test]
+    fn foreign_worker_key_is_rejected() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0) else {
+            panic!("allocate must succeed");
+        };
+        let foreign = InflightSlotKey {
+            worker_id: key.worker_id + 1,
+            ..key
+        };
+        assert!(
+            registry.slot_ptr(foreign).is_none(),
+            "a key from another worker is rejected",
+        );
     }
 }
