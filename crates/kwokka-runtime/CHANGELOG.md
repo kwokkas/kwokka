@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.3](https://github.com/kwokkas/kwokka/compare/kwokka-runtime-v0.0.2...kwokka-runtime-v0.0.3) - 2026-06-28
+
+### Features
+
+- wire the drop-safe buffer through the worker ([#188](https://github.com/kwokkas/kwokka/pull/188))
+
 ## [0.0.2](https://github.com/kwokkas/kwokka/compare/kwokka-runtime-v0.0.1...kwokka-runtime-v0.0.2) - 2026-06-24
 
 ### Refactor

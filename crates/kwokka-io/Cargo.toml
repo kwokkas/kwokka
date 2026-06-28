@@ -1,6 +1,6 @@
 [package]
 name = "kwokka-io"
-version = "0.0.1"
+version = "0.0.2"
 description = "completion-based I/O driver, buffer pool, and operation types"
 readme = "README.md"
 edition.workspace = true
