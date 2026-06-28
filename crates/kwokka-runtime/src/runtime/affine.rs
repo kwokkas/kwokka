@@ -17,7 +17,7 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{io, thread};
 
-use kwokka_io::{DriverType, wake};
+use kwokka_io::{DriverType, boundary::CancelInboxGuard, wake};
 
 use crate::{
     runtime::{
@@ -108,7 +108,13 @@ fn build_crew(
 ) -> io::Result<Runtime<Affine>> {
     let driver = DriverType::for_platform(ring_entries)?;
     let wake_fd = wake::create_wake_fd()?;
-    let shard = WorkerShard::new(lead, driver, task_capacity);
+    let shard = match WorkerShard::new(lead, driver, task_capacity) {
+        Ok(shard) => shard,
+        Err(error) => {
+            wake::close_wake_fd(wake_fd);
+            return Err(error);
+        }
+    };
     registry::publish_endpoint(lead, wake_fd);
     match spawn_crew(lead, ring_entries, task_capacity, workers) {
         Ok(crew) => Ok(Runtime::from_crew(shard, wake_fd, crew)),
@@ -181,7 +187,15 @@ fn sibling_main(id: WorkerId, ring_entries: u32, task_capacity: usize) {
         AFFINE_READY.fetch_add(1, Ordering::SeqCst);
         return;
     };
-    let mut shard = WorkerShard::new(id, driver, task_capacity);
+    let Ok(mut shard) = WorkerShard::new(id, driver, task_capacity) else {
+        AFFINE_BOOT_FAILED.store(true, Ordering::SeqCst);
+        AFFINE_READY.fetch_add(1, Ordering::SeqCst);
+        wake::close_wake_fd(wake_fd);
+        return;
+    };
+    // Declared after `shard` so LIFO drop nulls the cancel static before
+    // `shard.tasks` frees buffered futures, whose drops then no-op.
+    let _cancel_guard = CancelInboxGuard::install(id.raw(), &mut shard.cancel_inbox);
     registry::publish_endpoint(id, wake_fd);
     bootstrap::arm_wake(&shard, wake_fd);
     AFFINE_READY.fetch_add(1, Ordering::SeqCst);

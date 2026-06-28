@@ -26,6 +26,7 @@ use kwokka_core::slab::{Slab, SlabKey};
 use kwokka_io::{
     DriverType,
     boundary::{IoSeam, SeamGuard, WakeSlot},
+    buffer::inflight::InflightBufSlab,
 };
 
 use crate::{
@@ -144,6 +145,7 @@ pub(crate) fn poll_one(
     inbox: NonNull<SpawnInbox<SPAWN_INBOX_CAPACITY>>,
     reap: NonNull<ReapQueue<REAP_QUEUE_CAPACITY>>,
     driver: Option<NonNull<DriverType>>,
+    inflight_slab: Option<NonNull<InflightBufSlab>>,
     timer_requests: Option<NonNull<TimerInbox<TIMER_INBOX_CAPACITY>>>,
 ) -> Option<PollOutcome> {
     // SAFETY: Invariant -- `tasks` points at the worker's live slab; the caller
@@ -188,7 +190,12 @@ pub(crate) fn poll_one(
     // so its drop clears the seam first (LIFO), and fed the same driver and
     // captured wake data so a future hosted outside this crate observes the
     // exact state a frame-routed future would.
-    let seam = IoSeam::new(worker_id.raw(), driver, wake_slot_of(wake_data));
+    let seam = IoSeam::new(
+        worker_id.raw(),
+        driver,
+        inflight_slab,
+        wake_slot_of(wake_data),
+    );
     let _seam_guard = SeamGuard::install(&seam);
     let waker = waker_from_task_ref(current);
     let mut context = Context::from_waker(&waker);
@@ -461,6 +468,7 @@ mod tests {
             NonNull::from(&mut reap),
             None,
             None,
+            None,
         );
         assert_eq!(outcome, Some(PollOutcome::Completed));
         let Some(slot) = slab.get(key) else {
@@ -513,6 +521,7 @@ mod tests {
             task,
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
+            None,
             None,
             None,
         );
@@ -588,6 +597,7 @@ mod tests {
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
             Some(NonNull::from(&mut driver)),
+            None,
             None,
         );
         assert_eq!(outcome, Some(PollOutcome::Completed));

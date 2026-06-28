@@ -27,7 +27,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::{
     DriverType, IoDriver,
-    buffer::inflight::InflightSlotKey,
+    buffer::inflight::{InflightBufSlab, InflightSlotKey},
     operation::{IoBuf, IoBufMut, IoRequest, SubmitResult},
 };
 
@@ -144,6 +144,10 @@ pub struct IoSeam {
     worker_id: u8,
     /// The worker's I/O driver, or `None` for a test seam with no backend.
     driver: Option<NonNull<DriverType>>,
+    /// The worker's in-flight buffer registry, or `None` for a test seam. A
+    /// buffered future allocates a slot here during its poll through
+    /// [`IoSeam::allocate_slot`].
+    inflight_slab: Option<NonNull<InflightBufSlab>>,
     /// The polling task's captured completion result, when one has arrived.
     wake_slot: Option<WakeSlot>,
     /// Ops submitted through the seam this poll. The runtime folds the count
@@ -158,11 +162,13 @@ impl IoSeam {
     pub const fn new(
         worker_id: u8,
         driver: Option<NonNull<DriverType>>,
+        inflight_slab: Option<NonNull<InflightBufSlab>>,
         wake_slot: Option<WakeSlot>,
     ) -> Self {
         Self {
             worker_id,
             driver,
+            inflight_slab,
             wake_slot,
             submitted: AtomicU16::new(0),
         }
@@ -290,6 +296,36 @@ impl IoSeam {
         }
         Some(result)
     }
+
+    /// Allocates an in-flight buffer slot for a buffered op on the polling task.
+    ///
+    /// Returns `None` when the seam carries no slab (a test seam with no
+    /// backend) or the registry is full. The returned [`InflightSlotKey`] is
+    /// `Copy`; the future holds it for the op lifetime and hands it to
+    /// [`push_cancel_for_worker`] if it drops before the completion arrives.
+    pub fn allocate_slot(&self, op_token: u64) -> Option<InflightSlotKey> {
+        let mut slab = self.inflight_slab?;
+        // SAFETY: Invariant -- `slab` points at the worker's `inflight_slab`
+        // field, formed by the run-loop via `NonNull::from(&mut
+        // shard.inflight_slab)` and disjoint from the driver, task slab, and
+        // inboxes the runtime borrows separately across the poll. The field
+        // lives on the worker, which outlives every poll window it hosts.
+        // Precondition (why this `&mut` is unique for the window): the runtime
+        // polls one task at a time per worker -- `poll_one` is not re-entrant,
+        // and `SeamGuard` is not re-entrant, so at most one `IoSeam` is
+        // installed per worker at a time. `allocate_slot` is the only path that
+        // forms a `&mut InflightBufSlab` during a poll, and the run-loop does
+        // not touch `inflight_slab` again between forming the pointer and the
+        // seam clearing. A second runtime in the same process claims a different
+        // worker id with its own `InflightBufSlab`, so a nested `block_on`
+        // aliases nothing here.
+        // Failure mode: a second `&mut` into the slab within the poll window --
+        // a reentrancy path the non-reentrant poll structure excludes -- aliases
+        // this one (double-mutable-aliasing UB); a call after `SeamGuard` drops
+        // derefs a dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        slab.allocate(op_token)
+    }
 }
 
 /// RAII bracket that installs a seam for one poll window and clears it on
@@ -416,6 +452,86 @@ impl<const N: usize> Default for CancelInbox<N> {
     }
 }
 
+/// One cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
+const CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
+
+/// The installed cancel inbox for each worker, or null outside a run-loop,
+/// indexed by worker id.
+///
+/// Unlike [`SEAMS`], which is poll-window scoped, this is installed for the
+/// worker's whole run-loop: a buffered future's `Drop` runs outside the poll
+/// window (task reap, or an early cancel-drop) yet still on the owning worker
+/// thread, so the cancel must reach the inbox without the poll bracket.
+/// `AtomicPtr<CancelInbox>` is `Sync` regardless of `CancelInbox`, so the array
+/// is a sound `static` with no `unsafe impl`.
+static CANCEL_INBOXES: [AtomicPtr<CancelInbox<CANCEL_INBOX_CAPACITY>>; CANCEL_INBOX_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; CANCEL_INBOX_SLOTS];
+
+/// RAII bracket that installs a worker's cancel inbox for its whole run-loop
+/// and clears it on drop.
+///
+/// Declared after the `WorkerShard` local in each run-loop entry, so Rust LIFO
+/// drop clears the static before the shard -- and its `cancel_inbox` field --
+/// is reclaimed. A buffered future dropped during shard teardown then finds a
+/// null slot and its [`push_cancel_for_worker`] is a no-op, an accepted bounded
+/// leak the same as an overflowed ring.
+///
+/// Not re-entrant: one run-loop per worker installs one guard.
+pub struct CancelInboxGuard {
+    /// Worker slot to clear on drop.
+    worker_id: u8,
+}
+
+impl CancelInboxGuard {
+    /// Installs `inbox` for `worker_id` for the run-loop, returning the guard
+    /// that clears it.
+    ///
+    /// Takes `&mut` only to form the pointer; the guard stores no reference, so
+    /// the caller's borrow of the inbox ends when this returns and the run-loop
+    /// can borrow the owning shard again.
+    #[must_use]
+    pub fn install(worker_id: u8, inbox: &mut CancelInbox<CANCEL_INBOX_CAPACITY>) -> Self {
+        CANCEL_INBOXES[worker_id as usize].store(ptr::from_mut(inbox), Ordering::Release);
+        Self { worker_id }
+    }
+}
+
+impl Drop for CancelInboxGuard {
+    fn drop(&mut self) {
+        CANCEL_INBOXES[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// Queues a cancel for a dropped buffered future's in-flight op on its worker.
+///
+/// A no-op when no inbox is installed for `key.worker_id`: the worker's
+/// run-loop already tore down, so the op's own completion frees the slot during
+/// shutdown, a bounded leak like an overflowed ring.
+pub fn push_cancel_for_worker(key: InflightSlotKey) {
+    let inbox = CANCEL_INBOXES[key.worker_id as usize].load(Ordering::Acquire);
+    if inbox.is_null() {
+        return;
+    }
+    // SAFETY: Invariant -- a non-null pointer in `CANCEL_INBOXES[key.worker_id]`
+    // was stored by `CancelInboxGuard::install` over the owning `WorkerShard`'s
+    // `cancel_inbox` field. The guard is declared after the shard in the
+    // run-loop entry, so Rust LIFO drop nulls this slot before the shard, and
+    // its field, is reclaimed; a non-null load therefore names a live field.
+    // Precondition (why the single-writer contract holds): a buffered future's
+    // `Drop` fires only on the owning worker's thread, because submitting a
+    // buffered op sets `header.io_bound = true` in the post-poll fold, which
+    // pins the task off the steal path so it never migrates to another worker.
+    // Callers must invoke this only from such a future's `Drop`, so the worker
+    // that installed the inbox is the only thread that ever pushes -- the inbox
+    // needs no atomics. A future that cleared `io_bound`, or a non-buffered
+    // future reaching here, would break that contract and must re-establish it.
+    // Failure mode: null is the early return above. A cross-thread push (a task
+    // with `io_bound = false`) races the single writer; the call-site invariant
+    // excludes it. A dangling pointer cannot arise -- LIFO drop order excludes it.
+    let inbox = unsafe { &mut *inbox };
+    inbox.push_cancel(key);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,7 +543,7 @@ mod tests {
 
     #[test]
     fn guard_brackets_install_and_clear() {
-        let seam = IoSeam::new(201, None, None);
+        let seam = IoSeam::new(201, None, None, None);
         {
             let _guard = SeamGuard::install(&seam);
             assert_eq!(IoSeam::with_current(201, IoSeam::worker_id), Some(201));
@@ -498,7 +614,7 @@ mod tests {
     #[test]
     fn rejected_submit_leaves_the_count_untouched() {
         let mut driver = DriverType::Epoll(());
-        let seam = IoSeam::new(202, Some(NonNull::from(&mut driver)), None);
+        let seam = IoSeam::new(202, Some(NonNull::from(&mut driver)), None, None);
         let result = seam.submit_internal(IoRequest::<()>::timeout(1));
         assert!(
             matches!(result, Some(SubmitResult::Unsupported)),
@@ -514,7 +630,7 @@ mod tests {
         let Ok(mut driver) = DriverType::for_platform(8) else {
             panic!("the platform driver must build on this host");
         };
-        let seam = IoSeam::new(203, Some(NonNull::from(&mut driver)), None);
+        let seam = IoSeam::new(203, Some(NonNull::from(&mut driver)), None, None);
         let request = IoRequest::<()>::timeout(1_000_000).with_user_data(0);
         let Some(result) = seam.submit_internal(request) else {
             panic!("a seam with a driver must reach the submit path");
@@ -606,5 +722,32 @@ mod tests {
     fn cancel_default_is_empty() {
         let inbox = CancelInbox::<4>::default();
         assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn cancel_guard_routes_then_clears() {
+        let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
+        {
+            let _guard = CancelInboxGuard::install(7, &mut inbox);
+            push_cancel_for_worker(InflightSlotKey {
+                slot: 1,
+                generation: 0,
+                worker_id: 7,
+                op_token: 0xBEEF,
+            });
+        }
+        // The guard dropped, so the static is null and this push is a no-op.
+        push_cancel_for_worker(InflightSlotKey {
+            slot: 2,
+            generation: 0,
+            worker_id: 7,
+            op_token: 0,
+        });
+        let Some(key) = inbox.pop() else {
+            panic!("the in-guard push reached the inbox");
+        };
+        assert_eq!(key.slot, 1);
+        assert_eq!(key.op_token, 0xBEEF);
+        assert!(inbox.pop().is_none(), "the post-guard push was a no-op");
     }
 }

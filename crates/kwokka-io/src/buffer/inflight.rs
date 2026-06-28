@@ -29,7 +29,7 @@ use crate::buffer::mmap::MmapRegion;
 pub(crate) const INFLIGHT_BUF_STRIDE: u32 = 4096;
 
 /// Default in-flight slots per worker.
-pub(crate) const DEFAULT_INFLIGHT_CAP: u16 = 256;
+pub const DEFAULT_INFLIGHT_CAP: u16 = 256;
 
 /// Slot-count ceiling that sizes the inline bitmaps and generation table.
 const MAX_INFLIGHT_SLOTS: usize = DEFAULT_INFLIGHT_CAP as usize;
@@ -60,7 +60,7 @@ pub struct InflightSlotKey {
 /// Owns the bytes for every buffered op in flight on its worker. A slot is
 /// freed only by the completion drain after the kernel signals it is done,
 /// never by the future's drop, so the kernel never writes freed memory.
-pub(crate) struct InflightBufSlab {
+pub struct InflightBufSlab {
     storage: MmapRegion,
     occupied: [u64; BITMAP_WORDS],
     retire_pending: [u64; BITMAP_WORDS],
@@ -74,12 +74,12 @@ pub(crate) struct InflightBufSlab {
 
 impl InflightBufSlab {
     /// Builds a registry of `cap` slots (clamped to [`DEFAULT_INFLIGHT_CAP`])
-    /// for `worker_id`, each [`INFLIGHT_BUF_STRIDE`] bytes wide.
+    /// for `worker_id`, each `INFLIGHT_BUF_STRIDE` bytes wide.
     ///
     /// # Errors
     ///
     /// Returns the `mmap` error when backing allocation fails.
-    pub(crate) fn new(worker_id: u8, cap: u16) -> io::Result<Self> {
+    pub fn new(worker_id: u8, cap: u16) -> io::Result<Self> {
         let cap = cap.min(DEFAULT_INFLIGHT_CAP);
         let stride = INFLIGHT_BUF_STRIDE;
         let storage = MmapRegion::new(cap as usize * stride as usize)?;

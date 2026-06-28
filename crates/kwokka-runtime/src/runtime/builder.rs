@@ -118,7 +118,14 @@ impl RuntimeBuilder {
                 return Err(error);
             }
         };
-        let shard = WorkerShard::new(worker_id, driver, self.task_capacity);
+        let shard = match WorkerShard::new(worker_id, driver, self.task_capacity) {
+            Ok(shard) => shard,
+            Err(error) => {
+                registry::release(worker_id);
+                wake::close_wake_fd(wake_fd);
+                return Err(error);
+            }
+        };
         Ok(Runtime::from_shard(shard, wake_fd))
     }
 

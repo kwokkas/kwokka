@@ -32,7 +32,7 @@ use std::{io, thread};
 
 #[cfg(feature = "steal")]
 use kwokka_core::slab::SlabKey;
-use kwokka_io::{DriverType, wake};
+use kwokka_io::{DriverType, boundary::CancelInboxGuard, wake};
 
 #[cfg(not(feature = "steal"))]
 use crate::worker::park::wake::wake_local;
@@ -125,7 +125,13 @@ fn build_crew(
 ) -> io::Result<Runtime<Stealing>> {
     let driver = DriverType::for_platform(ring_entries)?;
     let wake_fd = wake::create_wake_fd()?;
-    let shard = WorkerShard::new(lead, driver, task_capacity);
+    let shard = match WorkerShard::new(lead, driver, task_capacity) {
+        Ok(shard) => shard,
+        Err(error) => {
+            wake::close_wake_fd(wake_fd);
+            return Err(error);
+        }
+    };
     registry::publish_endpoint(lead, wake_fd);
     match spawn_crew(lead, ring_entries, task_capacity, workers) {
         Ok(crew) => Ok(Runtime::from_crew(shard, wake_fd, crew)),
@@ -204,7 +210,15 @@ fn sibling_main(
         READY.fetch_add(1, Ordering::SeqCst);
         return;
     };
-    let mut shard = WorkerShard::new(id, driver, task_capacity);
+    let Ok(mut shard) = WorkerShard::new(id, driver, task_capacity) else {
+        BOOT_FAILED.store(true, Ordering::SeqCst);
+        READY.fetch_add(1, Ordering::SeqCst);
+        wake::close_wake_fd(wake_fd);
+        return;
+    };
+    // Declared after `shard` so LIFO drop nulls the cancel static before
+    // `shard.tasks` frees buffered futures, whose drops then no-op.
+    let _cancel_guard = CancelInboxGuard::install(id.raw(), &mut shard.cancel_inbox);
     registry::publish_endpoint(id, wake_fd);
     bootstrap::arm_wake(&shard, wake_fd);
     READY.fetch_add(1, Ordering::SeqCst);
@@ -381,6 +395,8 @@ impl Runtime<Stealing> {
     where
         F: Future + Send + 'static,
     {
+        let worker_id = self.shard.id.raw();
+        let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
         let root_key = bootstrap::spawn_root(&mut self.shard, future);
         bootstrap::arm_wake(&self.shard, self.wake_fd);
         loop {

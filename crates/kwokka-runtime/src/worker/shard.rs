@@ -5,10 +5,16 @@
     reason = "pub(crate) on module-private items"
 )]
 
+use std::io;
+
 #[cfg(feature = "steal")]
 use kwokka_core::slab::SlabKey;
 use kwokka_core::{id::Pip, slab::Slab};
-use kwokka_io::DriverType;
+use kwokka_io::{
+    DriverType,
+    boundary::{CANCEL_INBOX_CAPACITY, CancelInbox},
+    buffer::inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
+};
 
 #[cfg(feature = "steal")]
 use crate::scheduler::stealing::{handoff::ForwardOrigin, relocate::ForwardTable};
@@ -49,6 +55,15 @@ pub(crate) struct WorkerShard {
     pub(crate) pip_seq: u64,
     /// I/O backend for SQE submission and CQE polling.
     pub(crate) driver: DriverType,
+    /// Per-worker in-flight buffer registry, owning buffered-op bytes across
+    /// the op lifetime. Declared after `driver` so on drop its mmap unmaps only
+    /// after the ring fd closes: closing the ring fd cancels in-flight ops and
+    /// releases their registered-buffer references (`io_uring_enter.2`,
+    /// `io_uring_register.2`), so no op writes into an unmapped page.
+    pub(crate) inflight_slab: InflightBufSlab,
+    /// Per-worker cancel queue for dropped buffered futures. Drop-order
+    /// independent (no heap, no fd); grouped with `inflight_slab` for cohesion.
+    pub(crate) cancel_inbox: CancelInbox<CANCEL_INBOX_CAPACITY>,
     /// Per-worker generational slab holding task headers and futures.
     pub(crate) tasks: Slab<TaskSlot>,
     /// Hierarchical timer wheel for deadline-based wakeups.
@@ -90,15 +105,18 @@ pub(crate) struct WorkerShard {
 
 impl WorkerShard {
     /// Create a shard for the given worker.
-    pub(crate) fn new(id: WorkerId, driver: DriverType, task_capacity: usize) -> Self {
+    pub(crate) fn new(id: WorkerId, driver: DriverType, task_capacity: usize) -> io::Result<Self> {
         // Every shard construction precedes its worker's first poll, so the
         // seam can translate task wakers from the very first submit.
         crate::task::waker::register_seam_decoder();
         let timer = TimerWheel::new(SystemClock::new(), task_capacity);
-        Self {
+        let inflight_slab = InflightBufSlab::new(id.raw(), DEFAULT_INFLIGHT_CAP)?;
+        Ok(Self {
             id,
             pip_seq: 1,
             driver,
+            inflight_slab,
+            cancel_inbox: CancelInbox::new(),
             tasks: Slab::new(task_capacity),
             timer,
             run_queue: LocalRunQueue::new(),
@@ -113,7 +131,7 @@ impl WorkerShard {
             steal_cursor: 0,
             #[cfg(feature = "steal")]
             pending_steal: None,
-        }
+        })
     }
 
     /// Mints the next [`Pip`] for a task spawned on this worker.
