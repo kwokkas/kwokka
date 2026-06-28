@@ -18,7 +18,7 @@
 #![allow(dead_code, reason = "pending drop-safe future wire-up")]
 #![allow(
     clippy::redundant_pub_crate,
-    reason = "pub(crate) on module-private items"
+    reason = "pub(crate) restricts slab internals inside the now-pub inflight module"
 )]
 
 use std::io;
@@ -44,7 +44,7 @@ const BITMAP_WORDS: usize = MAX_INFLIGHT_SLOTS / 64;
 /// bumped, so a stale future or a stale cancel that still names the old
 /// generation is rejected rather than touching a reallocated slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct InflightSlotKey {
+pub struct InflightSlotKey {
     /// Slot index in the owning worker's registry.
     pub(crate) slot: u16,
     /// Generation captured at allocation.
