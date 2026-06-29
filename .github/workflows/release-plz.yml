@@ -25,7 +25,7 @@ jobs:
           private-key: ${{ secrets.RELEASE_PLZ_APP_KEY }}
           permission-contents: write
           permission-pull-requests: write
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
@@ -50,7 +50,7 @@ jobs:
           private-key: ${{ secrets.RELEASE_PLZ_APP_KEY }}
           permission-contents: write
           permission-pull-requests: read
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           persist-credentials: false
