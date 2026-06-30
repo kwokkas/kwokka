@@ -19,7 +19,12 @@
 use core::{future::Future, ptr::NonNull};
 
 use kwokka_core::{namespace::Namespace, slab::SlabKey};
-use kwokka_io::{IoDriver, boundary::CancelInboxGuard, operation::Completion, wake};
+use kwokka_io::{
+    IoDriver,
+    boundary::{CancelInboxGuard, is_cancel_sentinel, reclaim_cancel_slot, submit_cancel},
+    operation::Completion,
+    wake,
+};
 
 use crate::{
     runtime::handle::Runtime,
@@ -56,6 +61,7 @@ pub(crate) fn arm_wake(shard: &WorkerShard, wake_fd: i32) {
 /// spawn drain, and the settled-children reap, in that order.
 pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
     drain_completions(shard, wake_fd);
+    drain_cancels(shard);
     #[cfg(feature = "steal")]
     drain_settled_notes(shard);
     #[cfg(feature = "steal")]
@@ -232,6 +238,12 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             arm_wake(shard, wake_fd);
             continue;
         }
+        if is_cancel_sentinel(completion.token.user_data()) {
+            // A buffered-op cancel completed: reclaim its slot. A cancel
+            // sentinel names no task, so there is nothing to wake.
+            reclaim_cancel_slot(&mut shard.inflight_slab, completion.token.user_data());
+            continue;
+        }
         let task_ref = TaskRef::from_raw(completion.token.user_data());
         let key = SlabKey::new(task_ref.index(), task_ref.generation());
         if let Some(slot) = shard.tasks.get_mut(key) {
@@ -242,6 +254,20 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             );
         }
         wake_local(&mut shard.tasks, &mut shard.run_queue, task_ref);
+    }
+}
+
+/// Submits a cancel for every dropped buffered future queued this pass.
+///
+/// A future whose buffered op is still in flight pushes its slot key to the
+/// worker's cancel inbox on drop. This drains the inbox, marking each slot
+/// retire-pending and submitting an `ASYNC_CANCEL` SQE tagged with a sentinel
+/// `user_data`; that cancel's completion routes back to the slot-reclaim path
+/// in [`drain_completions`]. Runs after the completion drain so a slot a normal
+/// completion freed this pass is not cancelled redundantly.
+fn drain_cancels(shard: &mut WorkerShard) {
+    while let Some(key) = shard.cancel_inbox.pop() {
+        submit_cancel(&shard.driver, &mut shard.inflight_slab, key);
     }
 }
 

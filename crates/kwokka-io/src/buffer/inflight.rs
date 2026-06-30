@@ -124,10 +124,6 @@ impl InflightBufSlab {
     }
 
     /// Marks `key`'s slot retire-pending. A stale handle is a no-op.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the cancel-drain wire-up")
-    )]
     pub(crate) const fn mark_retire_pending(&mut self, key: InflightSlotKey) {
         if !self.is_live(key) {
             return;
@@ -137,16 +133,36 @@ impl InflightBufSlab {
     }
 
     /// Returns whether `slot` is currently marked retire-pending.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "consumed by the cancel-drain wire-up")
-    )]
     pub(crate) const fn is_retire_pending(&self, slot: u16) -> bool {
         if slot >= self.cap {
             return false;
         }
         let (word, bit) = word_bit(slot);
         self.retire_pending[word] & (1u64 << bit) != 0
+    }
+
+    /// Frees a slot named by a cancel sentinel CQE, matching the low 16 bits
+    /// of its generation.
+    ///
+    /// The cancel-drain submits a cancel SQE tagged with `slot` and the low 16
+    /// bits of the slot's generation; that op's completion routes here. The
+    /// slot frees only when it is still retire-pending, occupied, and at the
+    /// matching generation, so a sentinel that races a slot already reused (a
+    /// duplicate CQE, or the slot freed by another path) is a no-op.
+    pub(crate) const fn free_cancelled(&mut self, slot: u16, generation_low: u64) {
+        if !self.is_retire_pending(slot) {
+            return;
+        }
+        let (word, bit) = word_bit(slot);
+        let is_occupied = self.occupied[word] & (1u64 << bit) != 0;
+        let matches_generation = self.generation[slot as usize] & 0xFFFF == generation_low;
+        if !is_occupied || !matches_generation {
+            return;
+        }
+        self.occupied[word] &= !(1u64 << bit);
+        self.retire_pending[word] &= !(1u64 << bit);
+        let generation = &mut self.generation[slot as usize];
+        *generation = generation.wrapping_add(1);
     }
 
     /// Returns a writable pointer to `key`'s slot, or `None` if stale.
@@ -396,6 +412,66 @@ mod tests {
         assert!(
             registry.slot_ptr(foreign).is_none(),
             "a key from another worker is rejected",
+        );
+    }
+
+    #[test]
+    fn free_cancelled_requires_retire_pending() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0) else {
+            panic!("allocate must succeed");
+        };
+        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
+        assert!(
+            registry.slot_ptr(key).is_some(),
+            "an unmarked slot is not freed by a cancel sentinel",
+        );
+        registry.mark_retire_pending(key);
+        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
+        let Some(next) = registry.allocate(0) else {
+            panic!("the freed slot reallocates");
+        };
+        assert_eq!(next.slot, key.slot, "the slot is reused");
+        assert_eq!(
+            next.generation,
+            key.generation + 1,
+            "the cancel free bumped the generation",
+        );
+    }
+
+    #[test]
+    fn free_cancelled_rejects_generation_mismatch() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0) else {
+            panic!("allocate must succeed");
+        };
+        registry.mark_retire_pending(key);
+        registry.free_cancelled(key.slot, (key.generation + 1) & 0xFFFF);
+        assert!(
+            registry.is_retire_pending(key.slot),
+            "a stale generation leaves the slot marked, not freed",
+        );
+        assert!(registry.slot_ptr(key).is_some(), "the live slot survives");
+    }
+
+    #[test]
+    fn free_cancelled_is_idempotent() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0) else {
+            panic!("allocate must succeed");
+        };
+        registry.mark_retire_pending(key);
+        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
+        // A duplicate sentinel CQE finds the slot already freed: a no-op, never
+        // a second free.
+        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
+        let Some(next) = registry.allocate(0) else {
+            panic!("the freed slot reallocates");
+        };
+        assert_eq!(
+            next.generation,
+            key.generation + 1,
+            "the slot was freed once, not twice, despite the duplicate sentinel",
         );
     }
 }

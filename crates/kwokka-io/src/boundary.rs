@@ -28,7 +28,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 use crate::{
     DriverType, IoDriver,
     buffer::inflight::{InflightBufSlab, InflightSlotKey},
-    operation::{IoBuf, IoBufMut, IoRequest, SubmitResult},
+    operation::{IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
 
 /// One seam slot per possible worker id byte.
@@ -596,6 +596,73 @@ pub fn push_cancel_for_worker(key: InflightSlotKey) {
     inbox.push_cancel(key);
 }
 
+/// `user_data` marker for a buffered-op cancel completion.
+///
+/// Tags every cancel SQE the worker's cancel-drain submits so the completion
+/// drain routes the CQE to slot reclamation instead of a task wake. Bit 63 is
+/// set, which a slab-path task handle never sets (its tag bit is clear), and
+/// the upper 32 bits read exactly `0x8000_0000`, distinct from the wake fd's
+/// `u64::MAX`. The low 32 bits carry the slot and the low 16 bits of its
+/// generation.
+///
+/// Like the wake sentinel, this assumes the slab-only runtime: an arena-path
+/// task that submitted I/O could set bit 63 too, so revisit before arena tasks
+/// reach the seam.
+const CANCEL_TOKEN_BASE: u64 = 1 << 63;
+
+/// Upper-32-bit mask isolating the [`CANCEL_TOKEN_BASE`] marker.
+const CANCEL_TOKEN_HIGH_MASK: u64 = 0xFFFF_FFFF_0000_0000;
+
+/// Encodes the cancel-completion `user_data` for `key`: the marker, the low 16
+/// bits of the generation at bits 16..32, and the slot at bits 0..16.
+const fn encode_cancel_sentinel(key: InflightSlotKey) -> u64 {
+    CANCEL_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
+}
+
+/// Whether `user_data` is a cancel-completion sentinel.
+///
+/// The completion drain calls this to classify a CQE before treating its
+/// `user_data` as a task handle; a sentinel routes to [`reclaim_cancel_slot`]
+/// rather than a task wake.
+pub const fn is_cancel_sentinel(user_data: u64) -> bool {
+    user_data & CANCEL_TOKEN_HIGH_MASK == CANCEL_TOKEN_BASE
+}
+
+/// Submits a cancel for a dropped buffered future's in-flight op and marks its
+/// slot retire-pending.
+///
+/// The worker's cancel-drain calls this for each [`InflightSlotKey`] popped
+/// from the cancel inbox. It marks the slot retire-pending so the bytes stay
+/// pinned until the kernel signals the op is done, then submits an
+/// `ASYNC_CANCEL` SQE tagged with a cancel sentinel `user_data`; that op's
+/// completion routes back to [`reclaim_cancel_slot`], which frees the slot.
+///
+/// A refused submit (a full ring, a backend without cancel) leaves the slot
+/// retire-pending: a bounded leak reclaimed when the worker tears its slab
+/// down, never freed memory under an in-flight kernel write.
+pub fn submit_cancel(driver: &DriverType, slab: &mut InflightBufSlab, key: InflightSlotKey) {
+    slab.mark_retire_pending(key);
+    let request = IoRequest::<()>::cancel(SubmitToken::new(key.op_token))
+        .with_user_data(encode_cancel_sentinel(key));
+    // IGNORE: submit_internal returns a best-effort SubmitResult; a refused
+    // cancel leaves the slot retire-pending as a bounded leak reclaimed at
+    // worker teardown, never a use-after-free.
+    let _ = driver.submit_internal(request);
+}
+
+/// Reclaims the in-flight slot named by a cancel-completion `user_data`.
+///
+/// Called from the completion drain once [`is_cancel_sentinel`] has classified
+/// the CQE as a buffered-op cancel. Decodes the slot and the low 16 generation
+/// bits and frees the slot; the slab free is itself guarded against a stale
+/// slot (a duplicate sentinel, or a slot already reused), so this is a no-op
+/// when the slot has already changed hands.
+pub const fn reclaim_cancel_slot(slab: &mut InflightBufSlab, user_data: u64) {
+    let slot = (user_data & 0xFFFF) as u16;
+    let generation_low = (user_data >> 16) & 0xFFFF;
+    slab.free_cancelled(slot, generation_low);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -917,5 +984,90 @@ mod tests {
         // A seam with no slab is a no-op for both, never a panic.
         seam.harvest_into(key, 4, &mut [0u8; 4]);
         seam.free_slot(key);
+    }
+
+    #[test]
+    fn cancel_sentinel_excludes_other_tokens() {
+        assert!(
+            !is_cancel_sentinel(crate::wake::WAKE_FD_USER_DATA),
+            "the wake fd marker is not a cancel sentinel",
+        );
+        assert!(
+            !is_cancel_sentinel(0x7FFF_FFFF_FFFF_FFFF),
+            "a slab-path task token keeps its top bit clear",
+        );
+        let sentinel = CANCEL_TOKEN_BASE | (0xAB << 16) | 0x05;
+        assert!(is_cancel_sentinel(sentinel), "the marker is recognized");
+    }
+
+    #[test]
+    fn sentinel_round_trips_slot_gen() {
+        let key = InflightSlotKey {
+            slot: 0x2A,
+            generation: 0x1_0007,
+            worker_id: 3,
+            op_token: 0,
+        };
+        let sentinel = encode_cancel_sentinel(key);
+        assert_eq!(
+            sentinel & 0xFFFF,
+            u64::from(key.slot),
+            "slot in the low 16 bits"
+        );
+        assert_eq!(
+            (sentinel >> 16) & 0xFFFF,
+            0x0007,
+            "the generation low 16 bits sit at bits 16..32",
+        );
+        assert!(is_cancel_sentinel(sentinel));
+    }
+
+    #[test]
+    fn cancel_sentinel_frees_marked_slot() {
+        let Ok(mut slab) = InflightBufSlab::new(4, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xAA) else {
+            panic!("allocate must succeed");
+        };
+        slab.mark_retire_pending(key);
+        let sentinel = encode_cancel_sentinel(key);
+        assert!(
+            is_cancel_sentinel(sentinel),
+            "the encoded user_data is recognized as a sentinel",
+        );
+        reclaim_cancel_slot(&mut slab, sentinel);
+        let Some(next) = slab.allocate(0) else {
+            panic!("the freed slot reallocates");
+        };
+        assert_eq!(
+            next.slot, key.slot,
+            "the slot is reused after the cancel reclaim frees it",
+        );
+    }
+
+    #[test]
+    fn non_sentinel_routes_to_task() {
+        assert!(
+            !is_cancel_sentinel(0x1234_5678),
+            "a slab-path task token routes to the task path, not slot reclaim",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn submit_cancel_marks_retire_pending() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = InflightBufSlab::new(4, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xBEEF) else {
+            panic!("allocate must succeed");
+        };
+        submit_cancel(&driver, &mut slab, key);
+        assert!(
+            slab.is_retire_pending(key.slot),
+            "the slot is marked retire-pending even when the backend refuses the cancel",
+        );
     }
 }
