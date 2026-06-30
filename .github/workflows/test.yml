@@ -119,7 +119,7 @@ jobs:
       - name: Generate the codecov report
         run: cargo llvm-cov report --codecov --output-path codecov.json
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
+        uses: codecov/codecov-action@v7
         with:
           files: codecov.json
           token: ${{ secrets.CODECOV_TOKEN }}
