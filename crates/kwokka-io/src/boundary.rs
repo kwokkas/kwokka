@@ -299,11 +299,15 @@ impl IoSeam {
 
     /// Allocates an in-flight buffer slot for a buffered op on the polling task.
     ///
-    /// Returns `None` when the seam carries no slab (a test seam with no
-    /// backend) or the registry is full. The returned [`InflightSlotKey`] is
-    /// `Copy`; the future holds it for the op lifetime and hands it to
-    /// [`push_cancel_for_worker`] if it drops before the completion arrives.
-    pub fn allocate_slot(&self, op_token: u64) -> Option<InflightSlotKey> {
+    /// Returns the slot handle paired with a writable pointer to its
+    /// `INFLIGHT_BUF_STRIDE` bytes -- the future builds an `InlineBuf` over the
+    /// pointer to submit and, for a write-class op, copies its input into the
+    /// slot first. Returns
+    /// `None` when the seam carries no slab (a test seam with no backend) or the
+    /// registry is full. The returned [`InflightSlotKey`] is `Copy`; the future
+    /// holds it for the op lifetime and hands it to [`push_cancel_for_worker`]
+    /// if it drops before the completion arrives.
+    pub fn allocate_slot(&self, op_token: u64) -> Option<(InflightSlotKey, *mut u8)> {
         let mut slab = self.inflight_slab?;
         // SAFETY: Invariant -- `slab` points at the worker's `inflight_slab`
         // field, formed by the run-loop via `NonNull::from(&mut
@@ -313,18 +317,78 @@ impl IoSeam {
         // Precondition (why this `&mut` is unique for the window): the runtime
         // polls one task at a time per worker -- `poll_one` is not re-entrant,
         // and `SeamGuard` is not re-entrant, so at most one `IoSeam` is
-        // installed per worker at a time. `allocate_slot` is the only path that
-        // forms a `&mut InflightBufSlab` during a poll, and the run-loop does
-        // not touch `inflight_slab` again between forming the pointer and the
-        // seam clearing. A second runtime in the same process claims a different
-        // worker id with its own `InflightBufSlab`, so a nested `block_on`
-        // aliases nothing here.
+        // installed per worker at a time. `allocate_slot`, `harvest_into`, and
+        // `free_slot` are the only paths that form a `&mut InflightBufSlab`
+        // during a poll, each runs to completion before the next, and the
+        // run-loop does not touch `inflight_slab` again between forming the
+        // pointer and the seam clearing. A second runtime in the same process
+        // claims a different worker id with its own `InflightBufSlab`, so a
+        // nested `block_on` aliases nothing here.
         // Failure mode: a second `&mut` into the slab within the poll window --
         // a reentrancy path the non-reentrant poll structure excludes -- aliases
         // this one (double-mutable-aliasing UB); a call after `SeamGuard` drops
         // derefs a dangling pointer (the bracket excludes it).
         let slab = unsafe { slab.as_mut() };
-        slab.allocate(op_token)
+        let key = slab.allocate(op_token)?;
+        // `slot_ptr` cannot return `None` for the key `allocate` just produced:
+        // the worker matches, the occupancy bit was just set, and the generation
+        // is current, so `is_live` holds. The `?` keeps this panic-free against a
+        // future occupancy-invariant regression rather than expressing a live
+        // failure path.
+        let ptr = slab.slot_ptr(key)?;
+        Some((key, ptr))
+    }
+
+    /// Copies `key`'s completed slot bytes into `dst` and frees the slot.
+    ///
+    /// Called on the completion poll of a read-class buffered future, once its
+    /// CQE has arrived: `len` is the kernel-confirmed byte count, and the copy
+    /// is clamped to both the slot stride and `dst`. Freeing the slot returns it
+    /// to the registry with a bumped generation, so the future's later drop --
+    /// which still holds the now-stale key -- pushes a cancel that the slab
+    /// rejects as stale. A no-op when the seam carries no slab.
+    pub fn harvest_into(&self, key: InflightSlotKey, len: usize, dst: &mut [u8]) {
+        let Some(mut slab) = self.inflight_slab else {
+            return;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot`. Precondition: reached via `with_current` during a
+        // poll on this worker; the `SeamGuard` bracket keeps the referent live,
+        // and the `slot_slice` shared reborrow ends before `free` takes the
+        // `&mut` again. Failure mode: a second `&mut` into the slab within the
+        // poll window (excluded by the non-reentrant poll structure) aliases
+        // this one (double-mutable-aliasing UB); a call after `SeamGuard` drops
+        // derefs a dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        if let Some(src) = slab.slot_slice(key, len) {
+            let count = src.len().min(dst.len());
+            dst[..count].copy_from_slice(&src[..count]);
+        }
+        slab.free(key);
+    }
+
+    /// Frees `key`'s slot without reading it.
+    ///
+    /// Called on the completion poll of a write-class buffered future (the
+    /// kernel read the slot, nothing to copy back) and on the submit-failure
+    /// path of any buffered future (the slot was allocated but no op took
+    /// ownership of its bytes). A stale key is a no-op in the slab; a seam with
+    /// no slab is a no-op here.
+    pub const fn free_slot(&self, key: InflightSlotKey) {
+        let Some(mut slab) = self.inflight_slab else {
+            return;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot`. Precondition: reached via `with_current` during a
+        // poll on this worker; the `SeamGuard` bracket keeps the referent live.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // (excluded by the non-reentrant poll structure) aliases this one
+        // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        slab.free(key);
     }
 }
 
@@ -757,11 +821,12 @@ mod tests {
             panic!("mmap must succeed for the test slab");
         };
         let seam = IoSeam::new(5, None, Some(NonNull::from(&mut slab)), None);
-        let Some(key) = seam.allocate_slot(0xABCD) else {
+        let Some((key, ptr)) = seam.allocate_slot(0xABCD) else {
             panic!("a seam carrying a slab allocates a slot");
         };
         assert_eq!(key.op_token, 0xABCD);
         assert_eq!(key.worker_id, 5);
+        assert!(!ptr.is_null(), "a live slot yields a writable pointer");
     }
 
     #[test]
@@ -771,5 +836,86 @@ mod tests {
             seam.allocate_slot(0).is_none(),
             "a seam with no slab cannot allocate",
         );
+    }
+
+    #[test]
+    fn harvest_into_copies_then_frees() {
+        let Ok(mut slab) = InflightBufSlab::new(9, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(9, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, ptr)) = seam.allocate_slot(0x1234) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        // SAFETY: `ptr` addresses the slot's stride-wide region for the slot's
+        // lifetime; this test writes 4 bytes well within the stride and reads
+        // them back through the harvest path, with no other reference aliasing.
+        // Failure mode: a write past the stride would corrupt an adjacent slot
+        // or mmap page.
+        unsafe {
+            ptr.copy_from(b"ping".as_ptr(), 4);
+        }
+        let mut out = [0u8; 8];
+        seam.harvest_into(key, 4, &mut out);
+        assert_eq!(&out[..4], b"ping");
+        assert!(
+            seam.allocate_slot(0)
+                .is_some_and(|(reused, _)| reused.slot == key.slot
+                    && reused.generation == key.generation + 1),
+            "harvest frees the slot so it is reused with a bumped generation",
+        );
+    }
+
+    #[test]
+    fn harvest_into_clamps_to_dst() {
+        let Ok(mut slab) = InflightBufSlab::new(10, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(10, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, ptr)) = seam.allocate_slot(0) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        // SAFETY: `ptr` addresses the slot's stride-wide region; this test
+        // writes 8 bytes within the stride, exclusively owned for the test.
+        // Failure mode: a write past the stride would corrupt an adjacent slot
+        // or mmap page.
+        unsafe {
+            ptr.copy_from(b"overflow".as_ptr(), 8);
+        }
+        let mut out = [0u8; 4];
+        seam.harvest_into(key, 8, &mut out);
+        assert_eq!(&out, b"over", "the copy clamps to the destination length");
+    }
+
+    #[test]
+    fn free_slot_returns_the_slot() {
+        let Ok(mut slab) = InflightBufSlab::new(11, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(11, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _)) = seam.allocate_slot(0) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        seam.free_slot(key);
+        assert!(
+            seam.allocate_slot(0)
+                .is_some_and(|(reused, _)| reused.slot == key.slot
+                    && reused.generation == key.generation + 1),
+            "free returns the slot for reuse with a bumped generation",
+        );
+    }
+
+    #[test]
+    fn harvest_and_free_need_no_slab() {
+        let seam = IoSeam::new(12, None, None, None);
+        let key = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 12,
+            op_token: 0,
+        };
+        // A seam with no slab is a no-op for both, never a panic.
+        seam.harvest_into(key, 4, &mut [0u8; 4]);
+        seam.free_slot(key);
     }
 }

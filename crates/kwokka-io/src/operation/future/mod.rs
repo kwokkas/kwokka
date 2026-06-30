@@ -6,8 +6,26 @@
 
 use std::io;
 
+use crate::buffer::inflight::INFLIGHT_BUF_STRIDE;
+
 pub(crate) mod file;
 pub(crate) mod socket;
+
+/// Compile-time guard that a buffered future's `CAP` fits one in-flight slot.
+///
+/// The kernel writes (recv / read) or reads (send / write) at most `CAP` bytes
+/// of a slot whose width is `INFLIGHT_BUF_STRIDE`; a `CAP` past the stride would
+/// address memory outside the slot. Each buffered future evaluates this in a
+/// `const` block at the top of `poll`, so the bound is a compile error, not a
+/// runtime check.
+pub(crate) const fn assert_cap_fits<const CAP: usize>() {
+    const {
+        assert!(
+            CAP <= INFLIGHT_BUF_STRIDE as usize,
+            "buffered future CAP must fit the in-flight slot stride"
+        );
+    }
+}
 
 /// Maps a raw completion result (the `io_uring` CQE `res`, the value the
 /// kernel returns from the I/O syscall) into a byte count.

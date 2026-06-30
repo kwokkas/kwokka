@@ -15,7 +15,6 @@
 //! handle for a reused slot is rejected. A retire-pending bit alone cannot
 //! tell one occupant from the next.
 
-#![allow(dead_code, reason = "pending drop-safe future wire-up")]
 #![allow(
     clippy::redundant_pub_crate,
     reason = "pub(crate) restricts slab internals inside the now-pub inflight module"
@@ -125,6 +124,10 @@ impl InflightBufSlab {
     }
 
     /// Marks `key`'s slot retire-pending. A stale handle is a no-op.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the cancel-drain wire-up")
+    )]
     pub(crate) const fn mark_retire_pending(&mut self, key: InflightSlotKey) {
         if !self.is_live(key) {
             return;
@@ -134,6 +137,10 @@ impl InflightBufSlab {
     }
 
     /// Returns whether `slot` is currently marked retire-pending.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the cancel-drain wire-up")
+    )]
     pub(crate) const fn is_retire_pending(&self, slot: u16) -> bool {
         if slot >= self.cap {
             return false;
