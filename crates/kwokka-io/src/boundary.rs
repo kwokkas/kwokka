@@ -87,6 +87,23 @@ pub enum MultishotNext {
     Ended,
 }
 
+/// The outcome of reserving a multishot slot for a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultishotAlloc {
+    /// A slot was reserved; the stream tags its SQE with `sentinel` and drains
+    /// and cancels through `key`.
+    Allocated {
+        /// Handle that drains the slot's FIFO and cancels its op.
+        key: MultishotSlotKey,
+        /// `user_data` sentinel the multishot SQE carries.
+        sentinel: u64,
+    },
+    /// Every slot is occupied; the stream degrades to a single-shot accept.
+    Full,
+    /// The seam carries no multishot registry (a test seam).
+    Unsupported,
+}
+
 /// Adopts a nonnegative accept-completion result as an owned descriptor.
 ///
 /// Returns `None` for a negative result -- an `-errno`, not a descriptor.
@@ -420,16 +437,20 @@ impl IoSeam {
         slab.free(key);
     }
 
-    /// Allocates a multishot slot for the polling task, returning its handle.
+    /// Reserves a multishot slot for the polling task.
     ///
-    /// `owner_token` is the polling task, woken on each completion. The stream
-    /// tags its multishot SQE with the sentinel derived from the returned key,
-    /// drains the slot's FIFO on later polls via [`IoSeam::multishot_next`], and
-    /// hands the key to [`push_multishot_cancel_for_worker`] if it drops before
-    /// the op terminates. Returns `None` when the seam carries no multishot slab
-    /// (a test seam) or the registry is full.
-    pub fn allocate_multishot_slot(&self, owner_token: u64) -> Option<(MultishotSlotKey, u64)> {
-        let mut slab = self.multishot_slab?;
+    /// `owner_token` is the polling task, woken on each completion. On
+    /// [`MultishotAlloc::Allocated`] the stream tags its multishot SQE with the
+    /// returned sentinel, drains the slot's FIFO on later polls via
+    /// [`IoSeam::multishot_next`], and hands the key to
+    /// [`push_multishot_cancel_for_worker`] if it drops before the op terminates.
+    /// Returns [`MultishotAlloc::Full`] when every slot is occupied, so the
+    /// stream can degrade to single-shot, and [`MultishotAlloc::Unsupported`]
+    /// when the seam carries no multishot registry (a test seam).
+    pub fn allocate_multishot_slot(&self, owner_token: u64) -> MultishotAlloc {
+        let Some(mut slab) = self.multishot_slab else {
+            return MultishotAlloc::Unsupported;
+        };
         // SAFETY: Invariant -- `slab` points at the worker's `multishot_slab`
         // field, formed by the run-loop via `NonNull::from(&mut ...)` and
         // disjoint from the driver, task slab, inflight slab, and inboxes the
@@ -447,8 +468,11 @@ impl IoSeam {
         // structure excludes it, and a call after `SeamGuard` drops derefs a
         // dangling pointer (the bracket excludes it).
         let slab = unsafe { slab.as_mut() };
-        let key = slab.allocate(owner_token)?;
-        Some((key, encode_multishot_sentinel(key)))
+        slab.allocate(owner_token)
+            .map_or(MultishotAlloc::Full, |key| MultishotAlloc::Allocated {
+                key,
+                sentinel: encode_multishot_sentinel(key),
+            })
     }
 
     /// Advances `key`'s multishot stream by one completion.
@@ -1550,7 +1574,8 @@ mod tests {
         let mut slab = MultishotSlab::new(21, 4);
         let seam =
             IoSeam::new(21, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
-        let Some((key, sentinel)) = seam.allocate_multishot_slot(0xABCD) else {
+        let MultishotAlloc::Allocated { key, sentinel } = seam.allocate_multishot_slot(0xABCD)
+        else {
             panic!("a seam carrying a multishot slab allocates a slot");
         };
         assert_eq!(key.worker_id, 21);
@@ -1575,7 +1600,7 @@ mod tests {
         let mut slab = MultishotSlab::new(22, 4);
         let seam =
             IoSeam::new(22, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
-        let Some((key, _)) = seam.allocate_multishot_slot(0x9) else {
+        let MultishotAlloc::Allocated { key, .. } = seam.allocate_multishot_slot(0x9) else {
             panic!("a seam carrying a multishot slab allocates a slot");
         };
         assert_eq!(
@@ -1607,7 +1632,8 @@ mod tests {
             MultishotNext::Ended,
             "an empty terminated FIFO ends the stream",
         );
-        let Some((reused, _)) = seam.allocate_multishot_slot(0x5) else {
+        let MultishotAlloc::Allocated { key: reused, .. } = seam.allocate_multishot_slot(0x5)
+        else {
             panic!("ending the stream freed the slot for reuse");
         };
         assert_eq!(reused.slot, key.slot);
@@ -1623,11 +1649,11 @@ mod tests {
         let mut slab = MultishotSlab::new(25, 4);
         let seam =
             IoSeam::new(25, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
-        let Some((key, _)) = seam.allocate_multishot_slot(0) else {
+        let MultishotAlloc::Allocated { key, .. } = seam.allocate_multishot_slot(0) else {
             panic!("a seam carrying a multishot slab allocates a slot");
         };
         seam.multishot_free(key);
-        let Some((reused, _)) = seam.allocate_multishot_slot(0) else {
+        let MultishotAlloc::Allocated { key: reused, .. } = seam.allocate_multishot_slot(0) else {
             panic!("freeing the slot returns it for reuse");
         };
         assert_eq!(reused.slot, key.slot);
@@ -1639,11 +1665,32 @@ mod tests {
     }
 
     #[test]
+    fn multishot_seam_reports_full_when_saturated() {
+        let mut slab = MultishotSlab::new(26, 2);
+        let seam =
+            IoSeam::new(26, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
+        assert!(matches!(
+            seam.allocate_multishot_slot(0x1),
+            MultishotAlloc::Allocated { .. }
+        ));
+        assert!(matches!(
+            seam.allocate_multishot_slot(0x2),
+            MultishotAlloc::Allocated { .. }
+        ));
+        assert_eq!(
+            seam.allocate_multishot_slot(0x3),
+            MultishotAlloc::Full,
+            "a saturated registry reports Full so the stream degrades to single-shot",
+        );
+    }
+
+    #[test]
     fn multishot_seam_needs_a_slab() {
         let seam = IoSeam::new(31, None, None, None);
-        assert!(
-            seam.allocate_multishot_slot(0).is_none(),
-            "a seam with no multishot slab cannot allocate",
+        assert_eq!(
+            seam.allocate_multishot_slot(0),
+            MultishotAlloc::Unsupported,
+            "a seam with no multishot slab reports Unsupported",
         );
         let key = MultishotSlotKey {
             slot: 0,
