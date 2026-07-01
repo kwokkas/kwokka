@@ -66,6 +66,12 @@ pub struct InflightBufSlab {
     /// Per-slot generation, bumped on free. A `u64` makes the ABA window
     /// effectively unbounded: a slot would need 2^64 reuses to wrap.
     generation: [u64; MAX_INFLIGHT_SLOTS],
+    /// Per-slot submitted op `user_data`, matched when the op's own completion
+    /// frees the slot. The runtime holds at most one outstanding buffered
+    /// completion per task (one `wake_data` slot per task header), so an
+    /// `op_token` is unique across live slots; a multishot op must never route
+    /// through this slab, since one token would then post several CQEs.
+    op_token: [u64; MAX_INFLIGHT_SLOTS],
     worker_id: u8,
     cap: u16,
     stride: u32,
@@ -87,6 +93,7 @@ impl InflightBufSlab {
             occupied: [0; BITMAP_WORDS],
             retire_pending: [0; BITMAP_WORDS],
             generation: [0; MAX_INFLIGHT_SLOTS],
+            op_token: [0; MAX_INFLIGHT_SLOTS],
             worker_id,
             cap,
             stride,
@@ -101,6 +108,7 @@ impl InflightBufSlab {
         let slot = self.first_free()?;
         let (word, bit) = word_bit(slot);
         self.occupied[word] |= 1u64 << bit;
+        self.op_token[slot as usize] = op_token;
         Some(InflightSlotKey {
             slot,
             generation: self.generation[slot as usize],
@@ -133,6 +141,7 @@ impl InflightBufSlab {
     }
 
     /// Returns whether `slot` is currently marked retire-pending.
+    #[cfg(test)]
     pub(crate) const fn is_retire_pending(&self, slot: u16) -> bool {
         if slot >= self.cap {
             return false;
@@ -141,28 +150,32 @@ impl InflightBufSlab {
         self.retire_pending[word] & (1u64 << bit) != 0
     }
 
-    /// Frees a slot named by a cancel sentinel CQE, matching the low 16 bits
-    /// of its generation.
+    /// Frees the retire-pending slot whose op matches `op_token`, if any.
     ///
-    /// The cancel-drain submits a cancel SQE tagged with `slot` and the low 16
-    /// bits of the slot's generation; that op's completion routes here. The
-    /// slot frees only when it is still retire-pending, occupied, and at the
-    /// matching generation, so a sentinel that races a slot already reused (a
-    /// duplicate CQE, or the slot freed by another path) is a no-op.
-    pub(crate) const fn free_cancelled(&mut self, slot: u16, generation_low: u64) {
-        if !self.is_retire_pending(slot) {
-            return;
+    /// Called from the completion drain on the original buffered op's own
+    /// completion (keyed by the task token it was submitted with). That CQE is
+    /// the kernel's signal it is done with the slot's bytes, for every cancel
+    /// outcome, so freeing here -- not on the cancel op's own CQE -- keeps a
+    /// still-in-flight write from landing in a reused slot.
+    ///
+    /// Only retire-pending slots are eligible: a slot still owned by a live
+    /// future frees through its own `harvest_into` or `free_slot`, never here.
+    /// The scan is a no-op when no slot is retire-pending, the common case.
+    pub(crate) fn free_by_op_token(&mut self, op_token: u64) {
+        for word in 0..BITMAP_WORDS {
+            let mut pending = self.retire_pending[word];
+            while pending != 0 {
+                let bit = pending.trailing_zeros() as usize;
+                pending &= pending - 1;
+                let slot = word * 64 + bit;
+                if self.op_token[slot] == op_token && self.occupied[word] & (1u64 << bit) != 0 {
+                    self.occupied[word] &= !(1u64 << bit);
+                    self.retire_pending[word] &= !(1u64 << bit);
+                    self.generation[slot] = self.generation[slot].wrapping_add(1);
+                    return;
+                }
+            }
         }
-        let (word, bit) = word_bit(slot);
-        let is_occupied = self.occupied[word] & (1u64 << bit) != 0;
-        let matches_generation = self.generation[slot as usize] & 0xFFFF == generation_low;
-        if !is_occupied || !matches_generation {
-            return;
-        }
-        self.occupied[word] &= !(1u64 << bit);
-        self.retire_pending[word] &= !(1u64 << bit);
-        let generation = &mut self.generation[slot as usize];
-        *generation = generation.wrapping_add(1);
     }
 
     /// Returns a writable pointer to `key`'s slot, or `None` if stale.
@@ -416,18 +429,13 @@ mod tests {
     }
 
     #[test]
-    fn free_cancelled_requires_retire_pending() {
+    fn op_token_frees_marked_slot() {
         let mut registry = slab(8);
-        let Some(key) = registry.allocate(0) else {
+        let Some(key) = registry.allocate(0xABCD) else {
             panic!("allocate must succeed");
         };
-        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
-        assert!(
-            registry.slot_ptr(key).is_some(),
-            "an unmarked slot is not freed by a cancel sentinel",
-        );
         registry.mark_retire_pending(key);
-        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
+        registry.free_by_op_token(0xABCD);
         let Some(next) = registry.allocate(0) else {
             panic!("the freed slot reallocates");
         };
@@ -435,43 +443,58 @@ mod tests {
         assert_eq!(
             next.generation,
             key.generation + 1,
-            "the cancel free bumped the generation",
+            "the op-token free bumped the generation",
         );
     }
 
     #[test]
-    fn free_cancelled_rejects_generation_mismatch() {
+    fn op_token_skips_live_slot() {
         let mut registry = slab(8);
-        let Some(key) = registry.allocate(0) else {
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        // Not retire-pending: a live future still owns the slot, so its op
+        // completion must not free it here -- only its own harvest/free may.
+        registry.free_by_op_token(0xABCD);
+        assert!(
+            registry.slot_ptr(key).is_some(),
+            "a slot not yet retire-pending survives its op completion",
+        );
+    }
+
+    #[test]
+    fn op_token_ignores_mismatch() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
             panic!("allocate must succeed");
         };
         registry.mark_retire_pending(key);
-        registry.free_cancelled(key.slot, (key.generation + 1) & 0xFFFF);
+        registry.free_by_op_token(0x1234);
         assert!(
             registry.is_retire_pending(key.slot),
-            "a stale generation leaves the slot marked, not freed",
+            "a foreign op token leaves the slot marked, not freed",
         );
-        assert!(registry.slot_ptr(key).is_some(), "the live slot survives");
+        assert!(registry.slot_ptr(key).is_some(), "the marked slot survives");
     }
 
     #[test]
-    fn free_cancelled_is_idempotent() {
+    fn op_token_free_is_idempotent() {
         let mut registry = slab(8);
-        let Some(key) = registry.allocate(0) else {
+        let Some(key) = registry.allocate(0xABCD) else {
             panic!("allocate must succeed");
         };
         registry.mark_retire_pending(key);
-        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
-        // A duplicate sentinel CQE finds the slot already freed: a no-op, never
-        // a second free.
-        registry.free_cancelled(key.slot, key.generation & 0xFFFF);
+        registry.free_by_op_token(0xABCD);
+        // The op's CQE cannot arrive twice, but a defensive second call finds
+        // the slot cleared (bit gone), so it is a no-op.
+        registry.free_by_op_token(0xABCD);
         let Some(next) = registry.allocate(0) else {
             panic!("the freed slot reallocates");
         };
         assert_eq!(
             next.generation,
             key.generation + 1,
-            "the slot was freed once, not twice, despite the duplicate sentinel",
+            "the slot was freed once, not twice",
         );
     }
 }
