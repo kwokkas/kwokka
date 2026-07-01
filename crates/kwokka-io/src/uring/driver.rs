@@ -568,17 +568,17 @@ mod tests {
         ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
     )]
     #[test]
-    fn pool_present_when_supported() {
+    fn pool_tracks_buf_ring_capability() {
         let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
             panic!("UringDriver::new failed");
         };
-        // The provided-recv pool is present exactly when the kernel
-        // advertised buf_ring support at probe time.
-        assert_eq!(
-            driver.capabilities().buf_ring,
-            driver.provided_recv_pool().is_some()
-        );
-        if let Some(pool) = driver.provided_recv_pool() {
+        // Fallback parity, not an iff: without buf_ring support there is no
+        // pool and recv stays on the inline path; with support, registration
+        // can still fall back to None on failure, so a present pool must be
+        // sized to the configured constants, but presence is not required.
+        let pool = driver.provided_recv_pool();
+        assert!(driver.capabilities().buf_ring || pool.is_none());
+        if let Some(pool) = pool {
             assert_eq!(pool.entries(), PROVIDED_RECV_RING_ENTRIES);
             assert_eq!(pool.buf_size(), PROVIDED_RECV_BUF_SIZE);
         }
