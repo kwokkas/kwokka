@@ -808,14 +808,28 @@ pub(crate) const fn multishot_sentinel_generation(user_data: u64) -> u16 {
     ((user_data >> 16) & 0xFFFF) as u16
 }
 
+/// The wake and retire targets a multishot CQE resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MultishotCompletion {
+    /// The owner task to wake, set when the result was queued for it.
+    pub wake: Option<u64>,
+    /// The owner task whose one counted SQE retires, set on the terminal
+    /// (no-`MORE`) CQE regardless of wake, so the worker's in-flight accounting
+    /// pairs with the submit even when the owning stream already dropped.
+    pub retire: Option<u64>,
+}
+
 /// Routes a multishot op's completion CQE into the worker's registry.
 ///
 /// The completion drain calls this on a CQE whose `user_data` is a multishot
 /// sentinel (see [`is_multishot_sentinel`]). It queues the result for the owning
-/// stream and returns the owner task token to wake, or `None` when there is
-/// nothing to wake: the slot is stale, the FIFO overflowed, or the stream
-/// already dropped -- a cancel-pending slot, whose intermediate results are
-/// discarded and whose terminal CQE frees the slot here.
+/// stream and returns the [`MultishotCompletion`] targets: [`wake`](MultishotCompletion::wake)
+/// names the owner to wake when a result was queued, and [`retire`](MultishotCompletion::retire)
+/// names the owner to retire on the terminal (no-`MORE`) CQE so the in-flight
+/// count pairs with the submit even when the stream already dropped. Nothing is
+/// queued when the slot is stale, the FIFO overflowed, or the stream dropped --
+/// a cancel-pending slot, whose intermediate results are discarded and whose
+/// terminal CQE frees the slot here.
 ///
 /// A discarded nonnegative accept result is a kernel-created fd; it is closed
 /// here so a dropped or overflowed stream does not leak the descriptor.
@@ -824,10 +838,15 @@ pub fn push_multishot_completion(
     user_data: u64,
     result: i32,
     flags: CqeFlags,
-) -> Option<u64> {
+) -> MultishotCompletion {
     let slot = multishot_sentinel_slot(user_data);
     let generation = multishot_sentinel_generation(user_data);
     let is_more = flags.contains(CqeFlags::MORE);
+    // The one SQE `poll_one` counted retires when the op posts its terminal CQE,
+    // live or cancel-pending. Read the owner before any free so a cancel-pending
+    // terminal still retires it; a stale slot reads `None` and retires nothing.
+    let owner = slab.owner(slot, generation);
+    let retire = if is_more { None } else { owner };
     if slab.is_cancel_pending(slot, generation) {
         // The owning stream dropped. Each intermediate CQE (`MORE` set) carries
         // an accepted fd it will never take, so close it; the terminal CQE (the
@@ -838,10 +857,9 @@ pub fn push_multishot_completion(
         } else {
             slab.free_by_slot(slot, generation);
         }
-        return None;
+        return MultishotCompletion { wake: None, retire };
     }
-    let owner = slab.owner(slot, generation);
-    match slab.push(slot, generation, result, is_more) {
+    let wake = match slab.push(slot, generation, result, is_more) {
         MultishotPush::Queued => owner,
         MultishotPush::Overflowed | MultishotPush::Stale => {
             // Only an intermediate CQE carries a descriptor; a terminal status
@@ -851,7 +869,8 @@ pub fn push_multishot_completion(
             }
             None
         }
-    }
+    };
+    MultishotCompletion { wake, retire }
 }
 
 /// Closes a nonnegative accept result the owning stream will never observe.
@@ -1616,10 +1635,31 @@ mod tests {
         let sentinel = encode_multishot_sentinel(key);
         assert_eq!(
             push_multishot_completion(&mut slab, sentinel, 9, CqeFlags::MORE),
-            Some(0xF00D),
-            "a queued completion returns the owning task to wake",
+            MultishotCompletion {
+                wake: Some(0xF00D),
+                retire: None,
+            },
+            "an intermediate completion wakes the owner without retiring the op",
         );
         assert_eq!(slab.pop(key), Some(9), "the result reached the FIFO");
+    }
+
+    #[test]
+    fn multishot_completion_terminal_retires_live_owner() {
+        let mut slab = MultishotSlab::new(23, 4);
+        let Some(key) = slab.allocate(0xBEEF) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_multishot_sentinel(key);
+        // A live terminal CQE queues its result (wake) and retires the one SQE.
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -104, CqeFlags::EMPTY),
+            MultishotCompletion {
+                wake: Some(0xBEEF),
+                retire: Some(0xBEEF),
+            },
+            "a live terminal CQE both wakes and retires the owner",
+        );
     }
 
     #[test]
@@ -1634,8 +1674,11 @@ mod tests {
         // result carries no fd, so the dispose path closes nothing.
         assert_eq!(
             push_multishot_completion(&mut slab, sentinel, -22, CqeFlags::MORE),
-            None,
-            "a cancel-pending slot wakes no owner",
+            MultishotCompletion {
+                wake: None,
+                retire: None,
+            },
+            "a cancel-pending intermediate wakes and retires nothing",
         );
         assert!(
             slab.is_live(key),
@@ -1643,8 +1686,11 @@ mod tests {
         );
         assert_eq!(
             push_multishot_completion(&mut slab, sentinel, -125, CqeFlags::EMPTY),
-            None,
-            "the terminal CQE wakes no owner",
+            MultishotCompletion {
+                wake: None,
+                retire: Some(0x1),
+            },
+            "the terminal CQE retires the owner without waking",
         );
         assert!(
             !slab.is_live(key),
@@ -1662,7 +1708,10 @@ mod tests {
         slab.free(key);
         assert_eq!(
             push_multishot_completion(&mut slab, sentinel, -22, CqeFlags::MORE),
-            None,
+            MultishotCompletion {
+                wake: None,
+                retire: None,
+            },
             "a sentinel naming a freed slot routes to nothing",
         );
     }
@@ -1682,8 +1731,20 @@ mod tests {
         }
         assert_eq!(
             push_multishot_completion(&mut slab, sentinel, -22, CqeFlags::MORE),
-            None,
+            MultishotCompletion {
+                wake: None,
+                retire: None,
+            },
             "an overflowing completion routes to nothing",
+        );
+        // The terminal CQE retires the owner even when the full FIFO drops it.
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -104, CqeFlags::EMPTY),
+            MultishotCompletion {
+                wake: None,
+                retire: Some(0x1),
+            },
+            "a terminal CQE still retires the owner when the FIFO is full",
         );
     }
 
