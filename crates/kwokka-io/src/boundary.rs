@@ -27,7 +27,10 @@ use std::os::fd::{FromRawFd, OwnedFd};
 
 use crate::{
     DriverType, IoDriver,
-    buffer::inflight::{InflightBufSlab, InflightSlotKey},
+    buffer::{
+        inflight::{InflightBufSlab, InflightSlotKey},
+        multishot::MultishotSlotKey,
+    },
     operation::{IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
 
@@ -648,6 +651,58 @@ pub const fn is_cancel_sentinel(user_data: u64) -> bool {
         && user_data != crate::wake::WAKE_FD_USER_DATA
 }
 
+/// `user_data` marker base for a multishot completion.
+///
+/// A multishot op posts many CQEs sharing one `user_data`, so its completions
+/// route to the [`MultishotSlab`](crate::buffer::multishot::MultishotSlab)
+/// rather than the per-task wake slot. The upper 32 bits read `0xFFFF_FFFE`:
+/// the arena tag bit, worker id 127, and generation `MAX - 1`, one corner below
+/// the cancel base. That keeps the three completion sentinels disjoint -- the
+/// wake fd is `u64::MAX` and the cancel base is `0xFFFF_FFFF_0000_0000`, both
+/// upper-32 `0xFFFF_FFFF`, while this reads `0xFFFF_FFFE`. It is unreachable for
+/// the same reason the cancel corner is: generation `MAX - 1` needs ~2^24 slot
+/// reuses. The low 32 bits carry the slot and its low 16 generation bits, the
+/// same layout [`encode_cancel_sentinel`] uses.
+const MULTISHOT_TOKEN_BASE: u64 = 0xFFFF_FFFE_0000_0000;
+
+/// Encodes the multishot-completion `user_data` for `key`.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "pending multishot drain wire-up")
+)]
+pub(crate) const fn encode_multishot_sentinel(key: MultishotSlotKey) -> u64 {
+    MULTISHOT_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
+}
+
+/// Whether `user_data` is a multishot-completion sentinel.
+///
+/// The completion drain calls this to route the CQE into the
+/// [`MultishotSlab`](crate::buffer::multishot::MultishotSlab). The marker shares
+/// the upper-32 isolation mask with the cancel sentinel but sits one corner
+/// below it, so no wake-value guard is needed: `u64::MAX` reads upper-32
+/// `0xFFFF_FFFF`, already excluded.
+pub const fn is_multishot_sentinel(user_data: u64) -> bool {
+    user_data & CANCEL_TOKEN_HIGH_MASK == MULTISHOT_TOKEN_BASE
+}
+
+/// The slot index a multishot sentinel names.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "pending multishot drain wire-up")
+)]
+pub(crate) const fn multishot_sentinel_slot(user_data: u64) -> u16 {
+    (user_data & 0xFFFF) as u16
+}
+
+/// The low 16 generation bits a multishot sentinel carries.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "pending multishot drain wire-up")
+)]
+pub(crate) const fn multishot_sentinel_generation(user_data: u64) -> u16 {
+    ((user_data >> 16) & 0xFFFF) as u16
+}
+
 /// Submits a cancel for a dropped buffered future's in-flight op and marks its
 /// slot retire-pending.
 ///
@@ -1048,6 +1103,40 @@ mod tests {
         );
         let sentinel = CANCEL_TOKEN_BASE | (0xAB << 16) | 0x05;
         assert!(is_cancel_sentinel(sentinel), "the marker is recognized");
+    }
+
+    #[test]
+    fn multishot_sentinel_round_trips() {
+        let key = MultishotSlotKey {
+            slot: 0x2A,
+            generation: 0xABCD,
+            worker_id: 3,
+            op_token: 0,
+        };
+        let sentinel = encode_multishot_sentinel(key);
+        assert!(is_multishot_sentinel(sentinel));
+        assert_eq!(multishot_sentinel_slot(sentinel), 0x2A);
+        assert_eq!(multishot_sentinel_generation(sentinel), 0xABCD);
+    }
+
+    #[test]
+    fn multishot_sentinel_excludes_other_markers() {
+        assert!(
+            !is_multishot_sentinel(CANCEL_TOKEN_BASE),
+            "the cancel corner reads upper-32 0xFFFF_FFFF, not 0xFFFF_FFFE",
+        );
+        assert!(
+            !is_multishot_sentinel(crate::wake::WAKE_FD_USER_DATA),
+            "the wake fd reads upper-32 0xFFFF_FFFF",
+        );
+        assert!(
+            !is_cancel_sentinel(MULTISHOT_TOKEN_BASE),
+            "the multishot corner is not a cancel sentinel",
+        );
+        assert!(
+            !is_multishot_sentinel(0x7FFF_FFFF_FFFF_FFFF),
+            "a slab-path task token keeps its top bit clear",
+        );
     }
 
     #[test]

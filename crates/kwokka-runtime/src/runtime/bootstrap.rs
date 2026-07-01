@@ -392,7 +392,7 @@ impl Runtime<Affine> {
 #[cfg(test)]
 mod tests {
     use kwokka_core::Generation;
-    use kwokka_io::boundary::is_cancel_sentinel;
+    use kwokka_io::boundary::{is_cancel_sentinel, is_multishot_sentinel};
 
     use crate::task::TaskRef;
 
@@ -431,5 +431,42 @@ mod tests {
         let wake = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, u32::MAX, max);
         assert_eq!(wake.raw(), u64::MAX);
         assert!(!is_cancel_sentinel(wake.raw()));
+    }
+
+    #[test]
+    fn arena_clears_the_multishot_marker() {
+        // A real arena-path completion must never be misread as a multishot
+        // sentinel in the drain. The multishot corner sits at worker 127 /
+        // generation MAX - 1; every reachable encoding, and the cancel corner
+        // (generation MAX), stays clear.
+        let reachable = [
+            TaskRef::from_arena(0, 0, Generation::ZERO),
+            TaskRef::from_arena(0, u32::MAX, Generation::ZERO),
+            TaskRef::from_arena(5, 0xDEAD_BEEF, Generation::from_raw(1)),
+            TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, Generation::ZERO),
+            TaskRef::from_arena(0, 0, Generation::from_raw(Generation::MAX)),
+            TaskRef::from_arena(
+                TaskRef::WORKER_ID_MAX,
+                7,
+                Generation::from_raw(Generation::MAX),
+            ),
+        ];
+        for task in reachable {
+            assert!(
+                !is_multishot_sentinel(task.raw()),
+                "arena completion aliases the multishot marker: {:#018x}",
+                task.raw(),
+            );
+        }
+    }
+
+    #[test]
+    fn multishot_marker_below_cancel_corner() {
+        // The multishot corner is worker 127 at generation MAX - 1, one below
+        // the cancel corner, so the two markers never alias the same encoding.
+        let below_max = Generation::from_raw(Generation::MAX - 1);
+        let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, below_max);
+        assert!(is_multishot_sentinel(corner.raw()));
+        assert!(!is_cancel_sentinel(corner.raw()));
     }
 }
