@@ -9,7 +9,7 @@ use core::{
 use std::io;
 
 use kwokka_io::{
-    boundary::{self, IoSeam, MultishotNext, WakerBinding},
+    boundary::{self, IoSeam, MultishotAlloc, MultishotNext, WakerBinding},
     buffer::multishot::MultishotSlotKey,
     operation::{IoRequest, SubmitResult},
 };
@@ -193,15 +193,21 @@ impl Future for AcceptNext<'_, '_> {
 
 /// Allocates a slot and submits the multishot accept, or picks a fallback.
 ///
-/// Returns [`AcceptState::Done`] when no multishot registry is reachable (a test
-/// seam or a full registry), [`AcceptState::Fallback`] when the backend rejects
-/// the multishot op, or [`AcceptState::Multishot`] once the op is in flight.
+/// Returns [`AcceptState::Multishot`] once the op is in flight,
+/// [`AcceptState::Fallback`] when the registry is full or the backend rejects the
+/// multishot op (degrading to single-shot), or [`AcceptState::Done`] when no seam
+/// or registry is reachable (a test seam).
 fn start_multishot(fd: i32, binding: WakerBinding) -> AcceptState {
-    let allocated = IoSeam::with_current(binding.worker_id, |seam| {
+    let alloc = IoSeam::with_current(binding.worker_id, |seam| {
         seam.allocate_multishot_slot(binding.token)
     });
-    let Some(Some((key, sentinel))) = allocated else {
-        return AcceptState::Done;
+    let (key, sentinel) = match alloc {
+        Some(MultishotAlloc::Allocated { key, sentinel }) => (key, sentinel),
+        // A full registry still has connections to accept; degrade to a
+        // single-shot accept per item rather than ending the stream.
+        Some(MultishotAlloc::Full) => return AcceptState::Fallback(AcceptFuture::new(fd)),
+        // No seam or no registry (a test seam) can drive the stream.
+        _ => return AcceptState::Done,
     };
     let request = IoRequest::<()>::accept_multishot(fd).with_user_data(sentinel);
     let submitted = IoSeam::with_current(binding.worker_id, |seam| seam.submit_internal(request));
