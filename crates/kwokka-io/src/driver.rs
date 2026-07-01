@@ -114,10 +114,13 @@ pub enum CancelError {
     /// Cancellation was not sent; the op will complete normally and its result
     /// will be discarded (best-effort detach).
     BestEffortDetach,
-    /// No in-flight op with the given token was found.
+    /// No in-flight op with the given token was found (`-ENOENT`): it may
+    /// have already completed, or the token was invalid.
     NotFound,
-    /// The op already produced a CQE before the cancel arrived.
-    AlreadyCompleted,
+    /// The op was found but is past the cancel point (`-EALREADY`); it will
+    /// complete shortly and its result stands. Buffers must stay owned until
+    /// that completion arrives.
+    TooLateToCancel,
 }
 
 #[cfg(test)]
