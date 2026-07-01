@@ -890,11 +890,12 @@ pub fn submit_cancel(driver: &DriverType, slab: &mut InflightBufSlab, key: Infli
 /// cancel-pending.
 ///
 /// Called by the cancel drain for a queued cancel whose `op_token` is a
-/// multishot sentinel. It marks the registry slot cancel-pending, then submits
-/// an `ASYNC_CANCEL` targeting the multishot op by its sentinel `user_data`. The
-/// op's terminal completion (its `-ECANCELED`, or the cancel op's own status)
-/// frees the slot through [`push_multishot_completion`]; intermediate accepts a
-/// dropped stream will not take are closed there, so no descriptor leaks.
+/// multishot sentinel. It closes any accepts already queued for the gone stream,
+/// marks the registry slot cancel-pending, then submits an `ASYNC_CANCEL`
+/// targeting the multishot op by its sentinel `user_data`. The op's terminal
+/// completion (its `-ECANCELED`, or the cancel op's own status) frees the slot
+/// through [`push_multishot_completion`]; intermediate accepts arriving after the
+/// mark are closed there, so no descriptor leaks either way.
 pub fn submit_multishot_cancel(
     driver: &DriverType,
     slab: &mut MultishotSlab,
@@ -905,6 +906,12 @@ pub fn submit_multishot_cancel(
         generation: key.generation,
         worker_id: key.worker_id,
     };
+    // The dropped stream will never take the accepts already queued in its FIFO;
+    // close each one so the descriptor does not leak. A negative result is an
+    // -errno, not an fd, and disposes as a no-op.
+    while let Some(result) = slab.pop(slot) {
+        dispose_accept_result(result);
+    }
     slab.mark_cancel_pending(slot);
     let request =
         IoRequest::<()>::cancel(SubmitToken::new(key.op_token)).with_user_data(key.op_token);
@@ -1678,5 +1685,64 @@ mod tests {
             None,
             "an overflowing completion routes to nothing",
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn multishot_cancel_drains_queued_results() {
+        let driver = DriverType::Epoll(());
+        let mut slab = MultishotSlab::new(19, 4);
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        // Two accepts sit unconsumed in the FIFO when the stream drops.
+        slab.push(key.slot, gen_low16, -7, true);
+        slab.push(key.slot, gen_low16, -9, true);
+        let cancel = InflightSlotKey {
+            slot: key.slot,
+            generation: key.generation,
+            worker_id: key.worker_id,
+            op_token: encode_multishot_sentinel(key),
+        };
+        submit_multishot_cancel(&driver, &mut slab, cancel);
+        assert_eq!(slab.pop(key), None, "the cancel drained the queued results");
+        assert!(
+            slab.is_cancel_pending(key.slot, gen_low16),
+            "the slot is marked cancel-pending",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(not(miri))]
+    #[test]
+    fn multishot_cancel_closes_queued_accept_fds() {
+        use std::os::fd::IntoRawFd;
+
+        let driver = DriverType::Epoll(());
+        let mut slab = MultishotSlab::new(20, 4);
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        // A real owned descriptor stands in for a queued accepted connection.
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            panic!("binding a loopback listener must succeed");
+        };
+        let fd = listener.into_raw_fd();
+        slab.push(key.slot, gen_low16, fd, true);
+        let cancel = InflightSlotKey {
+            slot: key.slot,
+            generation: key.generation,
+            worker_id: key.worker_id,
+            op_token: encode_multishot_sentinel(key),
+        };
+        submit_multishot_cancel(&driver, &mut slab, cancel);
+        // SAFETY: Invariant -- `fd` was owned via `into_raw_fd` and just disposed
+        // by the cancel above, so no live handle aliases it. Precondition -- this
+        // is a non-destructive `F_GETFD` probe, closing nothing. Failure mode --
+        // none; a probe of a closed fd reports `EBADF`, which is the assertion.
+        let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+        assert!(!still_open, "the cancel closed the queued accepted fd");
     }
 }
