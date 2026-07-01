@@ -524,10 +524,13 @@ impl Drop for SeamGuard {
 
 /// Per-worker cancel-inbox capacity.
 ///
-/// Sized to one slot per possible in-flight buffered op, so a worker can queue
-/// a cancel for every occupied slot in the same tick. A power of two, as
-/// [`CancelInbox`] requires.
-pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize;
+/// Sized to hold one cancel per droppable op across both per-worker registries
+/// -- the buffered-op inflight slab and the multishot slab -- so a worker can
+/// queue a cancel for every occupied slot in the same tick and never drop one.
+/// No op can drop twice before a drain (its slot stays occupied until the drain
+/// reclaims it), so the sum of the two capacities bounds every pending cancel.
+pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
+    + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
 
 /// Fixed-capacity ring of pending cancels for dropped buffered futures.
 ///
@@ -541,19 +544,21 @@ pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIG
 /// push runs on the owning worker thread. The ring is therefore single-writer
 /// and needs no atomics.
 ///
-/// `N` must be a power of two. At [`CANCEL_INBOX_CAPACITY`] there is one slot
-/// per in-flight op, so overflow is a safety backstop rather than a
-/// steady-state case: a full ring drops the cancel, a bounded leak, and the
-/// op's own completion still reclaims the slot, so no byte storage leaks
-/// permanently.
+/// At [`CANCEL_INBOX_CAPACITY`] there is one slot per op that can drop between
+/// drains -- across the inflight and multishot slabs -- so overflow is a safety
+/// backstop rather than a steady-state case: a full ring drops the cancel, a
+/// bounded leak, and the op's own completion still reclaims the slot, so no byte
+/// storage leaks permanently.
 pub struct CancelInbox<const N: usize> {
     /// Pending cancels, oldest at `head`. `InflightSlotKey` is `Copy`, so a
     /// dropped entry leaks only the cancel request, never owned storage. A
     /// multishot cancel rides the same key with its `op_token` set to the
     /// multishot sentinel, which the drain routes to the multishot registry.
     slots: [Option<InflightSlotKey>; N],
+    /// Ring read cursor, always in `[0, N)`.
     head: usize,
-    tail: usize,
+    /// Count of queued cancels; `(head + len) % N` is the next write slot.
+    len: usize,
 }
 
 impl<const N: usize> CancelInbox<N> {
@@ -561,19 +566,16 @@ impl<const N: usize> CancelInbox<N> {
     ///
     /// # Panics
     ///
-    /// Compile-time panic if `N` is not a power of two or is zero.
+    /// Compile-time panic if `N` is zero.
     #[must_use]
     pub const fn new() -> Self {
         const {
-            assert!(
-                N > 0 && N.is_power_of_two(),
-                "N must be a positive power of 2"
-            );
+            assert!(N > 0, "N must be positive");
         }
         Self {
             slots: [const { None }; N],
             head: 0,
-            tail: 0,
+            len: 0,
         }
     }
 
@@ -581,35 +583,38 @@ impl<const N: usize> CancelInbox<N> {
     ///
     /// A full ring drops the cancel -- a bounded leak: the op's own completion
     /// still reclaims the slot, so no byte storage leaks. The caller does not
-    /// retry; the original CQE frees the slot either way.
+    /// retry; the original CQE frees the slot either way. At
+    /// [`CANCEL_INBOX_CAPACITY`] the ring holds every op that can drop between
+    /// drains, so the full case is a backstop, not a steady state.
     pub const fn push_cancel(&mut self, key: InflightSlotKey) {
-        if self.tail.wrapping_sub(self.head) >= N {
+        if self.len >= N {
             return;
         }
-        self.slots[self.tail & (N - 1)] = Some(key);
-        self.tail = self.tail.wrapping_add(1);
+        self.slots[(self.head + self.len) % N] = Some(key);
+        self.len += 1;
     }
 
     /// Pops the oldest pending cancel, or `None` when the inbox is empty.
     pub const fn pop(&mut self) -> Option<InflightSlotKey> {
-        if self.head == self.tail {
+        if self.len == 0 {
             return None;
         }
-        let key = self.slots[self.head & (N - 1)].take();
-        self.head = self.head.wrapping_add(1);
+        let key = self.slots[self.head].take();
+        self.head = (self.head + 1) % N;
+        self.len -= 1;
         key
     }
 
     /// Number of pending cancels.
     #[cfg(test)]
     pub(crate) const fn len(&self) -> usize {
-        self.tail.wrapping_sub(self.head)
+        self.len
     }
 
     /// `true` when no cancels are pending.
     #[cfg(test)]
     pub(crate) const fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.len == 0
     }
 }
 
@@ -1147,6 +1152,34 @@ mod tests {
             first.slot, 0,
             "the overflow did not displace a queued cancel"
         );
+    }
+
+    #[test]
+    fn cancel_inbox_capacity_covers_both_slabs() {
+        let droppable = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
+            + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
+        assert!(
+            CANCEL_INBOX_CAPACITY >= droppable,
+            "the inbox holds a cancel for every op that can drop between drains, \
+             so no worker cancel is silently dropped in production",
+        );
+    }
+
+    #[test]
+    fn cancel_inbox_wraps_across_capacity() {
+        // Fill, drain half, refill: exercises the modulo write past the array end
+        // so the ring stays correct without a power-of-two capacity.
+        let mut inbox = CancelInbox::<3>::new();
+        inbox.push_cancel(cancel_key(0));
+        inbox.push_cancel(cancel_key(1));
+        assert_eq!(inbox.pop().map(|k| k.slot), Some(0));
+        inbox.push_cancel(cancel_key(2));
+        inbox.push_cancel(cancel_key(3));
+        assert_eq!(inbox.len(), 3, "the ring refilled to capacity after wrap");
+        assert_eq!(inbox.pop().map(|k| k.slot), Some(1));
+        assert_eq!(inbox.pop().map(|k| k.slot), Some(2));
+        assert_eq!(inbox.pop().map(|k| k.slot), Some(3));
+        assert!(inbox.pop().is_none());
     }
 
     #[test]
