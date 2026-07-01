@@ -604,15 +604,19 @@ pub fn push_cancel_for_worker(key: InflightSlotKey) {
 /// op's completion (see [`reclaim_dropped_slot`]); the cancel CQE frees it only
 /// on `-ENOENT`, where the target already completed and no op completion is
 /// coming. `io_uring` async cancel is best-effort, so a `0` or `-EALREADY`
-/// result leaves the target still completing and never drives a free. Bit 63 is
-/// set, which a slab-path task handle never sets (its tag bit is clear), and
-/// the upper 32 bits read exactly `0x8000_0000`, distinct from the wake fd's
-/// `u64::MAX`. The low bits carry the slot and its low 16 generation bits.
+/// result leaves the target still completing and never drives a free. The
+/// upper 32 bits are all set: the arena tag bit, a worker id of 127, and a
+/// maximal generation. That is the arena address space's exhaustion corner,
+/// reached only when both the worker id and the generation are maxed out, so a
+/// real completion never aliases the marker in practice. The low 32 bits carry
+/// the slot and its low 16 generation bits.
 ///
-/// Like the wake sentinel, this assumes the slab-only runtime: an arena-path
-/// task that submitted I/O could set bit 63 too, so revisit before arena tasks
-/// reach the seam.
-const CANCEL_TOKEN_BASE: u64 = 1 << 63;
+/// This gives the marker the same narrow window as the wake fd's `u64::MAX`,
+/// which sits in that corner at a maximal offset. The two stay disjoint: the
+/// marker never encodes an all-ones low half, and [`is_cancel_sentinel`]
+/// excludes the wake value. A slab-path handle clears the arena tag bit, so it
+/// never aliases either.
+const CANCEL_TOKEN_BASE: u64 = 0xFFFF_FFFF_0000_0000;
 
 /// Upper-32-bit mask isolating the [`CANCEL_TOKEN_BASE`] marker.
 const CANCEL_TOKEN_HIGH_MASK: u64 = 0xFFFF_FFFF_0000_0000;
@@ -635,8 +639,13 @@ const fn encode_cancel_sentinel(key: InflightSlotKey) -> u64 {
 /// slot is normally reclaimed on the original op's completion (see
 /// [`reclaim_dropped_slot`]); the cancel CQE frees it only on a `-ENOENT`
 /// result.
+///
+/// The marker fills the upper 32 bits, which the wake fd's `u64::MAX` also
+/// does, so the wake value is excluded here to keep the two predicates disjoint
+/// on their own. The drain tests the wake fd first regardless.
 pub const fn is_cancel_sentinel(user_data: u64) -> bool {
     user_data & CANCEL_TOKEN_HIGH_MASK == CANCEL_TOKEN_BASE
+        && user_data != crate::wake::WAKE_FD_USER_DATA
 }
 
 /// Submits a cancel for a dropped buffered future's in-flight op and marks its
@@ -1032,6 +1041,10 @@ mod tests {
         assert!(
             !is_cancel_sentinel(0x7FFF_FFFF_FFFF_FFFF),
             "a slab-path task token keeps its top bit clear",
+        );
+        assert!(
+            !is_cancel_sentinel(0x8000_0000_0000_0005),
+            "the previous marker corner (arena worker 0, generation 0) no longer aliases",
         );
         let sentinel = CANCEL_TOKEN_BASE | (0xAB << 16) | 0x05;
         assert!(is_cancel_sentinel(sentinel), "the marker is recognized");

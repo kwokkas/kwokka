@@ -388,3 +388,48 @@ impl Runtime<Affine> {
         take_root_output::<F::Output>(&mut self.shard, root_key)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kwokka_core::Generation;
+    use kwokka_io::boundary::is_cancel_sentinel;
+
+    use crate::task::TaskRef;
+
+    #[test]
+    fn arena_completions_clear_the_marker() {
+        // A real arena-path completion must never be misread as a buffered-op
+        // cancel sentinel in the drain. The narrowed marker aliases an arena
+        // handle only at the worker-127 / max-generation corner; every
+        // reachable encoding stays clear.
+        let reachable = [
+            TaskRef::from_arena(0, 0, Generation::ZERO),
+            TaskRef::from_arena(0, u32::MAX, Generation::ZERO),
+            TaskRef::from_arena(5, 0xDEAD_BEEF, Generation::from_raw(1)),
+            TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, Generation::ZERO),
+            TaskRef::from_arena(0, 0, Generation::from_raw(Generation::MAX)),
+        ];
+        for task in reachable {
+            assert!(
+                !is_cancel_sentinel(task.raw()),
+                "arena completion aliases the cancel marker: {:#018x}",
+                task.raw(),
+            );
+        }
+    }
+
+    #[test]
+    fn marker_corner_matches_wake() {
+        // The one residual collision is the worker-127 / max-generation corner,
+        // identical to the wake fd's window. An arena handle there is read as a
+        // marker, except the maximal-offset point, which is the wake sentinel
+        // (u64::MAX) and stays excluded.
+        let max = Generation::from_raw(Generation::MAX);
+        let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, max);
+        assert!(is_cancel_sentinel(corner.raw()));
+
+        let wake = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, u32::MAX, max);
+        assert_eq!(wake.raw(), u64::MAX);
+        assert!(!is_cancel_sentinel(wake.raw()));
+    }
+}
