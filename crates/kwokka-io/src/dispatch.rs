@@ -142,6 +142,14 @@ impl IoDriver for DriverType {
             _ => Err(RegisterError::Unsupported),
         }
     }
+
+    fn provided_recv_group(&self) -> Option<BufGroupId> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => driver.provided_recv_group(),
+            _ => None,
+        }
+    }
 }
 
 impl DriverType {

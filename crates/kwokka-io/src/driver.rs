@@ -34,7 +34,9 @@ pub trait IoDriver: Send {
         self.submit(request)
     }
 
-    /// Submit a driver-internal operation (timeout, cancel, `msg_ring`, poll).
+    /// Submit an operation with no caller buffer: accept / connect / close,
+    /// provided-buffer recv, and the driver-internal control ops (timeout,
+    /// cancel, `msg_ring`, poll).
     #[doc(hidden)]
     fn submit_internal(&self, request: IoRequest<()>) -> SubmitResult;
 
@@ -92,6 +94,17 @@ pub trait IoDriver: Send {
     /// with `IORING_OP_ASYNC_CANCEL`.
     fn cancel(&self, _token: SubmitToken) -> Result<(), CancelError> {
         Err(CancelError::BestEffortDetach)
+    }
+
+    /// The provided-buffer group for kernel-selected recv, if the backend
+    /// registered one.
+    ///
+    /// `None` (the default, and every thin-fallback backend) means the caller
+    /// takes the inline-buffer recv path instead -- the fallback-parity
+    /// statement for provided buffers. `UringDriver` returns the group of its
+    /// per-worker `buf_ring` pool when one is registered.
+    fn provided_recv_group(&self) -> Option<BufGroupId> {
+        None
     }
 }
 

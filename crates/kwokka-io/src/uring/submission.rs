@@ -62,6 +62,9 @@ impl SubmitScratch {
 pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) -> Entry {
     let entry = match (&request.opcode, &request.payload) {
         (OpCode::Accept, OpPayload::Fd) => net::build_accept(request.fd, request.flags),
+        (OpCode::RecvProvided, OpPayload::Fd) => {
+            net::build_recv_provided(request.fd, request.common.buf_group, request.flags)
+        }
         (OpCode::Connect, OpPayload::Socket { addr, .. }) => {
             net::build_connect(request.fd, addr, &mut scratch.addr, request.flags)
         }
@@ -253,6 +256,13 @@ mod tests {
     #[test]
     fn accept_builds_without_panic() {
         let request = IoRequest::<()>::accept(3).with_user_data(42);
+        let _entry = build_entry(&request, &mut scratch());
+    }
+
+    #[test]
+    fn recv_provided_builds_without_panic() {
+        let request = IoRequest::<()>::recv_provided(3, crate::buffer::slot::BufGroupId::new(0));
+        assert!(request.flags.buffer_select);
         let _entry = build_entry(&request, &mut scratch());
     }
 

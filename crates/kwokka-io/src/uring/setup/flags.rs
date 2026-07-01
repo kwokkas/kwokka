@@ -27,13 +27,18 @@ pub(crate) enum SetupTier {
 
 /// Map [`OpFlags`] to `io_uring` SQE flags.
 ///
-/// Only `fixed_fd` maps to an SQE flag bit (`FIXED_FILE`). Other
-/// [`OpFlags`] fields affect opcode selection in the submission path,
-/// not SQE flags.
+/// `fixed_fd` maps to `FIXED_FILE` and `buffer_select` to `BUFFER_SELECT`;
+/// the io-uring crate sets the SQE `buf_group` field on the `Recv` op but
+/// not the `BUFFER_SELECT` bit for a single-shot recv, so that bit is set
+/// here. Other [`OpFlags`] fields affect opcode selection in the submission
+/// path, not SQE flags.
 pub(crate) fn sqe_flags(op_flags: OpFlags) -> squeue::Flags {
     let mut flags = squeue::Flags::empty();
     if op_flags.fixed_fd {
         flags |= squeue::Flags::FIXED_FILE;
+    }
+    if op_flags.buffer_select {
+        flags |= squeue::Flags::BUFFER_SELECT;
     }
     flags
 }
@@ -70,6 +75,13 @@ mod tests {
         let op_flags = OpFlags::new().with_fixed_fd(true);
         let flags = sqe_flags(op_flags);
         assert!(flags.contains(squeue::Flags::FIXED_FILE));
+    }
+
+    #[test]
+    fn sqe_flags_buffer_select_when_set() {
+        let op_flags = OpFlags::new().with_buffer_select(true);
+        let flags = sqe_flags(op_flags);
+        assert!(flags.contains(squeue::Flags::BUFFER_SELECT));
     }
 
     #[test]
