@@ -224,6 +224,13 @@ fn drain_wakes(shard: &mut WorkerShard) {
     }
 }
 
+/// CQEs read per completion-drain pass.
+///
+/// A multishot op can post up to this many CQEs sharing one `user_data` in a
+/// single pass, so `kwokka_io::buffer::multishot::MULTISHOT_FIFO_DEPTH` must not
+/// be smaller; a runtime-side test enforces that bound.
+const COMPLETION_BATCH: usize = 64;
+
 /// Drains ready completions, storing each result into its task and waking it.
 ///
 /// Reads a batch of CQEs from the driver and maps each back to its task via
@@ -231,14 +238,15 @@ fn drain_wakes(shard: &mut WorkerShard) {
 /// in the task header for its next poll, then makes the task runnable. A
 /// `user_data` that no longer resolves (a recycled slot) is dropped.
 fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
-    const BATCH: usize = 64;
     // IGNORE: an interrupted flush retries next pass. Deferred task work
     // must run before the CQ read: on a DEFER_TASKRUN ring the kernel
     // posts CQEs only at a GETEVENTS enter, and a worker that never parks
     // would otherwise starve its completions.
     let _ = shard.driver.flush_deferred();
-    let mut completions = [Completion::default(); BATCH];
-    let count = shard.driver.poll_completions(BATCH, &mut completions);
+    let mut completions = [Completion::default(); COMPLETION_BATCH];
+    let count = shard
+        .driver
+        .poll_completions(COMPLETION_BATCH, &mut completions);
     for completion in &completions[..count] {
         let user_data = completion.token.user_data();
         if user_data == wake::WAKE_FD_USER_DATA {
@@ -468,5 +476,15 @@ mod tests {
         let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, below_max);
         assert!(is_multishot_sentinel(corner.raw()));
         assert!(!is_cancel_sentinel(corner.raw()));
+    }
+
+    #[test]
+    fn drain_batch_fits_multishot_fifo() {
+        // A drain pass can post a full batch of same-op multishot CQEs; the
+        // per-slot FIFO must hold them all. Enforces the cross-crate invariant
+        // that the comment on both sides depends on.
+        assert!(
+            super::COMPLETION_BATCH <= kwokka_io::buffer::multishot::MULTISHOT_FIFO_DEPTH as usize
+        );
     }
 }

@@ -1111,7 +1111,6 @@ mod tests {
             slot: 0x2A,
             generation: 0xABCD,
             worker_id: 3,
-            op_token: 0,
         };
         let sentinel = encode_multishot_sentinel(key);
         assert!(is_multishot_sentinel(sentinel));
