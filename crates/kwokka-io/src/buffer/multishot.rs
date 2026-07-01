@@ -21,10 +21,13 @@
 )]
 #![allow(dead_code, reason = "pending multishot accept wire-up")]
 
-/// Multishot slots per worker. Sized generously against the handful of
-/// multishot registrations a worker runs (one per listener today); the
-/// per-connection recv case is revisited when recv lands.
-pub const DEFAULT_MULTISHOT_CAP: u16 = 64;
+/// Multishot slots per worker, kept small.
+///
+/// A worker runs a handful of multishot registrations (one per listener today),
+/// and the whole registry is stored inline in the worker shard, so a low slot
+/// count bounds the shard's stack frame. The per-connection recv case is
+/// revisited when recv lands; it needs an mmap-backed store to scale past this.
+pub const DEFAULT_MULTISHOT_CAP: u16 = 8;
 
 /// Per-slot completion FIFO depth, sized to the runtime completion-drain batch
 /// so one drain pass of same-op CQEs never overflows.
@@ -216,6 +219,34 @@ impl MultishotSlab {
         *generation = generation.wrapping_add(1);
     }
 
+    /// Whether `slot` is cancel-pending at `generation_low16`.
+    ///
+    /// The completion drain reads this by the sentinel's slot and low-16
+    /// generation to tell a dropped stream's op (cancel-pending) from a live one.
+    pub(crate) const fn is_cancel_pending(&self, slot: u16, generation_low16: u16) -> bool {
+        if !self.is_slot_live(slot, generation_low16) {
+            return false;
+        }
+        let (word, bit) = word_bit(slot);
+        self.cancel_pending[word] & (1u64 << bit) != 0
+    }
+
+    /// Frees `slot` when occupied at `generation_low16`, bumping its generation.
+    ///
+    /// The drain calls this on the terminal CQE of a cancel-pending op, keyed by
+    /// the sentinel's slot and low-16 generation; a stale slot is a no-op.
+    pub(crate) const fn free_by_slot(&mut self, slot: u16, generation_low16: u16) {
+        if !self.is_slot_live(slot, generation_low16) {
+            return;
+        }
+        let (word, bit) = word_bit(slot);
+        self.occupied[word] &= !(1u64 << bit);
+        self.terminated[word] &= !(1u64 << bit);
+        self.cancel_pending[word] &= !(1u64 << bit);
+        self.len[slot as usize] = 0;
+        self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
+    }
+
     /// Whether `key` names a currently-occupied slot at its generation.
     pub(crate) const fn is_live(&self, key: MultishotSlotKey) -> bool {
         if key.worker_id != self.worker_id {
@@ -400,5 +431,67 @@ mod tests {
         let mut foreign = key;
         foreign.worker_id = 4;
         assert!(!registry.is_live(foreign));
+    }
+
+    #[test]
+    fn is_cancel_pending_tracks_the_flag() {
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        assert!(
+            !registry.is_cancel_pending(key.slot, gen_low16),
+            "a fresh slot is not cancel-pending",
+        );
+        registry.mark_cancel_pending(key);
+        assert!(
+            registry.is_cancel_pending(key.slot, gen_low16),
+            "marking sets the cancel-pending flag",
+        );
+    }
+
+    #[test]
+    fn is_cancel_pending_rejects_stale_generation() {
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        registry.mark_cancel_pending(key);
+        registry.free(key);
+        assert!(
+            !registry.is_cancel_pending(key.slot, gen_low16),
+            "a freed slot reads not cancel-pending at the old generation",
+        );
+    }
+
+    #[test]
+    fn free_by_slot_frees_and_bumps_generation() {
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        registry.mark_cancel_pending(key);
+        registry.free_by_slot(key.slot, gen_low16);
+        assert!(!registry.is_live(key), "free_by_slot clears the occupancy");
+        let next = allocate(&mut registry, 0x1);
+        assert_eq!(next.slot, key.slot);
+        assert_eq!(
+            next.generation,
+            key.generation + 1,
+            "the generation bumped so the stale key is rejected",
+        );
+        assert!(
+            !registry.is_cancel_pending(next.slot, (next.generation & 0xFFFF) as u16),
+            "the reused slot starts without the cancel-pending flag",
+        );
+    }
+
+    #[test]
+    fn free_by_slot_ignores_stale_generation() {
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        registry.free_by_slot(key.slot, gen_low16.wrapping_add(1));
+        assert!(
+            registry.is_live(key),
+            "a mismatched generation leaves the slot live",
+        );
     }
 }

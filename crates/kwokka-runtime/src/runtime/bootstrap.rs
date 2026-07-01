@@ -22,8 +22,8 @@ use kwokka_core::{namespace::Namespace, slab::SlabKey};
 use kwokka_io::{
     IoDriver,
     boundary::{
-        CancelInboxGuard, is_cancel_sentinel, reclaim_cancel_completion, reclaim_dropped_slot,
-        submit_cancel,
+        CancelInboxGuard, is_cancel_sentinel, is_multishot_sentinel, push_multishot_completion,
+        reclaim_cancel_completion, reclaim_dropped_slot, submit_cancel_for,
     },
     operation::Completion,
     wake,
@@ -89,6 +89,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         shard.id,
         Some(NonNull::from(&mut shard.driver)),
         Some(NonNull::from(&mut shard.inflight_slab)),
+        Some(NonNull::from(&mut shard.multishot_slab)),
         &shard.forward,
     );
     #[cfg(not(feature = "steal"))]
@@ -102,6 +103,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         shard.id,
         Some(NonNull::from(&mut shard.driver)),
         Some(NonNull::from(&mut shard.inflight_slab)),
+        Some(NonNull::from(&mut shard.multishot_slab)),
     );
     cycle::drain_spawns(
         &mut shard.tasks,
@@ -264,6 +266,24 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             reclaim_cancel_completion(&mut shard.inflight_slab, user_data, completion.result);
             continue;
         }
+        if is_multishot_sentinel(user_data) {
+            // A multishot op's CQE. Route the result into its registry FIFO and
+            // wake the owning stream; a stale, overflowed, or cancel-pending slot
+            // wakes nothing, and a terminal cancel CQE frees the slot in there.
+            if let Some(owner) = push_multishot_completion(
+                &mut shard.multishot_slab,
+                user_data,
+                completion.result,
+                completion.flags,
+            ) {
+                wake_local(
+                    &mut shard.tasks,
+                    &mut shard.run_queue,
+                    TaskRef::from_raw(owner),
+                );
+            }
+            continue;
+        }
         // The original op's completion is the kernel's done-with-the-bytes
         // signal. If a dropped buffered future owned this op, free its slot now;
         // a live future's slot is not retire-pending, so this is a no-op and it
@@ -293,7 +313,12 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
 /// before this pass reads an op completion that may already be waiting.
 fn drain_cancels(shard: &mut WorkerShard) {
     while let Some(key) = shard.cancel_inbox.pop() {
-        submit_cancel(&shard.driver, &mut shard.inflight_slab, key);
+        submit_cancel_for(
+            &shard.driver,
+            &mut shard.inflight_slab,
+            &mut shard.multishot_slab,
+            key,
+        );
     }
 }
 

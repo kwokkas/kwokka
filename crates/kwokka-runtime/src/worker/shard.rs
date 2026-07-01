@@ -13,7 +13,10 @@ use kwokka_core::{id::Pip, slab::Slab};
 use kwokka_io::{
     DriverType,
     boundary::{CANCEL_INBOX_CAPACITY, CancelInbox},
-    buffer::inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
+    buffer::{
+        inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
+        multishot::{DEFAULT_MULTISHOT_CAP, MultishotSlab},
+    },
 };
 
 #[cfg(feature = "steal")]
@@ -64,6 +67,9 @@ pub(crate) struct WorkerShard {
     /// Per-worker cancel queue for dropped buffered futures. Drop-order
     /// independent (no heap, no fd); grouped with `inflight_slab` for cohesion.
     pub(crate) cancel_inbox: CancelInbox<CANCEL_INBOX_CAPACITY>,
+    /// Per-worker multishot registry, holding the FIFO of completions for each
+    /// in-flight multishot op. Drop-order independent (no heap, no fd).
+    pub(crate) multishot_slab: MultishotSlab,
     /// Per-worker generational slab holding task headers and futures.
     pub(crate) tasks: Slab<TaskSlot>,
     /// Hierarchical timer wheel for deadline-based wakeups.
@@ -117,6 +123,7 @@ impl WorkerShard {
             driver,
             inflight_slab,
             cancel_inbox: CancelInbox::new(),
+            multishot_slab: MultishotSlab::new(id.raw(), DEFAULT_MULTISHOT_CAP),
             tasks: Slab::new(task_capacity),
             timer,
             run_queue: LocalRunQueue::new(),
