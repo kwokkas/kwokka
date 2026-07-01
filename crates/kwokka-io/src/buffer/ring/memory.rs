@@ -45,7 +45,9 @@ impl BufRing {
     ///
     /// - `ring` must point to a valid mmap'd region of at least `entries * 16` bytes, page-aligned
     ///   and zero-filled.
-    /// - The region must be registered via `IORING_REGISTER_PBUF_RING`.
+    /// - Before the kernel selects buffers, the region is registered via
+    ///   `IORING_REGISTER_PBUF_RING`; registration may follow construction and population of the
+    ///   ring (see `io_uring_buf_ring_init.3`).
     /// - `entries` must be a non-zero power of two, max 2^15.
     /// - The caller must keep the region mapped for the lifetime of this [`BufRing`].
     /// - The tail field (offset 14 of entry 0) must only be accessed through this [`BufRing`] or
