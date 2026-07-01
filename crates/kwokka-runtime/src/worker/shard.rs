@@ -12,7 +12,7 @@ use kwokka_core::slab::SlabKey;
 use kwokka_core::{id::Pip, slab::Slab};
 use kwokka_io::{
     DriverType,
-    boundary::{CANCEL_INBOX_CAPACITY, CancelInbox},
+    boundary::{ACCEPT_CANCEL_CAPACITY, AcceptCancelSet, CANCEL_INBOX_CAPACITY, CancelInbox},
     buffer::{
         inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
         multishot::{DEFAULT_MULTISHOT_CAP, MultishotSlab},
@@ -67,6 +67,9 @@ pub(crate) struct WorkerShard {
     /// Per-worker cancel queue for dropped buffered futures. Drop-order
     /// independent (no heap, no fd); grouped with `inflight_slab` for cohesion.
     pub(crate) cancel_inbox: CancelInbox<CANCEL_INBOX_CAPACITY>,
+    /// Tokens of dropped single-shot accepts awaiting their completion, so the
+    /// drain closes a raced accept's fd instead of orphaning it. No heap, no fd.
+    pub(crate) accept_cancels: AcceptCancelSet<ACCEPT_CANCEL_CAPACITY>,
     /// Per-worker multishot registry, holding the FIFO of completions for each
     /// in-flight multishot op. Drop-order independent (no heap, no fd).
     pub(crate) multishot_slab: MultishotSlab,
@@ -123,6 +126,7 @@ impl WorkerShard {
             driver,
             inflight_slab,
             cancel_inbox: CancelInbox::new(),
+            accept_cancels: AcceptCancelSet::new(),
             multishot_slab: MultishotSlab::new(id.raw(), DEFAULT_MULTISHOT_CAP),
             tasks: Slab::new(task_capacity),
             timer,

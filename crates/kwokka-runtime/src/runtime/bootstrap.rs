@@ -22,8 +22,9 @@ use kwokka_core::{namespace::Namespace, slab::SlabKey};
 use kwokka_io::{
     IoDriver,
     boundary::{
-        CancelInboxGuard, is_cancel_sentinel, is_multishot_sentinel, push_multishot_completion,
-        reclaim_cancel_completion, reclaim_dropped_slot, submit_cancel_for,
+        CancelInboxGuard, dispose_cancelled_accept, is_cancel_sentinel, is_multishot_sentinel,
+        push_multishot_completion, reclaim_cancel_completion, reclaim_dropped_slot,
+        submit_cancel_for,
     },
     operation::Completion,
     wake,
@@ -298,6 +299,11 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
         // signal. If a dropped buffered future owned this op, free its slot now;
         // a live future's slot is not retire-pending, so this is a no-op and it
         // frees through its own harvest path.
+        if dispose_cancelled_accept(&mut shard.accept_cancels, user_data, completion.result) {
+            // A dropped single-shot accept's op completed; its fd was closed
+            // here, so there is nothing to reclaim into a slot or wake.
+            continue;
+        }
         reclaim_dropped_slot(&mut shard.inflight_slab, user_data);
         let task_ref = TaskRef::from_raw(user_data);
         let key = SlabKey::new(task_ref.index(), task_ref.generation());
@@ -327,6 +333,7 @@ fn drain_cancels(shard: &mut WorkerShard) {
             &shard.driver,
             &mut shard.inflight_slab,
             &mut shard.multishot_slab,
+            &mut shard.accept_cancels,
             key,
         );
     }

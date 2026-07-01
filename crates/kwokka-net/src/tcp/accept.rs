@@ -45,8 +45,17 @@ use crate::tcp::TcpStream;
 pub struct AcceptFuture {
     /// Listening socket file descriptor.
     fd: i32,
-    /// Whether the op has been submitted; gates the submit-once transition.
-    is_submitted: bool,
+    /// The worker and token the accept submitted under, once in flight. `Some`
+    /// gates the cancel on drop; cleared when the op resolves, so a completed
+    /// accept is never cancelled.
+    submitted: Option<AcceptOp>,
+}
+
+/// The worker and `user_data` token a submitted accept is cancelled by.
+#[derive(Clone, Copy)]
+struct AcceptOp {
+    worker_id: u8,
+    token: u64,
 }
 
 impl AcceptFuture {
@@ -54,7 +63,7 @@ impl AcceptFuture {
     pub const fn new(fd: i32) -> Self {
         Self {
             fd,
-            is_submitted: false,
+            submitted: None,
         }
     }
 }
@@ -70,16 +79,23 @@ impl Future for AcceptFuture {
             panic!("AcceptFuture requires the runtime task waker; await it directly");
         };
         let this = self.get_mut();
-        if this.is_submitted {
+        if this.submitted.is_some() {
             return match IoSeam::with_current(binding.worker_id, IoSeam::completion_result) {
-                Some(Some(slot)) => Poll::Ready(slot.result),
+                Some(Some(slot)) => {
+                    // The op resolved; clear the cancel guard so drop is a no-op.
+                    this.submitted = None;
+                    Poll::Ready(slot.result)
+                }
                 _ => Poll::Pending,
             };
         }
         let request = IoRequest::<()>::accept(this.fd).with_user_data(binding.token);
         match IoSeam::with_current(binding.worker_id, |seam| seam.submit_internal(request)) {
             Some(Some(SubmitResult::Submitted(_))) => {
-                this.is_submitted = true;
+                this.submitted = Some(AcceptOp {
+                    worker_id: binding.worker_id,
+                    token: binding.token,
+                });
                 Poll::Pending
             }
             // No seam, no driver, or the backend rejected the op. The
@@ -87,6 +103,16 @@ impl Future for AcceptFuture {
             // test-seam / unsupported path; resolve with -EINVAL rather
             // than hang.
             _ => Poll::Ready(-22),
+        }
+    }
+}
+
+impl Drop for AcceptFuture {
+    fn drop(&mut self) {
+        if let Some(op) = self.submitted {
+            // The submitted accept made the task `io_bound`, so this drop runs on
+            // the owning worker and the cancel reaches the inbox single-writer.
+            boundary::push_accept_cancel_for_worker(op.worker_id, op.token);
         }
     }
 }
