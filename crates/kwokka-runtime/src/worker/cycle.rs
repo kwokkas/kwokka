@@ -12,7 +12,10 @@ use kwokka_core::{
     id::Pip,
     slab::{Slab, SlabKey},
 };
-use kwokka_io::{DriverType, buffer::inflight::InflightBufSlab};
+use kwokka_io::{
+    DriverType,
+    buffer::{inflight::InflightBufSlab, multishot::MultishotSlab},
+};
 
 #[cfg(feature = "steal")]
 use crate::scheduler::stealing::relocate::ForwardTable;
@@ -81,6 +84,7 @@ pub(crate) fn tick<C: Clock>(
     worker_id: WorkerId,
     driver: Option<NonNull<DriverType>>,
     inflight_slab: Option<NonNull<InflightBufSlab>>,
+    multishot_slab: Option<NonNull<MultishotSlab>>,
     #[cfg(feature = "steal")] forward: &ForwardTable,
 ) -> Tick {
     let now = timer.now_tick();
@@ -117,6 +121,7 @@ pub(crate) fn tick<C: Clock>(
             NonNull::from(&mut *reap),
             driver,
             inflight_slab,
+            multishot_slab,
             Some(NonNull::from(&mut *timer_requests)),
         ) else {
             continue;
@@ -274,6 +279,7 @@ mod tests {
                 worker(0),
                 None,
                 None,
+                None,
                 &forward,
             )
         }
@@ -287,6 +293,7 @@ mod tests {
                 &mut reap,
                 &mut timer_requests,
                 worker(0),
+                None,
                 None,
                 None,
             )

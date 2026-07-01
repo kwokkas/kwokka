@@ -6,7 +6,7 @@ mod connect;
 mod listener;
 mod stream;
 
-pub use accept::AcceptFuture;
+pub use accept::{AcceptFuture, AcceptNext, AcceptStream};
 pub use connect::ConnectFuture;
 pub use kwokka_io::operation::{RecvFuture, SendFuture};
 pub use listener::TcpListener;

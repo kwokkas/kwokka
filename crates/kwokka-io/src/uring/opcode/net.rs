@@ -46,11 +46,27 @@ pub(crate) fn build_send(fd: i32, ptr: *const u8, len: usize, flags: OpFlags) ->
 }
 
 /// Build an accept SQE.
+///
+/// Emits a multishot accept (`io_uring_prep_multishot_accept.3`) when
+/// `flags.multishot` is set: one SQE posts a CQE per incoming connection until
+/// the op is cancelled. Otherwise a single-shot accept that completes once.
 pub(crate) fn build_accept(fd: i32, flags: OpFlags) -> Entry {
+    if flags.multishot {
+        return build_accept_multi(fd, flags);
+    }
     if flags.fixed_fd {
         opcode::Accept::new(Fixed(fd as u32), std::ptr::null_mut(), std::ptr::null_mut()).build()
     } else {
         opcode::Accept::new(Fd(fd), std::ptr::null_mut(), std::ptr::null_mut()).build()
+    }
+}
+
+/// Build a multishot accept SQE (`io_uring_prep_multishot_accept.3`).
+fn build_accept_multi(fd: i32, flags: OpFlags) -> Entry {
+    if flags.fixed_fd {
+        opcode::AcceptMulti::new(Fixed(fd as u32)).build()
+    } else {
+        opcode::AcceptMulti::new(Fd(fd)).build()
     }
 }
 

@@ -26,7 +26,7 @@ use kwokka_core::slab::{Slab, SlabKey};
 use kwokka_io::{
     DriverType,
     boundary::{IoSeam, SeamGuard, WakeSlot},
-    buffer::inflight::InflightBufSlab,
+    buffer::{inflight::InflightBufSlab, multishot::MultishotSlab},
 };
 
 use crate::{
@@ -146,6 +146,7 @@ pub(crate) fn poll_one(
     reap: NonNull<ReapQueue<REAP_QUEUE_CAPACITY>>,
     driver: Option<NonNull<DriverType>>,
     inflight_slab: Option<NonNull<InflightBufSlab>>,
+    multishot_slab: Option<NonNull<MultishotSlab>>,
     timer_requests: Option<NonNull<TimerInbox<TIMER_INBOX_CAPACITY>>>,
 ) -> Option<PollOutcome> {
     // SAFETY: Invariant -- `tasks` points at the worker's live slab; the caller
@@ -195,7 +196,8 @@ pub(crate) fn poll_one(
         driver,
         inflight_slab,
         wake_slot_of(wake_data),
-    );
+    )
+    .with_multishot_slab(multishot_slab);
     let _seam_guard = SeamGuard::install(&seam);
     let waker = waker_from_task_ref(current);
     let mut context = Context::from_waker(&waker);
@@ -469,6 +471,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(outcome, Some(PollOutcome::Completed));
         let Some(slot) = slab.get(key) else {
@@ -521,6 +524,7 @@ mod tests {
             task,
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
+            None,
             None,
             None,
             None,
@@ -597,6 +601,7 @@ mod tests {
             NonNull::from(&mut inbox),
             NonNull::from(&mut reap),
             Some(NonNull::from(&mut driver)),
+            None,
             None,
             None,
         );

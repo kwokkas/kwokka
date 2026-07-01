@@ -20,7 +20,7 @@ use std::{
 
 use kwokka_io::boundary;
 
-use crate::tcp::{AcceptFuture, TcpStream};
+use crate::tcp::{AcceptFuture, AcceptStream, TcpStream};
 
 /// A TCP socket listening for inbound connections.
 ///
@@ -80,6 +80,15 @@ impl TcpListener {
             return Err(io::Error::from_raw_os_error(-result));
         };
         Ok(TcpStream::from(fd))
+    }
+
+    /// Accepts connections as a stream driven by one multishot accept.
+    ///
+    /// See [`AcceptStream`]: one submitted op yields a completion per incoming
+    /// connection on a capable kernel, degrading to single-shot accepts
+    /// otherwise. The returned connections are owned by the caller.
+    pub fn accept_multi(&self) -> AcceptStream {
+        AcceptStream::new(self.as_raw_fd())
     }
 }
 

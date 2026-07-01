@@ -29,9 +29,9 @@ use crate::{
     DriverType, IoDriver,
     buffer::{
         inflight::{InflightBufSlab, InflightSlotKey},
-        multishot::MultishotSlotKey,
+        multishot::{MultishotPush, MultishotSlab, MultishotSlotKey},
     },
-    operation::{IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
+    operation::{CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
 
 /// One seam slot per possible worker id byte.
@@ -74,6 +74,17 @@ pub struct WakeSlot {
     pub flags: u32,
     /// Kernel-selected buffer id, when the op consumed a provided buffer.
     pub buf_id: Option<u16>,
+}
+
+/// The outcome of advancing a multishot stream by one completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultishotNext {
+    /// A completion result: a nonnegative accept fd or a negative `-errno`.
+    Item(i32),
+    /// The op is in flight with an empty FIFO; poll again on wake.
+    Pending,
+    /// The op posted its terminal CQE and its FIFO is drained; the slot is freed.
+    Ended,
 }
 
 /// Adopts a nonnegative accept-completion result as an owned descriptor.
@@ -151,6 +162,10 @@ pub struct IoSeam {
     /// buffered future allocates a slot here during its poll through
     /// [`IoSeam::allocate_slot`].
     inflight_slab: Option<NonNull<InflightBufSlab>>,
+    /// The worker's multishot registry, or `None` for a test seam. A multishot
+    /// stream allocates and drains a slot here through [`IoSeam::allocate_multishot_slot`]
+    /// and [`IoSeam::multishot_next`].
+    multishot_slab: Option<NonNull<MultishotSlab>>,
     /// The polling task's captured completion result, when one has arrived.
     wake_slot: Option<WakeSlot>,
     /// Ops submitted through the seam this poll. The runtime folds the count
@@ -172,9 +187,20 @@ impl IoSeam {
             worker_id,
             driver,
             inflight_slab,
+            multishot_slab: None,
             wake_slot,
             submitted: AtomicU16::new(0),
         }
+    }
+
+    /// Attaches the worker's multishot registry to the seam.
+    ///
+    /// The run-loop calls this only on the production path; a test seam keeps
+    /// `None` and a multishot stream resolves as unsupported.
+    #[must_use]
+    pub const fn with_multishot_slab(mut self, slab: Option<NonNull<MultishotSlab>>) -> Self {
+        self.multishot_slab = slab;
+        self
     }
 
     /// Runs `f` with the seam installed for `worker_id`, or returns `None`
@@ -393,6 +419,78 @@ impl IoSeam {
         let slab = unsafe { slab.as_mut() };
         slab.free(key);
     }
+
+    /// Allocates a multishot slot for the polling task, returning its handle.
+    ///
+    /// `owner_token` is the polling task, woken on each completion. The stream
+    /// tags its multishot SQE with the sentinel derived from the returned key,
+    /// drains the slot's FIFO on later polls via [`IoSeam::multishot_next`], and
+    /// hands the key to [`push_multishot_cancel_for_worker`] if it drops before
+    /// the op terminates. Returns `None` when the seam carries no multishot slab
+    /// (a test seam) or the registry is full.
+    pub fn allocate_multishot_slot(&self, owner_token: u64) -> Option<(MultishotSlotKey, u64)> {
+        let mut slab = self.multishot_slab?;
+        // SAFETY: Invariant -- `slab` points at the worker's `multishot_slab`
+        // field, formed by the run-loop via `NonNull::from(&mut ...)` and
+        // disjoint from the driver, task slab, inflight slab, and inboxes the
+        // runtime borrows separately across the poll. The field lives on the
+        // worker, which outlives every poll window it hosts.
+        // Precondition (why this `&mut` is unique for the window): the runtime
+        // polls one task at a time per worker -- `poll_one` is not re-entrant and
+        // `SeamGuard` is not re-entrant, so at most one `IoSeam` is installed per
+        // worker, and `allocate_multishot_slot` / `multishot_next` are the only
+        // paths that form a `&mut MultishotSlab` during a poll, each running to
+        // completion before the next. A nested `block_on` claims a different
+        // worker id with its own slab, so it aliases nothing here.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // aliases this one (double-mutable-aliasing UB); the non-reentrant poll
+        // structure excludes it, and a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let key = slab.allocate(owner_token)?;
+        Some((key, encode_multishot_sentinel(key)))
+    }
+
+    /// Advances `key`'s multishot stream by one completion.
+    ///
+    /// Returns the next queued result, `Pending` while the op is in flight with
+    /// an empty FIFO, or `Ended` once the op posted its terminal CQE and the
+    /// FIFO is drained -- freeing the slot. A seam with no multishot slab yields
+    /// `Ended`.
+    pub const fn multishot_next(&self, key: MultishotSlotKey) -> MultishotNext {
+        let Some(mut slab) = self.multishot_slab else {
+            return MultishotNext::Ended;
+        };
+        // SAFETY: identical contract to `allocate_multishot_slot` -- the sole
+        // `&mut MultishotSlab` for the non-reentrant poll window, over the
+        // worker's live `multishot_slab` field reached via `with_current`, each
+        // slab-forming path running to completion before the next.
+        let slab = unsafe { slab.as_mut() };
+        if let Some(result) = slab.pop(key) {
+            return MultishotNext::Item(result);
+        }
+        if slab.is_terminated(key) {
+            slab.free(key);
+            return MultishotNext::Ended;
+        }
+        MultishotNext::Pending
+    }
+
+    /// Frees `key`'s multishot slot without draining it.
+    ///
+    /// The stream calls this only when a submit fails right after an allocate,
+    /// so the slot carries no in-flight op. A stale key is a no-op; a seam with
+    /// no multishot slab is a no-op.
+    pub const fn multishot_free(&self, key: MultishotSlotKey) {
+        let Some(mut slab) = self.multishot_slab else {
+            return;
+        };
+        // SAFETY: identical contract to `allocate_multishot_slot` -- the sole
+        // `&mut MultishotSlab` for the non-reentrant poll window, over the
+        // worker's live `multishot_slab` field reached via `with_current`.
+        let slab = unsafe { slab.as_mut() };
+        slab.free(key);
+    }
 }
 
 /// RAII bracket that installs a seam for one poll window and clears it on
@@ -450,7 +548,9 @@ pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIG
 /// permanently.
 pub struct CancelInbox<const N: usize> {
     /// Pending cancels, oldest at `head`. `InflightSlotKey` is `Copy`, so a
-    /// dropped entry leaks only the cancel request, never owned storage.
+    /// dropped entry leaks only the cancel request, never owned storage. A
+    /// multishot cancel rides the same key with its `op_token` set to the
+    /// multishot sentinel, which the drain routes to the multishot registry.
     slots: [Option<InflightSlotKey>; N],
     head: usize,
     tail: usize,
@@ -599,6 +699,23 @@ pub fn push_cancel_for_worker(key: InflightSlotKey) {
     inbox.push_cancel(key);
 }
 
+/// Queues a cancel for a dropped multishot stream's op on its worker.
+///
+/// The stream's `Drop` calls this. Like a buffered future, a live multishot op
+/// is `io_bound`, so the drop runs on the owning worker thread and the push is
+/// single-writer. The multishot slot rides an [`InflightSlotKey`] whose
+/// `op_token` is the multishot sentinel; the worker's cancel drain routes it to
+/// the multishot registry. A no-op when no inbox is installed (a bounded leak at
+/// worker teardown, reclaimed by the op's terminal completion).
+pub fn push_multishot_cancel_for_worker(key: MultishotSlotKey) {
+    push_cancel_for_worker(InflightSlotKey {
+        slot: key.slot,
+        generation: key.generation,
+        worker_id: key.worker_id,
+        op_token: encode_multishot_sentinel(key),
+    });
+}
+
 /// `user_data` marker for a buffered-op cancel completion.
 ///
 /// Tags every cancel SQE the worker's cancel-drain submits so the completion
@@ -654,7 +771,7 @@ pub const fn is_cancel_sentinel(user_data: u64) -> bool {
 /// `user_data` marker base for a multishot completion.
 ///
 /// A multishot op posts many CQEs sharing one `user_data`, so its completions
-/// route to the [`MultishotSlab`](crate::buffer::multishot::MultishotSlab)
+/// route to the [`MultishotSlab`]
 /// rather than the per-task wake slot. The upper 32 bits read `0xFFFF_FFFE`:
 /// the arena tag bit, worker id 127, and generation `MAX - 1`, one corner below
 /// the cancel base. That keeps the three completion sentinels disjoint -- the
@@ -666,10 +783,6 @@ pub const fn is_cancel_sentinel(user_data: u64) -> bool {
 const MULTISHOT_TOKEN_BASE: u64 = 0xFFFF_FFFE_0000_0000;
 
 /// Encodes the multishot-completion `user_data` for `key`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pending multishot drain wire-up")
-)]
 pub(crate) const fn encode_multishot_sentinel(key: MultishotSlotKey) -> u64 {
     MULTISHOT_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
 }
@@ -677,7 +790,7 @@ pub(crate) const fn encode_multishot_sentinel(key: MultishotSlotKey) -> u64 {
 /// Whether `user_data` is a multishot-completion sentinel.
 ///
 /// The completion drain calls this to route the CQE into the
-/// [`MultishotSlab`](crate::buffer::multishot::MultishotSlab). The marker shares
+/// [`MultishotSlab`]. The marker shares
 /// the upper-32 isolation mask with the cancel sentinel but sits one corner
 /// below it, so no wake-value guard is needed: `u64::MAX` reads upper-32
 /// `0xFFFF_FFFF`, already excluded.
@@ -686,21 +799,67 @@ pub const fn is_multishot_sentinel(user_data: u64) -> bool {
 }
 
 /// The slot index a multishot sentinel names.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pending multishot drain wire-up")
-)]
 pub(crate) const fn multishot_sentinel_slot(user_data: u64) -> u16 {
     (user_data & 0xFFFF) as u16
 }
 
 /// The low 16 generation bits a multishot sentinel carries.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "pending multishot drain wire-up")
-)]
 pub(crate) const fn multishot_sentinel_generation(user_data: u64) -> u16 {
     ((user_data >> 16) & 0xFFFF) as u16
+}
+
+/// Routes a multishot op's completion CQE into the worker's registry.
+///
+/// The completion drain calls this on a CQE whose `user_data` is a multishot
+/// sentinel (see [`is_multishot_sentinel`]). It queues the result for the owning
+/// stream and returns the owner task token to wake, or `None` when there is
+/// nothing to wake: the slot is stale, the FIFO overflowed, or the stream
+/// already dropped -- a cancel-pending slot, whose intermediate results are
+/// discarded and whose terminal CQE frees the slot here.
+///
+/// A discarded nonnegative accept result is a kernel-created fd; it is closed
+/// here so a dropped or overflowed stream does not leak the descriptor.
+pub fn push_multishot_completion(
+    slab: &mut MultishotSlab,
+    user_data: u64,
+    result: i32,
+    flags: CqeFlags,
+) -> Option<u64> {
+    let slot = multishot_sentinel_slot(user_data);
+    let generation = multishot_sentinel_generation(user_data);
+    let is_more = flags.contains(CqeFlags::MORE);
+    if slab.is_cancel_pending(slot, generation) {
+        // The owning stream dropped. Each intermediate CQE (`MORE` set) carries
+        // an accepted fd it will never take, so close it; the terminal CQE (the
+        // op's `-ECANCELED`, or the cancel op's own status) carries no
+        // descriptor and frees the slot.
+        if is_more {
+            dispose_accept_result(result);
+        } else {
+            slab.free_by_slot(slot, generation);
+        }
+        return None;
+    }
+    let owner = slab.owner(slot, generation);
+    match slab.push(slot, generation, result, is_more) {
+        MultishotPush::Queued => owner,
+        MultishotPush::Overflowed | MultishotPush::Stale => {
+            // Only an intermediate CQE carries a descriptor; a terminal status
+            // is not an fd.
+            if is_more {
+                dispose_accept_result(result);
+            }
+            None
+        }
+    }
+}
+
+/// Closes a nonnegative accept result the owning stream will never observe.
+///
+/// A negative result is an `-errno`, not a descriptor; [`adopt_accepted_fd`]
+/// returns `None` and the drop is a no-op.
+fn dispose_accept_result(result: i32) {
+    drop(adopt_accepted_fd(result));
 }
 
 /// Submits a cancel for a dropped buffered future's in-flight op and marks its
@@ -725,6 +884,51 @@ pub fn submit_cancel(driver: &DriverType, slab: &mut InflightBufSlab, key: Infli
     // cancel leaves the slot retire-pending as a bounded leak reclaimed at
     // worker teardown, never a use-after-free.
     let _ = driver.submit_internal(request);
+}
+
+/// Submits a cancel for a dropped multishot stream's op and marks its slot
+/// cancel-pending.
+///
+/// Called by the cancel drain for a queued cancel whose `op_token` is a
+/// multishot sentinel. It marks the registry slot cancel-pending, then submits
+/// an `ASYNC_CANCEL` targeting the multishot op by its sentinel `user_data`. The
+/// op's terminal completion (its `-ECANCELED`, or the cancel op's own status)
+/// frees the slot through [`push_multishot_completion`]; intermediate accepts a
+/// dropped stream will not take are closed there, so no descriptor leaks.
+pub fn submit_multishot_cancel(
+    driver: &DriverType,
+    slab: &mut MultishotSlab,
+    key: InflightSlotKey,
+) {
+    let slot = MultishotSlotKey {
+        slot: key.slot,
+        generation: key.generation,
+        worker_id: key.worker_id,
+    };
+    slab.mark_cancel_pending(slot);
+    let request =
+        IoRequest::<()>::cancel(SubmitToken::new(key.op_token)).with_user_data(key.op_token);
+    // IGNORE: submit_internal is best-effort; a refused cancel leaves the slot
+    // cancel-pending, and the op's own completions still drive the free, so this
+    // is a bounded hurry-up, never a leak or a use-after-free.
+    let _ = driver.submit_internal(request);
+}
+
+/// Routes a queued cancel to the registry that owns its slot.
+///
+/// A cancel whose `op_token` is a multishot sentinel targets the multishot
+/// registry; every other cancel is a buffered op's in-flight slot.
+pub fn submit_cancel_for(
+    driver: &DriverType,
+    inflight: &mut InflightBufSlab,
+    multishot: &mut MultishotSlab,
+    key: InflightSlotKey,
+) {
+    if is_multishot_sentinel(key.op_token) {
+        submit_multishot_cancel(driver, multishot, key);
+    } else {
+        submit_cancel(driver, inflight, key);
+    }
 }
 
 /// Reclaims the retire-pending slot whose op matches `op_token`, if any.
@@ -1279,6 +1483,200 @@ mod tests {
         assert!(
             slab.is_retire_pending(key.slot),
             "the slot is marked retire-pending even when the backend refuses the cancel",
+        );
+    }
+
+    #[test]
+    fn multishot_seam_allocates_and_decodes_sentinel() {
+        let mut slab = MultishotSlab::new(21, 4);
+        let seam =
+            IoSeam::new(21, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
+        let Some((key, sentinel)) = seam.allocate_multishot_slot(0xABCD) else {
+            panic!("a seam carrying a multishot slab allocates a slot");
+        };
+        assert_eq!(key.worker_id, 21);
+        assert!(
+            is_multishot_sentinel(sentinel),
+            "the SQE user_data is a multishot sentinel",
+        );
+        assert_eq!(
+            multishot_sentinel_slot(sentinel),
+            key.slot,
+            "the sentinel names the allocated slot",
+        );
+        assert_eq!(
+            multishot_sentinel_generation(sentinel),
+            (key.generation & 0xFFFF) as u16,
+            "the sentinel carries the slot generation",
+        );
+    }
+
+    #[test]
+    fn multishot_seam_next_is_pending_while_armed() {
+        let mut slab = MultishotSlab::new(22, 4);
+        let seam =
+            IoSeam::new(22, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
+        let Some((key, _)) = seam.allocate_multishot_slot(0x9) else {
+            panic!("a seam carrying a multishot slab allocates a slot");
+        };
+        assert_eq!(
+            seam.multishot_next(key),
+            MultishotNext::Pending,
+            "a freshly armed slot with an empty FIFO polls Pending",
+        );
+    }
+
+    #[test]
+    fn multishot_seam_drains_then_ends_and_frees() {
+        // Queue a terminal completion before the seam forms its pointer, so the
+        // only slab reference the seam holds is the last-derived one.
+        let mut slab = MultishotSlab::new(24, 4);
+        let Some(key) = slab.allocate(0x5) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        slab.push(key.slot, gen_low16, 7, false);
+        let seam =
+            IoSeam::new(24, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
+        assert_eq!(
+            seam.multishot_next(key),
+            MultishotNext::Item(7),
+            "the queued result drains first",
+        );
+        assert_eq!(
+            seam.multishot_next(key),
+            MultishotNext::Ended,
+            "an empty terminated FIFO ends the stream",
+        );
+        let Some((reused, _)) = seam.allocate_multishot_slot(0x5) else {
+            panic!("ending the stream freed the slot for reuse");
+        };
+        assert_eq!(reused.slot, key.slot);
+        assert_eq!(
+            reused.generation,
+            key.generation + 1,
+            "the freed slot is reused with a bumped generation",
+        );
+    }
+
+    #[test]
+    fn multishot_seam_free_returns_the_slot() {
+        let mut slab = MultishotSlab::new(25, 4);
+        let seam =
+            IoSeam::new(25, None, None, None).with_multishot_slab(Some(NonNull::from(&mut slab)));
+        let Some((key, _)) = seam.allocate_multishot_slot(0) else {
+            panic!("a seam carrying a multishot slab allocates a slot");
+        };
+        seam.multishot_free(key);
+        let Some((reused, _)) = seam.allocate_multishot_slot(0) else {
+            panic!("freeing the slot returns it for reuse");
+        };
+        assert_eq!(reused.slot, key.slot);
+        assert_eq!(
+            reused.generation,
+            key.generation + 1,
+            "free bumps the generation so a stale handle is rejected",
+        );
+    }
+
+    #[test]
+    fn multishot_seam_needs_a_slab() {
+        let seam = IoSeam::new(31, None, None, None);
+        assert!(
+            seam.allocate_multishot_slot(0).is_none(),
+            "a seam with no multishot slab cannot allocate",
+        );
+        let key = MultishotSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 31,
+        };
+        assert_eq!(
+            seam.multishot_next(key),
+            MultishotNext::Ended,
+            "a seam with no multishot slab resolves the stream as ended",
+        );
+        // free with no slab is a no-op, never a panic.
+        seam.multishot_free(key);
+    }
+
+    #[test]
+    fn multishot_completion_queues_and_wakes_owner() {
+        let mut slab = MultishotSlab::new(15, 4);
+        let Some(key) = slab.allocate(0xF00D) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_multishot_sentinel(key);
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, 9, CqeFlags::MORE),
+            Some(0xF00D),
+            "a queued completion returns the owning task to wake",
+        );
+        assert_eq!(slab.pop(key), Some(9), "the result reached the FIFO");
+    }
+
+    #[test]
+    fn multishot_completion_cancel_pending_frees_on_terminal() {
+        let mut slab = MultishotSlab::new(16, 4);
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        slab.mark_cancel_pending(key);
+        let sentinel = encode_multishot_sentinel(key);
+        // An intermediate CQE for a dropped stream wakes nothing; a negative
+        // result carries no fd, so the dispose path closes nothing.
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -22, CqeFlags::MORE),
+            None,
+            "a cancel-pending slot wakes no owner",
+        );
+        assert!(
+            slab.is_live(key),
+            "the slot survives until its terminal CQE"
+        );
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -125, CqeFlags::EMPTY),
+            None,
+            "the terminal CQE wakes no owner",
+        );
+        assert!(
+            !slab.is_live(key),
+            "the terminal CQE frees the cancel-pending slot",
+        );
+    }
+
+    #[test]
+    fn multishot_completion_stale_sentinel_wakes_nothing() {
+        let mut slab = MultishotSlab::new(17, 4);
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_multishot_sentinel(key);
+        slab.free(key);
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -22, CqeFlags::MORE),
+            None,
+            "a sentinel naming a freed slot routes to nothing",
+        );
+    }
+
+    #[test]
+    fn multishot_completion_overflow_wakes_nothing() {
+        use crate::buffer::multishot::MULTISHOT_FIFO_DEPTH;
+
+        let mut slab = MultishotSlab::new(18, 4);
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_multishot_sentinel(key);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        for value in 0..i32::from(MULTISHOT_FIFO_DEPTH) {
+            slab.push(key.slot, gen_low16, value, true);
+        }
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -22, CqeFlags::MORE),
+            None,
+            "an overflowing completion routes to nothing",
         );
     }
 }
