@@ -648,6 +648,80 @@ impl<const N: usize> Default for CancelInbox<N> {
     }
 }
 
+/// Per-worker capacity for pending single-shot accept cancels.
+///
+/// Holds a token from a dropped `accept()` between its cancel submission and the
+/// op's completion. The window is short (usually one drain), so a small ring
+/// suffices; a full ring drops the record, a bounded leak of one descriptor.
+pub const ACCEPT_CANCEL_CAPACITY: usize = 32;
+
+/// [`InflightSlotKey`] `slot` marker for a slotless single-shot accept cancel.
+///
+/// A single-shot accept carries no inflight slab slot -- it submits under the
+/// polling task's token. This reserved slot routes its cancel to
+/// [`submit_accept_cancel`] rather than the buffered-op path; no real slab slot
+/// reaches `u16::MAX` (the inflight cap is far smaller).
+const ACCEPT_CANCEL_SLOT: u16 = u16::MAX;
+
+/// Per-worker set of dropped single-shot accepts awaiting their completion.
+///
+/// A dropped `accept()` cancels its op and records the op's token here; the
+/// completion drain closes the accepted fd if the op still produced one, rather
+/// than orphaning it in the task wake slot.
+pub struct AcceptCancelSet<const N: usize> {
+    /// Pending tokens packed in `[0, len)`; order does not matter.
+    tokens: [u64; N],
+    /// Count of pending tokens.
+    len: usize,
+}
+
+impl<const N: usize> AcceptCancelSet<N> {
+    /// Creates an empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            tokens: [0; N],
+            len: 0,
+        }
+    }
+
+    /// Records `token` as a cancelled accept awaiting disposal.
+    ///
+    /// A full set drops the record: the op's fd is a bounded leak, never
+    /// corruption, and the caller does not retry.
+    pub(crate) const fn insert(&mut self, token: u64) {
+        if self.len < N {
+            self.tokens[self.len] = token;
+            self.len += 1;
+        }
+    }
+
+    /// Removes `token` if pending, reporting whether it was.
+    pub(crate) const fn take(&mut self, token: u64) -> bool {
+        let mut index = 0;
+        while index < self.len {
+            if self.tokens[index] == token {
+                self.tokens[index] = self.tokens[self.len - 1];
+                self.len -= 1;
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// `true` when no cancelled accept is pending.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const N: usize> Default for AcceptCancelSet<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
 const CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
 
@@ -726,6 +800,22 @@ pub fn push_cancel_for_worker(key: InflightSlotKey) {
     // excludes it. A dangling pointer cannot arise -- LIFO drop order excludes it.
     let inbox = unsafe { &mut *inbox };
     inbox.push_cancel(key);
+}
+
+/// Queues a cancel for a dropped single-shot accept on its worker.
+///
+/// The accept op carries the polling task's `token` as its `user_data` and holds
+/// no inflight slab slot, so the queued key uses the `ACCEPT_CANCEL_SLOT`
+/// marker; the drain routes it to [`submit_accept_cancel`]. Submitting the accept
+/// set the task `io_bound`, so its `Drop` runs on the owning worker and the push
+/// is single-writer, the same contract [`push_cancel_for_worker`] holds.
+pub fn push_accept_cancel_for_worker(worker_id: u8, token: u64) {
+    push_cancel_for_worker(InflightSlotKey {
+        slot: ACCEPT_CANCEL_SLOT,
+        generation: 0,
+        worker_id,
+        op_token: token,
+    });
 }
 
 /// Queues a cancel for a dropped multishot stream's op on its worker.
@@ -910,6 +1000,25 @@ fn dispose_accept_result(result: i32) {
     drop(adopt_accepted_fd(result));
 }
 
+/// Disposes the descriptor from a cancelled single-shot accept's completion.
+///
+/// The completion drain calls this on every task-token CQE. When `token` names a
+/// dropped accept recorded by [`submit_accept_cancel`], the op still produced a
+/// descriptor the caller will never take, so it is closed here (a negative
+/// result is an `-errno`, not an fd) and the CQE is consumed. Returns whether it
+/// handled the CQE; the common empty-set case is an `O(1)` miss.
+pub fn dispose_cancelled_accept<const N: usize>(
+    accepts: &mut AcceptCancelSet<N>,
+    token: u64,
+    result: i32,
+) -> bool {
+    if accepts.is_empty() || !accepts.take(token) {
+        return false;
+    }
+    dispose_accept_result(result);
+    true
+}
+
 /// Submits a cancel for a dropped buffered future's in-flight op and marks its
 /// slot retire-pending.
 ///
@@ -969,18 +1078,43 @@ pub fn submit_multishot_cancel(
     let _ = driver.submit_internal(request);
 }
 
-/// Routes a queued cancel to the registry that owns its slot.
+/// Submits a cancel for a dropped single-shot accept.
+///
+/// The accept op holds no slab slot, so this only submits an `ASYNC_CANCEL`
+/// targeting the op by its `user_data` token and records the token in `accepts`.
+/// A completion arriving after the cancel disposes the accepted fd through
+/// [`dispose_cancelled_accept`] rather than orphaning it in the wake slot; the
+/// cancel's own CQE decodes to a slot no registry owns, so
+/// [`reclaim_cancel_completion`] treats it as a no-op.
+pub fn submit_accept_cancel<const N: usize>(
+    driver: &DriverType,
+    accepts: &mut AcceptCancelSet<N>,
+    key: InflightSlotKey,
+) {
+    accepts.insert(key.op_token);
+    let request = IoRequest::<()>::cancel(SubmitToken::new(key.op_token))
+        .with_user_data(encode_cancel_sentinel(key));
+    // IGNORE: submit_internal is best-effort; a refused cancel leaves the accept
+    // running, and its completion still routes through dispose_cancelled_accept.
+    let _ = driver.submit_internal(request);
+}
+
+/// Routes a queued cancel to the mechanism that owns its op.
 ///
 /// A cancel whose `op_token` is a multishot sentinel targets the multishot
-/// registry; every other cancel is a buffered op's in-flight slot.
-pub fn submit_cancel_for(
+/// registry; the `ACCEPT_CANCEL_SLOT` marker targets a slotless single-shot
+/// accept; every other cancel is a buffered op's in-flight slot.
+pub fn submit_cancel_for<const N: usize>(
     driver: &DriverType,
     inflight: &mut InflightBufSlab,
     multishot: &mut MultishotSlab,
+    accepts: &mut AcceptCancelSet<N>,
     key: InflightSlotKey,
 ) {
     if is_multishot_sentinel(key.op_token) {
         submit_multishot_cancel(driver, multishot, key);
+    } else if key.slot == ACCEPT_CANCEL_SLOT {
+        submit_accept_cancel(driver, accepts, key);
     } else {
         submit_cancel(driver, inflight, key);
     }
@@ -1885,5 +2019,108 @@ mod tests {
         // none; a probe of a closed fd reports `EBADF`, which is the assertion.
         let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
         assert!(!still_open, "the cancel closed the queued accepted fd");
+    }
+
+    #[test]
+    fn accept_cancel_set_tracks_tokens() {
+        let mut set = AcceptCancelSet::<4>::new();
+        assert!(set.is_empty());
+        set.insert(0xAA);
+        set.insert(0xBB);
+        assert!(!set.is_empty());
+        assert!(set.take(0xAA), "a recorded token is pending");
+        assert!(!set.take(0xAA), "a taken token is no longer pending");
+        assert!(set.take(0xBB));
+        assert!(set.is_empty());
+    }
+
+    #[test]
+    fn accept_cancel_set_full_drops_the_record() {
+        let mut set = AcceptCancelSet::<2>::new();
+        set.insert(1);
+        set.insert(2);
+        set.insert(3);
+        assert!(set.take(1));
+        assert!(set.take(2));
+        assert!(!set.take(3), "a full set drops the overflow record");
+    }
+
+    #[test]
+    fn push_accept_cancel_carries_the_slotless_marker() {
+        let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
+        {
+            let _guard = CancelInboxGuard::install(9, &mut inbox);
+            push_accept_cancel_for_worker(9, 0xABCD);
+        }
+        let Some(key) = inbox.pop() else {
+            panic!("the accept cancel reached the inbox");
+        };
+        assert_eq!(
+            key.slot, ACCEPT_CANCEL_SLOT,
+            "the slotless marker rides along"
+        );
+        assert_eq!(key.op_token, 0xABCD);
+        assert_eq!(key.worker_id, 9);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn submit_cancel_for_routes_the_accept_marker() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut inflight) = InflightBufSlab::new(7, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let mut multishot = MultishotSlab::new(7, 4);
+        let mut accepts = AcceptCancelSet::<4>::new();
+        let key = InflightSlotKey {
+            slot: ACCEPT_CANCEL_SLOT,
+            generation: 0,
+            worker_id: 7,
+            op_token: 0xF00D,
+        };
+        submit_cancel_for(&driver, &mut inflight, &mut multishot, &mut accepts, key);
+        assert!(
+            accepts.take(0xF00D),
+            "the accept marker routes the token into the accept set",
+        );
+    }
+
+    #[test]
+    fn dispose_cancelled_accept_consumes_recorded_tokens() {
+        let mut accepts = AcceptCancelSet::<4>::new();
+        assert!(
+            !dispose_cancelled_accept(&mut accepts, 0x1, -22),
+            "an empty set disposes nothing",
+        );
+        accepts.insert(0x1);
+        assert!(
+            dispose_cancelled_accept(&mut accepts, 0x1, -22),
+            "a recorded token is consumed (a negative result closes no fd)",
+        );
+        assert!(
+            !dispose_cancelled_accept(&mut accepts, 0x1, -22),
+            "the token is gone after disposal",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(not(miri))]
+    #[test]
+    fn dispose_cancelled_accept_closes_a_real_fd() {
+        use std::os::fd::IntoRawFd;
+
+        let mut accepts = AcceptCancelSet::<4>::new();
+        let Ok(listener) = std::net::TcpListener::bind("127.0.0.1:0") else {
+            panic!("binding a loopback listener must succeed");
+        };
+        let fd = listener.into_raw_fd();
+        accepts.insert(0x7);
+        assert!(dispose_cancelled_accept(&mut accepts, 0x7, fd));
+        // SAFETY: Invariant -- `fd` was owned via `into_raw_fd` and just disposed
+        // above, so no live handle aliases it. Precondition -- this is a
+        // non-destructive `F_GETFD` probe, closing nothing. Failure mode -- none;
+        // a probe of a closed fd reports `EBADF`, which is the assertion.
+        let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
+        assert!(!still_open, "the disposal closed the accepted fd");
     }
 }
