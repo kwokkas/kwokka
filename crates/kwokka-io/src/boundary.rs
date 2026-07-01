@@ -343,6 +343,37 @@ impl IoSeam {
         Some(result)
     }
 
+    /// Submits a single-shot provided-buffer recv on `fd` for the polling task.
+    ///
+    /// The kernel selects a buffer from the driver's registered `buf_ring`
+    /// group; the completion carries the chosen buffer id, read later via
+    /// [`completion_result`](Self::completion_result). Returns `None` when the
+    /// seam carries no driver, and `Some(SubmitResult::Unsupported)` when the
+    /// backend registered no provided-buffer group -- the caller then takes the
+    /// inline-buffer recv path (fallback parity). A successful submit raises the
+    /// per-poll count the runtime folds onto the task's in-flight accounting.
+    pub fn submit_provided_recv(&self, fd: i32) -> Option<SubmitResult> {
+        let driver = self.driver?;
+        // SAFETY: Invariant -- `driver` points at the worker's live driver, a
+        // field disjoint from the task storage the runtime borrows across the
+        // poll; both `provided_recv_group` and `submit_internal` take `&self`,
+        // so this shared reborrow aliases nothing mutably.
+        // Precondition: reached only via `with_current` during a poll on this
+        // worker; the installing runtime keeps the referent live for the poll
+        // window and the `SeamGuard` bracket clears the seam first.
+        // Failure mode: a read after the guard dropped would deref a dangling
+        // driver pointer; the bracket excludes it.
+        let driver = unsafe { driver.as_ref() };
+        let Some(group) = driver.provided_recv_group() else {
+            return Some(SubmitResult::Unsupported);
+        };
+        let result = driver.submit_internal(IoRequest::recv_provided(fd, group));
+        if matches!(result, SubmitResult::Submitted(_)) {
+            self.submitted.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
     /// Allocates an in-flight buffer slot for a buffered op on the polling task.
     ///
     /// Returns the slot handle paired with a writable pointer to its

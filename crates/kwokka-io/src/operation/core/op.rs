@@ -7,7 +7,7 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum OpCode {
-    // Group A - hot path (8)
+    // Group A - hot path (9)
     /// Read from a file descriptor.
     Read,
     /// Write to a file descriptor.
@@ -16,6 +16,8 @@ pub enum OpCode {
     Send,
     /// Receive data on a socket.
     Recv,
+    /// Receive into a kernel-selected provided buffer (`buf_ring`).
+    RecvProvided,
     /// Send a message with ancillary data.
     Sendmsg,
     /// Receive a message with ancillary data.
@@ -77,11 +79,13 @@ pub enum OpCode {
 /// - `zero_copy`: set for `Send` ops when a registered buffer and capability `send_zc` are present
 /// - `multishot`: determined by builder method name (`accept_multishot()` / `recv_multishot()`)
 /// - `vectored`: set in `readv` / `writev` dedicated builders only
+/// - `buffer_select`: set by `recv_provided()` (`IOSQE_BUFFER_SELECT`)
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "five independent op-variant flags; each maps to a distinct SQE modifier with no natural grouping"
+    reason = "six independent op-variant flags; each maps to a distinct SQE modifier with no natural grouping"
 )]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+#[non_exhaustive]
 pub struct OpFlags {
     /// Use the registered-buffer variant (`_FIXED`).
     pub fixed_buf: bool,
@@ -93,6 +97,8 @@ pub struct OpFlags {
     pub multishot: bool,
     /// Use the vectored variant (`readv` / `writev`).
     pub vectored: bool,
+    /// Use kernel-selected provided buffers (`IOSQE_BUFFER_SELECT`).
+    pub buffer_select: bool,
 }
 
 impl OpFlags {
@@ -105,6 +111,7 @@ impl OpFlags {
             zero_copy: false,
             multishot: false,
             vectored: false,
+            buffer_select: false,
         }
     }
 
@@ -167,6 +174,14 @@ impl OpFlags {
             ..self
         }
     }
+
+    #[must_use]
+    pub(crate) const fn with_buffer_select(self, v: bool) -> Self {
+        Self {
+            buffer_select: v,
+            ..self
+        }
+    }
 }
 
 #[cfg(test)]
@@ -181,6 +196,7 @@ mod tests {
         assert!(!flags.zero_copy);
         assert!(!flags.multishot);
         assert!(!flags.vectored);
+        assert!(!flags.buffer_select);
     }
 
     #[test]
@@ -207,18 +223,20 @@ mod tests {
     }
 
     #[test]
-    fn op_flags_all_five_flags_independent() {
+    fn op_flags_all_six_flags_independent() {
         let flags = OpFlags::new()
             .with_fixed_buf(true)
             .with_fixed_fd(true)
             .with_zero_copy(true)
             .with_multishot(true)
-            .with_vectored(true);
+            .with_vectored(true)
+            .with_buffer_select(true);
         assert!(flags.fixed_buf);
         assert!(flags.fixed_fd);
         assert!(flags.zero_copy);
         assert!(flags.multishot);
         assert!(flags.vectored);
+        assert!(flags.buffer_select);
     }
 
     #[test]
@@ -229,18 +247,19 @@ mod tests {
     }
 
     #[test]
-    fn op_code_group_a_has_eight_variants() {
+    fn op_code_group_a_has_nine_variants() {
         let variants = [
             OpCode::Read,
             OpCode::Write,
             OpCode::Send,
             OpCode::Recv,
+            OpCode::RecvProvided,
             OpCode::Sendmsg,
             OpCode::Recvmsg,
             OpCode::Accept,
             OpCode::Connect,
         ];
-        assert_eq!(variants.len(), 8);
+        assert_eq!(variants.len(), 9);
     }
 
     #[test]

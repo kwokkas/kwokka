@@ -473,6 +473,10 @@ impl IoDriver for UringDriver {
         self.files_mut().release(slot)?;
         Ok(())
     }
+
+    fn provided_recv_group(&self) -> Option<BufGroupId> {
+        self.provided_recv_pool().map(BufRingPool::group_id)
+    }
 }
 
 #[cfg(test)]
@@ -582,5 +586,72 @@ mod tests {
             assert_eq!(pool.entries(), PROVIDED_RECV_RING_ENTRIES);
             assert_eq!(pool.buf_size(), PROVIDED_RECV_BUF_SIZE);
         }
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn provided_recv_delivers_a_buffer_id() {
+        use std::{
+            io::Write,
+            os::{fd::AsRawFd, unix::net::UnixStream},
+        };
+
+        const TOKEN: u64 = 0xB0F1;
+
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        let Some(group) = driver.provided_recv_group() else {
+            // No buf_ring support here; the inline-buffer recv path is the
+            // fallback and there is nothing to probe.
+            return;
+        };
+
+        let Ok((mut writer, reader)) = UnixStream::pair() else {
+            panic!("socketpair creation must succeed");
+        };
+        let payload = b"hello provided buffer";
+        let Ok(written) = writer.write(payload) else {
+            panic!("write to the pair must succeed");
+        };
+        assert_eq!(written, payload.len());
+
+        let request =
+            IoRequest::<()>::recv_provided(reader.as_raw_fd(), group).with_user_data(TOKEN);
+        assert!(matches!(
+            driver.submit_internal(request),
+            SubmitResult::Submitted(_)
+        ));
+
+        // The data is already waiting; a bounded park returns once the recv
+        // completes rather than blocking.
+        let _outcome = driver.park(Some(Duration::from_secs(1)));
+
+        let mut completions = [Completion {
+            token: SubmitToken::new(0),
+            result: 0,
+            flags: crate::operation::CqeFlags::EMPTY,
+            buf_id: None,
+        }; 4];
+        let count = driver.poll_completions(4, &mut completions);
+
+        let Some(cqe) = completions[..count]
+            .iter()
+            .find(|completion| completion.token.user_data() == TOKEN)
+        else {
+            panic!("the provided-recv completion must arrive");
+        };
+        let Ok(expected) = i32::try_from(payload.len()) else {
+            panic!("payload length fits i32");
+        };
+        // len=0 fills the kernel-selected buffer up to the payload size.
+        assert_eq!(cqe.result, expected);
+        assert!(
+            cqe.buf_id.is_some(),
+            "the kernel must report the selected buffer id"
+        );
     }
 }

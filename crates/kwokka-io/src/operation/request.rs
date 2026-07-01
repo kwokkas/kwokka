@@ -10,6 +10,7 @@
 
 use crate::{
     addr::SockAddr,
+    buffer::slot::BufGroupId,
     operation::{IoBuf, IoBufMut, OpCode, OpFlags, SubmitToken},
 };
 
@@ -34,6 +35,7 @@ pub struct IoRequest<B = ()> {
 
 /// Fields shared across all operation types.
 #[derive(Debug, Clone, Copy, Default)]
+#[non_exhaustive]
 pub struct CommonFields {
     /// Arbitrary `user_data` echoed back in the CQE.
     pub user_data: u64,
@@ -41,6 +43,8 @@ pub struct CommonFields {
     pub registered_buf: Option<u16>,
     /// Registered fd slot index (`OpFlags::fixed_fd` auto-set on assignment).
     pub registered_fd: Option<u32>,
+    /// Provided-buffer group id (`OpFlags::buffer_select` auto-set on assignment).
+    pub buf_group: Option<u16>,
 }
 
 /// Op-specific payload carried by [`IoRequest`].
@@ -233,6 +237,17 @@ impl IoRequest<()> {
     /// Accept connections on `fd`, multishot variant.
     pub fn accept_multishot(fd: i32) -> Self {
         Self::accept(fd).with_multishot()
+    }
+
+    /// Receive on `fd` into a kernel-selected provided buffer from `group`.
+    ///
+    /// Carries no caller buffer -- the kernel picks a buffer from the
+    /// registered `buf_ring` group and echoes the chosen id in the CQE flags.
+    pub fn recv_provided(fd: i32, group: BufGroupId) -> Self {
+        let mut request = Self::build(fd, OpCode::RecvProvided, OpPayload::Fd);
+        request.common.buf_group = Some(group.0);
+        request.flags = request.flags.with_buffer_select(true);
+        request
     }
 
     /// Connect `fd` to `addr`.
