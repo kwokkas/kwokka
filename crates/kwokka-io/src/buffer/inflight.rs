@@ -178,6 +178,32 @@ impl InflightBufSlab {
         }
     }
 
+    /// Frees `slot` when it is retire-pending, occupied, and at the matching
+    /// truncated generation.
+    ///
+    /// Called from the completion drain on a cancel completion that reported
+    /// `-ENOENT`: the target op already completed and posted its one CQE before
+    /// the cancel, so no op-token completion will arrive to free the slot. The
+    /// cancel sentinel carries the slot's low 16 generation bits, matched here
+    /// so a stale cancel completion cannot free a slot the same op token has
+    /// since reused at a later generation.
+    pub(crate) fn free_if_retire_pending(&mut self, slot: u16, generation_low16: u16) {
+        if slot >= self.cap {
+            return;
+        }
+        let (word, bit) = word_bit(slot);
+        let is_occupied = self.occupied[word] & (1u64 << bit) != 0;
+        let is_pending = self.retire_pending[word] & (1u64 << bit) != 0;
+        let matches_generation =
+            self.generation[slot as usize] & 0xFFFF == u64::from(generation_low16);
+        if !is_occupied || !is_pending || !matches_generation {
+            return;
+        }
+        self.occupied[word] &= !(1u64 << bit);
+        self.retire_pending[word] &= !(1u64 << bit);
+        self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
+    }
+
     /// Returns a writable pointer to `key`'s slot, or `None` if stale.
     ///
     /// The pointer is valid for [`INFLIGHT_BUF_STRIDE`] bytes while `self`

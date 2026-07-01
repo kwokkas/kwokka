@@ -21,7 +21,10 @@ use core::{future::Future, ptr::NonNull};
 use kwokka_core::{namespace::Namespace, slab::SlabKey};
 use kwokka_io::{
     IoDriver,
-    boundary::{CancelInboxGuard, is_cancel_sentinel, reclaim_dropped_slot, submit_cancel},
+    boundary::{
+        CancelInboxGuard, is_cancel_sentinel, reclaim_cancel_completion, reclaim_dropped_slot,
+        submit_cancel,
+    },
     operation::Completion,
     wake,
 };
@@ -246,9 +249,11 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             continue;
         }
         if is_cancel_sentinel(user_data) {
-            // The cancel op's own CQE. Best-effort cancel is not a "done"
-            // signal (it may return -EALREADY while the target still runs), so
-            // ignore it; the original op's own completion reclaims the slot.
+            // The cancel op's own CQE. Usually a no-op here: the target op's
+            // completion reclaims the slot. The exception is a -ENOENT result,
+            // meaning the target already completed before the cancel, so no op
+            // completion is coming and this reclaims the slot from the sentinel.
+            reclaim_cancel_completion(&mut shard.inflight_slab, user_data, completion.result);
             continue;
         }
         // The original op's completion is the kernel's done-with-the-bytes
