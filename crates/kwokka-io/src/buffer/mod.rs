@@ -2,6 +2,7 @@
 
 pub mod inflight;
 pub(crate) mod mmap;
+pub mod multishot;
 pub(crate) mod registration;
 pub(crate) mod ring;
 pub(crate) mod slot;
