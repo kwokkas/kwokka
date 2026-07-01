@@ -14,16 +14,18 @@ use crate::{CancelError, operation::SubmitToken};
 
 /// Map a cancel CQE result to [`CancelError`].
 ///
-/// `IORING_OP_ASYNC_CANCEL` returns 0 on success, `-ENOENT` if the
-/// target was not found, `-EALREADY` if already completed.
+/// `IORING_OP_ASYNC_CANCEL` returns 0 on success, `-ENOENT` if the target
+/// was not found, `-EALREADY` if the target is past the cancel point and
+/// will complete shortly.
 pub(crate) const fn map_cancel_result(result: i32) -> Result<(), CancelError> {
     // ABI: errno values per io_uring_prep_cancel.3 and
-    // io_uring_cancelation.7 -- -ENOENT (-2) target not found,
-    // -EALREADY (-114) already in progress / completed.
+    // io_uring_cancelation.7 -- -ENOENT (-2) target not found (may have
+    // already completed), -EALREADY (-114) too late to cancel, the target
+    // is still in flight and its completion is coming.
     match result {
         0 => Ok(()),
         -2 => Err(CancelError::NotFound),
-        -114 => Err(CancelError::AlreadyCompleted),
+        -114 => Err(CancelError::TooLateToCancel),
         _ => Err(CancelError::BestEffortDetach),
     }
 }
@@ -50,9 +52,9 @@ mod tests {
     }
 
     #[test]
-    fn cancel_already_completed() {
+    fn cancel_too_late() {
         let error = map_cancel_result(-114);
-        assert_eq!(error, Err(CancelError::AlreadyCompleted));
+        assert_eq!(error, Err(CancelError::TooLateToCancel));
     }
 
     #[test]
