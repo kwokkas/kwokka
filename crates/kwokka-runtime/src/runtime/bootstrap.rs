@@ -270,17 +270,27 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             // A multishot op's CQE. Route the result into its registry FIFO and
             // wake the owning stream; a stale, overflowed, or cancel-pending slot
             // wakes nothing, and a terminal cancel CQE frees the slot in there.
-            if let Some(owner) = push_multishot_completion(
+            // The terminal CQE also retires the one SQE `poll_one` counted, even
+            // when no wake is returned, so the task's in-flight count settles.
+            let outcome = push_multishot_completion(
                 &mut shard.multishot_slab,
                 user_data,
                 completion.result,
                 completion.flags,
-            ) {
+            );
+            if let Some(owner) = outcome.wake {
                 wake_local(
                     &mut shard.tasks,
                     &mut shard.run_queue,
                     TaskRef::from_raw(owner),
                 );
+            }
+            if let Some(owner) = outcome.retire {
+                let task_ref = TaskRef::from_raw(owner);
+                let key = SlabKey::new(task_ref.index(), task_ref.generation());
+                if let Some(slot) = shard.tasks.get_mut(key) {
+                    slot.header_mut().retire_in_flight_op();
+                }
             }
             continue;
         }

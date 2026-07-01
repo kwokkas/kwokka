@@ -192,6 +192,15 @@ impl TaskHeader {
             buf_id: buf_id.unwrap_or(WakeData::NO_BUF),
             has_result: true,
         };
+        self.retire_in_flight_op();
+    }
+
+    /// Retires one in-flight op, the saturating pair of the post-poll increment.
+    ///
+    /// A buffered op retires through `store_io_result`, which stores its result
+    /// and calls this; a multishot op retires here directly on its terminal CQE,
+    /// which carries no per-task result to store.
+    pub(crate) const fn retire_in_flight_op(&mut self) {
         self.in_flight_ops = self.in_flight_ops.saturating_sub(1);
     }
 
