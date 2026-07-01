@@ -1737,6 +1737,15 @@ mod tests {
             },
             "an overflowing completion routes to nothing",
         );
+        // The terminal CQE retires the owner even when the full FIFO drops it.
+        assert_eq!(
+            push_multishot_completion(&mut slab, sentinel, -104, CqeFlags::EMPTY),
+            MultishotCompletion {
+                wake: None,
+                retire: Some(0x1),
+            },
+            "a terminal CQE still retires the owner when the FIFO is full",
+        );
     }
 
     #[cfg(target_os = "linux")]
