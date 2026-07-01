@@ -2,6 +2,7 @@
 
 use core::{
     future::Future,
+    marker::PhantomData,
     pin::Pin,
     task::{Context, Poll},
 };
@@ -100,11 +101,14 @@ impl Future for AcceptFuture {
 /// `Some(Err(_))` for a per-accept error, or `None` once the op ends. Dropping
 /// the stream cancels the in-flight op.
 #[must_use = "streams do nothing unless polled"]
-pub struct AcceptStream {
+pub struct AcceptStream<'listener> {
     /// Listening socket file descriptor.
     fd: i32,
     /// Where the stream is in its lifecycle.
     state: AcceptState,
+    /// Binds the stream to the listener's lifetime so it cannot outlive the fd
+    /// and observe a closed or reused descriptor.
+    listener: PhantomData<&'listener ()>,
 }
 
 /// The accept stream's progress.
@@ -119,12 +123,13 @@ enum AcceptState {
     Done,
 }
 
-impl AcceptStream {
+impl<'listener> AcceptStream<'listener> {
     /// Builds an accept stream for listening socket `fd`.
     pub(crate) const fn new(fd: i32) -> Self {
         Self {
             fd,
             state: AcceptState::Idle,
+            listener: PhantomData,
         }
     }
 
@@ -132,12 +137,12 @@ impl AcceptStream {
     ///
     /// Written for the ordinary `while let Some(conn) = stream.next().await`
     /// loop.
-    pub const fn next(&mut self) -> AcceptNext<'_> {
+    pub const fn next(&mut self) -> AcceptNext<'_, 'listener> {
         AcceptNext { stream: self }
     }
 }
 
-impl Drop for AcceptStream {
+impl Drop for AcceptStream<'_> {
     fn drop(&mut self) {
         if let AcceptState::Multishot(key) = &self.state {
             // A live multishot op is `io_bound`, so this drop runs on the owning
@@ -149,11 +154,11 @@ impl Drop for AcceptStream {
 
 /// The future returned by [`AcceptStream::next`].
 #[must_use = "futures do nothing unless polled"]
-pub struct AcceptNext<'a> {
-    stream: &'a mut AcceptStream,
+pub struct AcceptNext<'stream, 'listener> {
+    stream: &'stream mut AcceptStream<'listener>,
 }
 
-impl Future for AcceptNext<'_> {
+impl Future for AcceptNext<'_, '_> {
     type Output = Option<io::Result<TcpStream>>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -216,7 +221,7 @@ fn multishot_next(binding: WakerBinding, key: MultishotSlotKey) -> MultishotNext
 /// Drives one single-shot accept, re-arming a fresh one after each item so a
 /// stale completion never repeats.
 fn poll_fallback(
-    stream: &mut AcceptStream,
+    stream: &mut AcceptStream<'_>,
     cx: &mut Context<'_>,
 ) -> Poll<Option<io::Result<TcpStream>>> {
     let AcceptState::Fallback(mut accept) =

@@ -87,7 +87,7 @@ impl TcpListener {
     /// See [`AcceptStream`]: one submitted op yields a completion per incoming
     /// connection on a capable kernel, degrading to single-shot accepts
     /// otherwise. The returned connections are owned by the caller.
-    pub fn accept_multi(&self) -> AcceptStream {
+    pub fn accept_multi(&self) -> AcceptStream<'_> {
         AcceptStream::new(self.as_raw_fd())
     }
 }
