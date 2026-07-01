@@ -73,6 +73,14 @@ impl MmapRegion {
         self.ptr.as_ptr()
     }
 
+    /// Non-null pointer to the start of the region.
+    ///
+    /// The region is page-aligned, so the returned pointer satisfies the
+    /// alignment of any type up to the page size when cast.
+    pub(crate) const fn as_non_null(&self) -> NonNull<u8> {
+        self.ptr
+    }
+
     /// Length in bytes.
     pub(crate) const fn len(&self) -> usize {
         self.len

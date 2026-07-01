@@ -38,6 +38,7 @@ use crate::{
     CancelError, IoDriver, RegisterError,
     buffer::{
         registration::{RegisteredBuffers, RegisteredFds},
+        ring::pool::BufRingPool,
         slot::{BufGroupId, FdSlot},
     },
     capability::CapabilityMatrix,
@@ -58,6 +59,15 @@ use crate::{
 /// 256 x 16B (iovec) = 4 KB per syscall.
 const REGISTER_CHUNK: usize = 256;
 
+/// Provided-buffer ring entries per worker. Power of two; aligned with the
+/// in-flight slab capacity so the two per-worker buffer regions match.
+const PROVIDED_RECV_RING_ENTRIES: u16 = 256;
+/// Per-buffer size in the provided-recv ring, matching the in-flight stride.
+const PROVIDED_RECV_BUF_SIZE: u32 = 4096;
+/// Buffer group id for the per-worker provided-recv ring. One ring per
+/// worker makes a fixed group id unambiguous.
+const PROVIDED_RECV_GROUP_ID: u16 = 0;
+
 /// `io_uring` I/O backend.
 ///
 /// Created via [`UringDriver::new`] which probes the kernel for the best
@@ -74,6 +84,14 @@ pub struct UringDriver {
     wake_buf: UnsafeCell<u64>,
     buffers: UnsafeCell<RegisteredBuffers>,
     files: UnsafeCell<RegisteredFds>,
+    /// Per-worker provided-buffer ring for kernel-selected recv, present
+    /// only when the kernel supports `buf_ring`. Declared after `ring` so
+    /// on drop its mmap regions unmap only after the ring fd closes:
+    /// closing the fd unregisters the buffer ring and aborts in-flight
+    /// recvs referencing the pool storage (`io_uring_register.2`), so no
+    /// op writes into an unmapped page. `get` / `recycle` take `&self`, so
+    /// no `UnsafeCell` is needed.
+    buf_ring_pool: Option<BufRingPool>,
 }
 
 // SAFETY: Invariant -- single-owner, single-thread.
@@ -106,6 +124,14 @@ impl UringDriver {
         )]
         let max_buf_slots = capabilities.max_register_slots as u16;
 
+        // A registration failure degrades to the inline-buffer recv fallback
+        // (fallback parity), so it never fails ring bootstrap.
+        let buf_ring_pool = if capabilities.buf_ring {
+            register_provided_recv_pool(&ring).ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             ring: UnsafeCell::new(ring),
             capabilities,
@@ -114,12 +140,19 @@ impl UringDriver {
             wake_buf: UnsafeCell::new(0),
             buffers: UnsafeCell::new(RegisteredBuffers::new(max_buf_slots)),
             files: UnsafeCell::new(RegisteredFds::new(capabilities.max_register_slots)),
+            buf_ring_pool,
         })
     }
 
     /// Setup tier achieved during ring creation.
     pub(crate) const fn tier(&self) -> SetupTier {
         self.tier
+    }
+
+    /// The provided-buffer recv pool, present only when the kernel supports
+    /// `buf_ring`. `None` selects the inline-buffer recv fallback.
+    pub(crate) const fn provided_recv_pool(&self) -> Option<&BufRingPool> {
+        self.buf_ring_pool.as_ref()
     }
 
     #[allow(
@@ -285,6 +318,33 @@ impl UringDriver {
         let request = IoRequest::read(fd, buf, 0).with_user_data(user_data);
         self.submit_read(request)
     }
+}
+
+/// Register a per-worker provided-buffer ring for kernel-selected recv.
+///
+/// Builds a [`BufRingPool`] -- which owns the ring metadata and buffer
+/// storage -- and registers it with the kernel. Called once at worker
+/// startup when [`CapabilityMatrix::buf_ring`] holds. On failure the pool
+/// drops here, unmapping the never-registered region.
+///
+/// # Errors
+///
+/// Returns [`RegisterError`] if the mmap allocation or the kernel
+/// registration fails.
+fn register_provided_recv_pool(ring: &IoUring) -> Result<BufRingPool, RegisterError> {
+    let pool = BufRingPool::new(
+        PROVIDED_RECV_RING_ENTRIES,
+        PROVIDED_RECV_BUF_SIZE,
+        BufGroupId(PROVIDED_RECV_GROUP_ID),
+    )
+    .map_err(|_| RegisterError::SlotExhausted)?;
+    crate::uring::fixed::register_buf_ring(
+        ring,
+        pool.ring_addr(),
+        pool.entries(),
+        PROVIDED_RECV_GROUP_ID,
+    )?;
+    Ok(pool)
 }
 
 impl IoDriver for UringDriver {
@@ -501,5 +561,26 @@ mod tests {
             outcome.is_err(),
             "a bounded park with nothing pending returns the ETIME timeout",
         );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn pool_tracks_buf_ring_capability() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        // Fallback parity, not an iff: without buf_ring support there is no
+        // pool and recv stays on the inline path; with support, registration
+        // can still fall back to None on failure, so a present pool must be
+        // sized to the configured constants, but presence is not required.
+        let pool = driver.provided_recv_pool();
+        assert!(driver.capabilities().buf_ring || pool.is_none());
+        if let Some(pool) = pool {
+            assert_eq!(pool.entries(), PROVIDED_RECV_RING_ENTRIES);
+            assert_eq!(pool.buf_size(), PROVIDED_RECV_BUF_SIZE);
+        }
     }
 }
