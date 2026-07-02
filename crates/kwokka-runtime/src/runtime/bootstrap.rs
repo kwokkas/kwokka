@@ -454,7 +454,9 @@ impl Runtime<Affine> {
 #[cfg(test)]
 mod tests {
     use kwokka_core::Generation;
-    use kwokka_io::boundary::{is_cancel_sentinel, is_multishot_sentinel};
+    use kwokka_io::boundary::{
+        is_cancel_sentinel, is_multishot_sentinel, is_recv_multishot_sentinel,
+    };
 
     use crate::task::TaskRef;
 
@@ -530,6 +532,44 @@ mod tests {
         let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, below_max);
         assert!(is_multishot_sentinel(corner.raw()));
         assert!(!is_cancel_sentinel(corner.raw()));
+    }
+
+    #[test]
+    fn recv_marker_below_multishot_corner() {
+        // The recv-multishot corner is worker 127 at generation MAX - 2, one
+        // below the multishot corner, so all three markers stay disjoint.
+        let below_multishot = Generation::from_raw(Generation::MAX - 2);
+        let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, below_multishot);
+        assert!(is_recv_multishot_sentinel(corner.raw()));
+        assert!(!is_multishot_sentinel(corner.raw()));
+        assert!(!is_cancel_sentinel(corner.raw()));
+    }
+
+    #[test]
+    fn arena_clears_the_recv_marker() {
+        // No reachable arena TaskRef, including the worker-127 / max-generation
+        // corners the accept-multishot and cancel markers occupy, aliases the
+        // recv-multishot marker.
+        let reachable = [
+            TaskRef::from_arena(0, 0, Generation::ZERO),
+            TaskRef::from_arena(0, u32::MAX, Generation::ZERO),
+            TaskRef::from_arena(5, 0xDEAD_BEEF, Generation::from_raw(1)),
+            TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, Generation::ZERO),
+            TaskRef::from_arena(0, 0, Generation::from_raw(Generation::MAX)),
+            TaskRef::from_arena(
+                TaskRef::WORKER_ID_MAX,
+                7,
+                Generation::from_raw(Generation::MAX),
+            ),
+            TaskRef::from_arena(
+                TaskRef::WORKER_ID_MAX,
+                7,
+                Generation::from_raw(Generation::MAX - 1),
+            ),
+        ];
+        for task in reachable {
+            assert!(!is_recv_multishot_sentinel(task.raw()));
+        }
     }
 
     #[test]

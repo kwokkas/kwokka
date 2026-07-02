@@ -100,6 +100,23 @@ impl MmapRegion {
         // by Drop taking &mut self.
         unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
     }
+
+    /// View the region as a mutable byte slice.
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "slice::from_raw_parts_mut is not const-stable"
+    )]
+    pub(crate) fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: Invariant -- ptr and len were returned by a successful mmap
+        // call requesting PROT_READ | PROT_WRITE, so the region is valid for
+        // reads and writes for its entire length.
+        // Precondition: &mut self is exclusive, so no other Rust reference into
+        // the region is live; the single-writer poll-window discipline at the
+        // slab level keeps this from aliasing a kernel-held buffer.
+        // Failure mode: dangling ptr after munmap causes UB; prevented by Drop
+        // taking &mut self.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
 }
 
 impl Drop for MmapRegion {

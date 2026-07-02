@@ -19,7 +19,6 @@
     clippy::redundant_pub_crate,
     reason = "pub(crate) restricts slab internals inside the now-pub multishot module"
 )]
-#![allow(dead_code, reason = "pending multishot accept wire-up")]
 
 /// Multishot slots per worker, kept small.
 ///
