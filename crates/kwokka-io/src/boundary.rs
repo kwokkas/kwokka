@@ -414,6 +414,51 @@ impl IoSeam {
         Some(result)
     }
 
+    /// Submits a multishot provided-buffer recv on `fd` for the polling task.
+    ///
+    /// `token` must be the recv-multishot sentinel the registry issues for this
+    /// stream, not a bare task token: the completion drain routes a CQE into the
+    /// recv-multishot slab only when its `user_data` is a recv-multishot
+    /// sentinel (see [`is_recv_multishot_sentinel`]), so a task token would
+    /// misroute the stream's completions onto the single-shot wake path. The
+    /// slab allocation that issues the sentinel lands with the drain-wiring
+    /// slice; this entry is the submit half of that pair.
+    ///
+    /// One SQE streams a CQE per received buffer until cancelled; each carries
+    /// the kernel-selected buffer id. The capability is probed up front: a
+    /// backend without multishot recv (a kernel below 6.0) resolves
+    /// `Some(SubmitResult::Unsupported)` synchronously rather than depending on
+    /// the kernel to reject the SQE, and a backend with no registered
+    /// provided-buffer group resolves the same. Either signals the caller to
+    /// degrade to the single-shot provided recv (fallback parity). Returns
+    /// `None` when the seam carries no driver. A successful submit raises the
+    /// per-poll count the runtime folds onto the task's in-flight accounting.
+    pub fn submit_recv_multishot_provided(&self, fd: i32, token: u64) -> Option<SubmitResult> {
+        let driver = self.driver?;
+        // SAFETY: Invariant -- `driver` points at the worker's live driver, a
+        // field disjoint from the task storage the runtime borrows across the
+        // poll; `capabilities`, `provided_recv_group`, and `submit_internal`
+        // all take `&self`, so this shared reborrow aliases nothing mutably.
+        // Precondition: reached only via `with_current` during a poll on this
+        // worker; the installing runtime keeps the referent live for the poll
+        // window and the `SeamGuard` bracket clears the seam first.
+        // Failure mode: a read after the guard dropped would deref a dangling
+        // driver pointer; the bracket excludes it.
+        let driver = unsafe { driver.as_ref() };
+        if !driver.capabilities().multishot_recv {
+            return Some(SubmitResult::Unsupported);
+        }
+        let Some(group) = driver.provided_recv_group() else {
+            return Some(SubmitResult::Unsupported);
+        };
+        let request = IoRequest::recv_multishot_provided(fd, group).with_user_data(token);
+        let result = driver.submit_internal(request);
+        if matches!(result, SubmitResult::Submitted(_)) {
+            self.submitted.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
     /// Allocates an in-flight buffer slot for a buffered op on the polling task.
     ///
     /// Returns the slot handle paired with a writable pointer to its
@@ -1772,6 +1817,43 @@ mod tests {
             "the ring accepts a timeout op",
         );
         assert_eq!(seam.submitted(), 1, "a submitted op raises the count");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_multishot_submit_gated() {
+        let mut driver = DriverType::Epoll(());
+        let seam = IoSeam::new(204, Some(NonNull::from(&mut driver)), None, None);
+        // Epoll reports no multishot-recv capability, so the submit resolves
+        // Unsupported up front without touching the ring.
+        assert_eq!(
+            seam.submit_recv_multishot_provided(5, 0x1),
+            Some(SubmitResult::Unsupported),
+            "a backend without multishot recv degrades synchronously",
+        );
+        assert_eq!(seam.submitted(), 0, "a gated submit raises no count");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(not(miri))]
+    #[test]
+    fn recv_multishot_submit_reaches_ring() {
+        let Ok(mut driver) = DriverType::for_platform(8) else {
+            panic!("the platform driver must build on this host");
+        };
+        let seam = IoSeam::new(205, Some(NonNull::from(&mut driver)), None, None);
+        // On a 6.0+ kernel with a registered group the submit reaches the ring;
+        // a kernel missing either degrades to Unsupported (fallback parity).
+        let Some(outcome) = seam.submit_recv_multishot_provided(5, 0x1) else {
+            panic!("a seam with a driver must reach the submit path");
+        };
+        assert!(
+            matches!(
+                outcome,
+                SubmitResult::Submitted(_) | SubmitResult::Unsupported
+            ),
+            "the submit either reaches the ring or degrades cleanly",
+        );
     }
 
     fn cancel_key(slot: u16) -> InflightSlotKey {

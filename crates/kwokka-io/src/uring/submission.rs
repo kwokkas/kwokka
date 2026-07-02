@@ -267,6 +267,15 @@ mod tests {
     }
 
     #[test]
+    fn recv_multishot_provided_builds_without_panic() {
+        let request =
+            IoRequest::<()>::recv_multishot_provided(3, crate::buffer::slot::BufGroupId::new(0));
+        assert!(request.flags.multishot);
+        assert!(request.flags.buffer_select);
+        let _entry = build_entry(&request, &mut scratch());
+    }
+
+    #[test]
     fn close_builds_without_panic() {
         let request = IoRequest::<()>::close(5);
         let _entry = build_entry(&request, &mut scratch());
