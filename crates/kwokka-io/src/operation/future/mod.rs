@@ -9,6 +9,7 @@ use std::io;
 use crate::buffer::inflight::INFLIGHT_BUF_STRIDE;
 
 pub(crate) mod file;
+pub(crate) mod provided;
 pub(crate) mod socket;
 
 /// Compile-time guard that a buffered future's `CAP` fits one in-flight slot.

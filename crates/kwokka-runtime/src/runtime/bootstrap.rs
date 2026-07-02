@@ -22,9 +22,9 @@ use kwokka_core::{namespace::Namespace, slab::SlabKey};
 use kwokka_io::{
     IoDriver,
     boundary::{
-        CancelInboxGuard, dispose_cancelled_accept, is_cancel_sentinel, is_multishot_sentinel,
-        push_multishot_completion, reclaim_cancel_completion, reclaim_dropped_slot,
-        submit_cancel_for,
+        CancelInboxGuard, ProvidedPoolGuard, dispose_cancelled_op, is_cancel_sentinel,
+        is_multishot_sentinel, push_multishot_completion, reclaim_cancel_completion,
+        reclaim_dropped_slot, submit_cancel_for,
     },
     operation::Completion,
     wake,
@@ -299,9 +299,17 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
         // signal. If a dropped buffered future owned this op, free its slot now;
         // a live future's slot is not retire-pending, so this is a no-op and it
         // frees through its own harvest path.
-        if dispose_cancelled_accept(&mut shard.accept_cancels, user_data, completion.result) {
-            // A dropped single-shot accept's op completed; its fd was closed
-            // here, so there is nothing to reclaim into a slot or wake.
+        if dispose_cancelled_op(
+            &shard.driver,
+            &mut shard.accept_cancels,
+            &mut shard.provided_recv_cancels,
+            user_data,
+            completion.result,
+            completion.buf_id,
+        ) {
+            // A dropped single-shot accept's or provided recv's op completed;
+            // its fd was closed or its buffer recycled here, so there is
+            // nothing to reclaim into a slot or wake.
             continue;
         }
         reclaim_dropped_slot(&mut shard.inflight_slab, user_data);
@@ -334,6 +342,7 @@ fn drain_cancels(shard: &mut WorkerShard) {
             &mut shard.inflight_slab,
             &mut shard.multishot_slab,
             &mut shard.accept_cancels,
+            &mut shard.provided_recv_cancels,
             key,
         );
     }
@@ -424,6 +433,9 @@ impl Runtime<Affine> {
     pub fn block_on<F: Future>(&mut self, future: F) -> F::Output {
         let worker_id = self.shard.id.raw();
         let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
+        // The pool outlives this run (it is driver-owned); the guard scopes
+        // handle access to the run-loop, clearing the slot on exit.
+        let _pool_guard = ProvidedPoolGuard::install(worker_id, &self.shard.driver);
         let root_key = spawn_root(&mut self.shard, future);
         arm_wake(&self.shard, self.wake_fd);
         loop {

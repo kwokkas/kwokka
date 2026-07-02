@@ -32,7 +32,11 @@ use std::{io, thread};
 
 #[cfg(feature = "steal")]
 use kwokka_core::slab::SlabKey;
-use kwokka_io::{DriverType, boundary::CancelInboxGuard, wake};
+use kwokka_io::{
+    DriverType,
+    boundary::{CancelInboxGuard, ProvidedPoolGuard},
+    wake,
+};
 
 #[cfg(not(feature = "steal"))]
 use crate::worker::park::wake::wake_local;
@@ -219,6 +223,9 @@ fn sibling_main(
     // Declared after `shard` so LIFO drop nulls the cancel static before
     // `shard.tasks` frees buffered futures, whose drops then no-op.
     let _cancel_guard = CancelInboxGuard::install(id.raw(), &mut shard.cancel_inbox);
+    // Same LIFO bracket: the provided-pool static clears before the shard --
+    // and the driver-owned pool -- is reclaimed.
+    let _pool_guard = ProvidedPoolGuard::install(id.raw(), &shard.driver);
     registry::publish_endpoint(id, wake_fd);
     bootstrap::arm_wake(&shard, wake_fd);
     READY.fetch_add(1, Ordering::SeqCst);
@@ -397,6 +404,9 @@ impl Runtime<Stealing> {
     {
         let worker_id = self.shard.id.raw();
         let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
+        // The pool outlives this run (it is driver-owned); the guard scopes
+        // handle access to the run-loop, clearing the slot on exit.
+        let _pool_guard = ProvidedPoolGuard::install(worker_id, &self.shard.driver);
         let root_key = bootstrap::spawn_root(&mut self.shard, future);
         bootstrap::arm_wake(&self.shard, self.wake_fd);
         loop {

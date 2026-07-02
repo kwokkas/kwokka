@@ -20,7 +20,7 @@
 
 use core::{
     ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicU16, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, Ordering},
     task::Waker,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -30,6 +30,7 @@ use crate::{
     buffer::{
         inflight::{InflightBufSlab, InflightSlotKey},
         multishot::{MultishotPush, MultishotSlab, MultishotSlotKey},
+        ring::pool::BufRingPool,
     },
     operation::{CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
@@ -343,7 +344,8 @@ impl IoSeam {
         Some(result)
     }
 
-    /// Submits a single-shot provided-buffer recv on `fd` for the polling task.
+    /// Submits a single-shot provided-buffer recv on `fd` for the polling
+    /// task, addressed by `token` for the `user_data` round trip.
     ///
     /// The kernel selects a buffer from the driver's registered `buf_ring`
     /// group; the completion carries the chosen buffer id, read later via
@@ -352,7 +354,7 @@ impl IoSeam {
     /// backend registered no provided-buffer group -- the caller then takes the
     /// inline-buffer recv path (fallback parity). A successful submit raises the
     /// per-poll count the runtime folds onto the task's in-flight accounting.
-    pub fn submit_provided_recv(&self, fd: i32) -> Option<SubmitResult> {
+    pub fn submit_provided_recv(&self, fd: i32, token: u64) -> Option<SubmitResult> {
         let driver = self.driver?;
         // SAFETY: Invariant -- `driver` points at the worker's live driver, a
         // field disjoint from the task storage the runtime borrows across the
@@ -367,7 +369,8 @@ impl IoSeam {
         let Some(group) = driver.provided_recv_group() else {
             return Some(SubmitResult::Unsupported);
         };
-        let result = driver.submit_internal(IoRequest::recv_provided(fd, group));
+        let request = IoRequest::recv_provided(fd, group).with_user_data(token);
+        let result = driver.submit_internal(request);
         if matches!(result, SubmitResult::Submitted(_)) {
             self.submitted.fetch_add(1, Ordering::Relaxed);
         }
@@ -579,11 +582,17 @@ impl Drop for SeamGuard {
 
 /// Per-worker cancel-inbox capacity.
 ///
-/// Sized to hold one cancel per droppable op across both per-worker registries
-/// -- the buffered-op inflight slab and the multishot slab -- so a worker can
-/// queue a cancel for every occupied slot in the same tick and never drop one.
-/// No op can drop twice before a drain (its slot stays occupied until the drain
-/// reclaims it), so the sum of the two capacities bounds every pending cancel.
+/// Sized to hold one cancel per droppable op across the slab-backed
+/// per-worker registries -- the buffered-op inflight slab and the multishot
+/// slab -- so a worker can queue a cancel for every occupied slot in the same
+/// tick. No slab-backed op can drop twice before a drain (its slot stays
+/// occupied until the drain reclaims it), so the sum of the two capacities
+/// bounds their pending cancels. Slotless ops (dropped accepts and provided
+/// recvs) share this window without a reserved share: the worker shard sits
+/// at its stack-frame budget, and no ring growth can make an op class with no
+/// structural drop bound lossless. Overflow keeps its established meaning --
+/// the cancel record is lost, a bounded leak (a slot held to teardown, a
+/// descriptor, or a pool buffer id), never a free under a live kernel access.
 pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
     + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
 
@@ -753,6 +762,87 @@ impl<const N: usize> Default for AcceptCancelSet<N> {
     }
 }
 
+/// Per-worker capacity for pending provided-recv cancels.
+///
+/// A provided-buffer recv holds no registry slot -- the kernel picks its
+/// buffer at completion time -- so nothing structural bounds how many can be
+/// dropped between drains. This window tracks the first N pending drops;
+/// past it (or past the shared [`CANCEL_INBOX_CAPACITY`] ring feeding it) a
+/// drop's cancel record is lost and the op's buffer id is never recycled, a
+/// bounded loss of pool entries reclaimed only at pool teardown. Sized to the
+/// provided-buffer ring itself -- at most every pool entry can be awaiting
+/// disposal at once -- at 8 bytes per slot on the shard.
+pub const PROVIDED_RECV_CANCEL_CAPACITY: usize =
+    crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize;
+
+/// [`InflightSlotKey`] `slot` marker for a slotless provided-recv cancel.
+///
+/// A provided-buffer recv carries no inflight slab slot -- it submits under
+/// the polling task's token and the kernel owns the buffer choice. This
+/// reserved slot routes its cancel to [`submit_provided_recv_cancel`] rather
+/// than the buffered-op path; it sits one below [`ACCEPT_CANCEL_SLOT`], and no
+/// real slab slot reaches either (the inflight cap is far smaller).
+pub(crate) const PROVIDED_RECV_CANCEL_SLOT: u16 = u16::MAX - 1;
+
+/// Per-worker set of dropped provided-buffer recvs awaiting their completion.
+///
+/// A dropped provided recv cancels its op and records the op's token here; the
+/// completion drain recycles the kernel-selected buffer if the op still
+/// consumed one, rather than orphaning the buffer id in the task wake slot.
+pub struct ProvidedRecvCancelSet<const N: usize> {
+    /// Pending tokens packed in `[0, len)`; order does not matter.
+    tokens: [u64; N],
+    /// Count of pending tokens.
+    len: usize,
+}
+
+impl<const N: usize> ProvidedRecvCancelSet<N> {
+    /// Creates an empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            tokens: [0; N],
+            len: 0,
+        }
+    }
+
+    /// Records `token` as a cancelled provided recv awaiting disposal.
+    ///
+    /// A full set drops the record: the op's buffer id is a bounded pool-entry
+    /// loss, never corruption, and the caller does not retry.
+    pub(crate) const fn insert(&mut self, token: u64) {
+        if self.len < N {
+            self.tokens[self.len] = token;
+            self.len += 1;
+        }
+    }
+
+    /// Removes `token` if pending, reporting whether it was.
+    pub(crate) const fn take(&mut self, token: u64) -> bool {
+        let mut index = 0;
+        while index < self.len {
+            if self.tokens[index] == token {
+                self.tokens[index] = self.tokens[self.len - 1];
+                self.len -= 1;
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// `true` when no cancelled provided recv is pending.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const N: usize> Default for ProvidedRecvCancelSet<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
 const CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
 
@@ -803,6 +893,103 @@ impl Drop for CancelInboxGuard {
     }
 }
 
+/// One provided-pool slot per possible worker id byte, like [`SEAM_SLOTS`].
+const PROVIDED_POOL_SLOTS: usize = u8::MAX as usize + 1;
+
+/// The installed provided-buffer pool for each worker, or null outside a
+/// run-loop, indexed by worker id.
+///
+/// Run-loop scoped like [`CANCEL_INBOXES`], not poll-window scoped: a
+/// `ProvidedBuf` reads its bytes and recycles its buffer id from arbitrary
+/// task code and from a drop in task reap, both outside the poll bracket, yet
+/// always on the owning worker thread. `AtomicPtr<BufRingPool>` is `Sync`
+/// regardless of the pointee, so the array is a sound `static` with no
+/// `unsafe impl`.
+static PROVIDED_POOLS: [AtomicPtr<BufRingPool>; PROVIDED_POOL_SLOTS] =
+    [const { AtomicPtr::new(ptr::null_mut()) }; PROVIDED_POOL_SLOTS];
+
+/// Registration epoch per provided-pool slot, bumped on every
+/// [`ProvidedPoolGuard`] install.
+///
+/// A `ProvidedBuf` captures the epoch at construction and every access
+/// re-checks it, so a handle outliving its run-loop session can never read
+/// through -- or recycle into -- a pool a later registration installed in the
+/// same slot (a rebuilt runtime re-claiming the worker id).
+static PROVIDED_POOL_EPOCHS: [AtomicU32; PROVIDED_POOL_SLOTS] =
+    [const { AtomicU32::new(0) }; PROVIDED_POOL_SLOTS];
+
+/// RAII bracket that installs a worker's provided-buffer pool for its whole
+/// run-loop and clears it on drop.
+///
+/// Declared after the `WorkerShard` local in each run-loop entry, so Rust
+/// LIFO drop clears the static before the shard -- and the driver-owned pool
+/// -- is reclaimed. A `ProvidedBuf` dropped during shard teardown then finds
+/// a null slot and skips its recycle, a bounded pool-entry loss on a pool
+/// that unmaps regardless.
+///
+/// Not re-entrant: one run-loop per worker installs one guard.
+pub struct ProvidedPoolGuard {
+    /// Worker slot to clear on drop.
+    worker_id: u8,
+}
+
+impl ProvidedPoolGuard {
+    /// Installs the driver's provided-buffer pool for `worker_id` for the
+    /// run-loop, returning the guard that clears it.
+    ///
+    /// A backend without a pool (a fallback driver, or a uring driver whose
+    /// registration failed or whose kernel lacks `buf_ring`) installs
+    /// nothing; the guard's drop still clears the slot, a no-op.
+    #[must_use]
+    pub fn install(worker_id: u8, driver: &DriverType) -> Self {
+        Self::install_pool(worker_id, driver.provided_recv_pool())
+    }
+
+    /// Installs `pool` for `worker_id`, bumping the slot's epoch first so a
+    /// handle from an earlier session can never match this registration.
+    ///
+    /// Crate-visible so a test can bracket a pool without a live driver; the
+    /// production path goes through [`install`](Self::install).
+    pub(crate) fn install_pool(worker_id: u8, pool: Option<&BufRingPool>) -> Self {
+        let Some(pool) = pool else {
+            return Self { worker_id };
+        };
+        PROVIDED_POOL_EPOCHS[worker_id as usize].fetch_add(1, Ordering::AcqRel);
+        PROVIDED_POOLS[worker_id as usize].store(ptr::from_ref(pool).cast_mut(), Ordering::Release);
+        Self { worker_id }
+    }
+}
+
+impl Drop for ProvidedPoolGuard {
+    fn drop(&mut self) {
+        PROVIDED_POOLS[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
+/// The provided-buffer pool installed for `worker_id`, when `epoch` still
+/// names the current registration.
+///
+/// Returns `None` outside a run-loop (the slot is null) and on an epoch
+/// mismatch (a later registration re-claimed the slot), so a stale handle is
+/// refused rather than read through the wrong pool. The pointee is live for
+/// exactly the reasons the guard doc states; the caller performs the deref
+/// under that contract.
+pub(crate) fn provided_pool(worker_id: u8, epoch: u32) -> Option<NonNull<BufRingPool>> {
+    let pool = NonNull::new(PROVIDED_POOLS[worker_id as usize].load(Ordering::Acquire))?;
+    if PROVIDED_POOL_EPOCHS[worker_id as usize].load(Ordering::Acquire) != epoch {
+        return None;
+    }
+    Some(pool)
+}
+
+/// The current pool-registration epoch for `worker_id`.
+///
+/// Captured into each `ProvidedBuf` at construction; [`provided_pool`]
+/// re-checks it on every access.
+pub(crate) fn provided_pool_epoch(worker_id: u8) -> u32 {
+    PROVIDED_POOL_EPOCHS[worker_id as usize].load(Ordering::Acquire)
+}
+
 /// Queues a cancel for a dropped buffered future's in-flight op on its worker.
 ///
 /// A no-op when no inbox is installed for `key.worker_id`: the worker's
@@ -843,6 +1030,23 @@ pub fn push_cancel_for_worker(key: InflightSlotKey) {
 pub fn push_accept_cancel_for_worker(worker_id: u8, token: u64) {
     push_cancel_for_worker(InflightSlotKey {
         slot: ACCEPT_CANCEL_SLOT,
+        generation: 0,
+        worker_id,
+        op_token: token,
+    });
+}
+
+/// Queues a cancel for a dropped provided-buffer recv on its worker.
+///
+/// The recv op carries the polling task's `token` as its `user_data` and holds
+/// no inflight slab slot, so the queued key uses the
+/// `PROVIDED_RECV_CANCEL_SLOT` marker; the drain routes it to
+/// [`submit_provided_recv_cancel`]. Submitting the recv set the task
+/// `io_bound`, so its `Drop` runs on the owning worker and the push is
+/// single-writer, the same contract [`push_accept_cancel_for_worker`] holds.
+pub fn push_provided_recv_cancel_for_worker(worker_id: u8, token: u64) {
+    push_cancel_for_worker(InflightSlotKey {
+        slot: PROVIDED_RECV_CANCEL_SLOT,
         generation: 0,
         worker_id,
         op_token: token,
@@ -1130,25 +1334,99 @@ pub fn submit_accept_cancel<const N: usize>(
     let _ = driver.submit_internal(request);
 }
 
+/// Submits a cancel for a dropped provided-buffer recv.
+///
+/// The recv holds no slab slot, so this only records the token in `cancels`
+/// and submits an `ASYNC_CANCEL` targeting the op by its `user_data` token. A
+/// completion arriving after the cancel routes through
+/// [`dispose_cancelled_op`], which recycles the kernel-selected buffer the
+/// dropped future will never take; the cancel's own CQE decodes to a slot no
+/// registry owns, so [`reclaim_cancel_completion`] treats it as a no-op.
+pub fn submit_provided_recv_cancel<const N: usize>(
+    driver: &DriverType,
+    cancels: &mut ProvidedRecvCancelSet<N>,
+    key: InflightSlotKey,
+) {
+    cancels.insert(key.op_token);
+    let request = IoRequest::<()>::cancel(SubmitToken::new(key.op_token))
+        .with_user_data(encode_cancel_sentinel(key));
+    // IGNORE: submit_internal is best-effort; a refused cancel leaves the recv
+    // running, and its completion still routes through dispose_cancelled_op.
+    let _ = driver.submit_internal(request);
+}
+
 /// Routes a queued cancel to the mechanism that owns its op.
 ///
 /// A cancel whose `op_token` is a multishot sentinel targets the multishot
 /// registry; the `ACCEPT_CANCEL_SLOT` marker targets a slotless single-shot
-/// accept; every other cancel is a buffered op's in-flight slot.
-pub fn submit_cancel_for<const N: usize>(
+/// accept; the `PROVIDED_RECV_CANCEL_SLOT` marker targets a slotless
+/// provided-buffer recv; every other cancel is a buffered op's in-flight slot.
+pub fn submit_cancel_for<const A: usize, const P: usize>(
     driver: &DriverType,
     inflight: &mut InflightBufSlab,
     multishot: &mut MultishotSlab,
-    accepts: &mut AcceptCancelSet<N>,
+    accepts: &mut AcceptCancelSet<A>,
+    provided_recvs: &mut ProvidedRecvCancelSet<P>,
     key: InflightSlotKey,
 ) {
     if is_multishot_sentinel(key.op_token) {
         submit_multishot_cancel(driver, multishot, key);
     } else if key.slot == ACCEPT_CANCEL_SLOT {
         submit_accept_cancel(driver, accepts, key);
+    } else if key.slot == PROVIDED_RECV_CANCEL_SLOT {
+        submit_provided_recv_cancel(driver, provided_recvs, key);
     } else {
         submit_cancel(driver, inflight, key);
     }
+}
+
+/// Disposes a task-token completion that a dropped accept or provided recv
+/// will never take.
+///
+/// The completion drain calls this on every task-token CQE, before the result
+/// is stored and the task woken. A CQE carrying a kernel-selected buffer id
+/// is definitively a provided recv's -- no other op sets the buffer flag --
+/// so when its token names a dropped recv, the buffer recycles into the
+/// driver's pool. A bufferless CQE checks the dropped accepts first (a
+/// nonnegative accept result is a descriptor to close), then the dropped
+/// provided recvs (an end-of-stream or error completion, nothing to recycle).
+/// Returns whether it consumed the CQE; the common empty-sets case is an
+/// `O(1)` miss.
+///
+/// One task dropping an in-flight accept AND an in-flight provided recv
+/// shares one token across both sets, and a bufferless completion then cannot
+/// name its op: the accept set takes it first, a bounded mis-disposal (a
+/// stale entry in the other set, or an end-of-stream `0` adopted as a
+/// descriptor) -- the same ambiguity the accept set already carries against
+/// dropped buffered ops sharing a token. The same holds within one kind: a
+/// task that drops an in-flight provided recv and reissues one before the
+/// first completes shares the token across both ops, and whichever
+/// completion lands first is disposed as the dropped one. A per-op registry
+/// (the multishot model) is the structural fix, deferred with multishot recv.
+pub fn dispose_cancelled_op<const A: usize, const P: usize>(
+    driver: &DriverType,
+    accepts: &mut AcceptCancelSet<A>,
+    provided_recvs: &mut ProvidedRecvCancelSet<P>,
+    token: u64,
+    result: i32,
+    buf_id: Option<u16>,
+) -> bool {
+    if let Some(id) = buf_id {
+        if provided_recvs.is_empty() || !provided_recvs.take(token) {
+            return false;
+        }
+        // The dropped recv's op still consumed a buffer; this CQE is the
+        // kernel's done-with-the-bytes signal, so the id returns to the ring
+        // here or never.
+        if let Some(pool) = driver.provided_recv_pool() {
+            pool.recycle(id);
+        }
+        return true;
+    }
+    if dispose_cancelled_accept(accepts, token, result) {
+        return true;
+    }
+    !provided_recvs.is_empty() && provided_recvs.take(token)
 }
 
 /// Reclaims the retire-pending slot whose op matches `op_token`, if any.
@@ -2103,13 +2381,21 @@ mod tests {
         };
         let mut multishot = MultishotSlab::new(7, 4);
         let mut accepts = AcceptCancelSet::<4>::new();
+        let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
         let key = InflightSlotKey {
             slot: ACCEPT_CANCEL_SLOT,
             generation: 0,
             worker_id: 7,
             op_token: 0xF00D,
         };
-        submit_cancel_for(&driver, &mut inflight, &mut multishot, &mut accepts, key);
+        submit_cancel_for(
+            &driver,
+            &mut inflight,
+            &mut multishot,
+            &mut accepts,
+            &mut provided_recvs,
+            key,
+        );
         assert!(
             accepts.take(0xF00D),
             "the accept marker routes the token into the accept set",
@@ -2153,5 +2439,127 @@ mod tests {
         // a probe of a closed fd reports `EBADF`, which is the assertion.
         let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
         assert!(!still_open, "the disposal closed the accepted fd");
+    }
+
+    #[test]
+    fn provided_recv_cancel_set_inserts_and_takes() {
+        let mut cancels = ProvidedRecvCancelSet::<2>::new();
+        assert!(cancels.is_empty());
+        cancels.insert(0xA);
+        cancels.insert(0xB);
+        // A full set drops the record rather than growing.
+        cancels.insert(0xC);
+        assert!(!cancels.take(0xC), "the overflowed record was dropped");
+        assert!(cancels.take(0xB));
+        assert!(cancels.take(0xA));
+        assert!(cancels.is_empty());
+        assert!(!cancels.take(0xA), "a taken token does not linger");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn submit_cancel_for_routes_the_provided_recv_marker() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut inflight) = InflightBufSlab::new(8, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let mut multishot = MultishotSlab::new(8, 4);
+        let mut accepts = AcceptCancelSet::<4>::new();
+        let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
+        let key = InflightSlotKey {
+            slot: PROVIDED_RECV_CANCEL_SLOT,
+            generation: 0,
+            worker_id: 8,
+            op_token: 0xBEEF,
+        };
+        submit_cancel_for(
+            &driver,
+            &mut inflight,
+            &mut multishot,
+            &mut accepts,
+            &mut provided_recvs,
+            key,
+        );
+        assert!(
+            provided_recvs.take(0xBEEF),
+            "the provided-recv marker routes the token into its set",
+        );
+        assert!(accepts.is_empty(), "the accept set is untouched");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn dispose_cancelled_op_routes_by_buffer_and_set() {
+        let driver = DriverType::Epoll(());
+        let mut accepts = AcceptCancelSet::<4>::new();
+        let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
+        assert!(
+            !dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x1, 4, Some(2)),
+            "empty sets dispose nothing",
+        );
+        // A buffer-carrying CQE is definitively a provided recv's; a live
+        // recv (token not recorded) falls through to the task path.
+        provided_recvs.insert(0x1);
+        assert!(
+            !dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x2, 4, Some(2)),
+            "an unrecorded token is a live future's completion",
+        );
+        assert!(
+            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x1, 4, Some(2)),
+            "a recorded token consumes its buffer-carrying completion",
+        );
+        // A bufferless CQE checks the accepts first, then the provided recvs.
+        accepts.insert(0x3);
+        provided_recvs.insert(0x4);
+        assert!(
+            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x3, -125, None),
+            "a bufferless completion matches the accept set first",
+        );
+        assert!(
+            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x4, -125, None),
+            "a cancelled provided recv disposes with nothing to recycle",
+        );
+        assert!(provided_recvs.is_empty());
+    }
+
+    #[test]
+    fn provided_pool_guard_brackets_install_and_clear() {
+        let Ok(pool) = crate::buffer::ring::pool::BufRingPool::new(
+            4,
+            64,
+            crate::buffer::slot::BufGroupId::new(0),
+        ) else {
+            panic!("pool creation must succeed");
+        };
+        let before = provided_pool_epoch(210);
+        {
+            let _guard = ProvidedPoolGuard::install_pool(210, Some(&pool));
+            let epoch = provided_pool_epoch(210);
+            assert_eq!(epoch, before.wrapping_add(1), "an install bumps the epoch");
+            assert!(
+                provided_pool(210, epoch).is_some(),
+                "the current epoch resolves the installed pool",
+            );
+            assert!(
+                provided_pool(210, epoch.wrapping_sub(1)).is_none(),
+                "a stale epoch is refused",
+            );
+        }
+        assert!(
+            provided_pool(210, provided_pool_epoch(210)).is_none(),
+            "the guard clears the slot on drop",
+        );
+    }
+
+    #[test]
+    fn provided_pool_guard_without_pool_installs_nothing() {
+        let before = provided_pool_epoch(211);
+        let _guard = ProvidedPoolGuard::install_pool(211, None);
+        assert_eq!(
+            provided_pool_epoch(211),
+            before,
+            "a poolless install does not bump the epoch",
+        );
+        assert!(provided_pool(211, before).is_none());
     }
 }
