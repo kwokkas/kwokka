@@ -10,6 +10,9 @@ pub use core::{InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, SubmitResult, Submit
 pub use completion::{Completion, CqeFlags};
 pub use future::{
     file::{FileReadFuture, FileWriteFuture},
+    provided::ProvidedRecvFuture,
     socket::{RecvFuture, SendFuture},
 };
 pub use request::{CommonFields, ControlPayload, IoRequest, OpPayload};
+
+pub use crate::buffer::ring::pool::ProvidedBuf;

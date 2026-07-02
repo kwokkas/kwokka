@@ -11,7 +11,10 @@ use std::{io, time::Duration};
 use crate::uring::driver::UringDriver;
 use crate::{
     CancelError, IoDriver, RegisterError,
-    buffer::slot::{BufGroupId, FdSlot},
+    buffer::{
+        ring::pool::BufRingPool,
+        slot::{BufGroupId, FdSlot},
+    },
     capability::CapabilityMatrix,
     operation::{Completion, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
@@ -153,6 +156,20 @@ impl IoDriver for DriverType {
 }
 
 impl DriverType {
+    /// The provided-buffer pool the `io_uring` backend registered, if any.
+    ///
+    /// `None` on every fallback backend, and on a uring driver whose kernel
+    /// lacks `buf_ring` or whose registration failed -- the same degradation
+    /// [`provided_recv_group`](IoDriver::provided_recv_group) reports, so the
+    /// two accessors stay in fallback parity.
+    pub(crate) const fn provided_recv_pool(&self) -> Option<&BufRingPool> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => driver.provided_recv_pool(),
+            _ => None,
+        }
+    }
+
     /// Builds the platform's default driver, running the `io_uring`
     /// capability probe once on Linux. Startup backend selection per the
     /// support matrix; Windows backends are deferred to 0.2.0.

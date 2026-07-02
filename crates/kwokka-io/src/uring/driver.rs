@@ -588,6 +588,19 @@ mod tests {
         }
     }
 
+    #[test]
+    fn provided_cancel_window_covers_the_ring() {
+        // The cancel window's doc claims one token per pool entry: every
+        // buffer id can be awaiting disposal at once. The two constants live
+        // in different modules, so pin the coupling here -- resizing either
+        // side without the other fails this test instead of silently
+        // invalidating the documented bound.
+        assert_eq!(
+            crate::boundary::PROVIDED_RECV_CANCEL_CAPACITY,
+            usize::from(PROVIDED_RECV_RING_ENTRIES),
+        );
+    }
+
     #[cfg_attr(
         miri,
         ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"

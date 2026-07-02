@@ -17,7 +17,11 @@
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{io, thread};
 
-use kwokka_io::{DriverType, boundary::CancelInboxGuard, wake};
+use kwokka_io::{
+    DriverType,
+    boundary::{CancelInboxGuard, ProvidedPoolGuard},
+    wake,
+};
 
 use crate::{
     runtime::{
@@ -196,6 +200,9 @@ fn sibling_main(id: WorkerId, ring_entries: u32, task_capacity: usize) {
     // Declared after `shard` so LIFO drop nulls the cancel static before
     // `shard.tasks` frees buffered futures, whose drops then no-op.
     let _cancel_guard = CancelInboxGuard::install(id.raw(), &mut shard.cancel_inbox);
+    // Same LIFO bracket: the provided-pool static clears before the shard --
+    // and the driver-owned pool -- is reclaimed.
+    let _pool_guard = ProvidedPoolGuard::install(id.raw(), &shard.driver);
     registry::publish_endpoint(id, wake_fd);
     bootstrap::arm_wake(&shard, wake_fd);
     AFFINE_READY.fetch_add(1, Ordering::SeqCst);
