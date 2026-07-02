@@ -31,15 +31,21 @@ pub(crate) fn build_recv(fd: i32, ptr: *mut u8, capacity: usize, flags: OpFlags)
     }
 }
 
-/// Build a single-shot provided-buffer recv SQE.
+/// Build a provided-buffer recv SQE.
 ///
-/// `len` is 0, so the kernel fills the buffer it selects from `buf_group` up
-/// to that buffer's own size. The `IOSQE_BUFFER_SELECT` bit is set in
-/// `sqe_flags`, not here -- `Recv::build()` sets only the `buf_group` field
-/// (`io_uring_prep_recv.3`; the flag is `RecvMulti`-only in the io-uring crate).
-/// `buf_group` is always `Some` for a `recv_provided` request; `0` is the sole
-/// per-worker group and a safe default.
+/// Emits a multishot provided recv (`io_uring_prep_recv_multishot.3`) when
+/// `flags.multishot` is set: one SQE re-arms and streams a CQE per selected
+/// buffer until cancelled. Otherwise a single-shot recv that completes once.
+/// `len` is 0, so the kernel fills the buffer it selects from `buf_group` up to
+/// that buffer's own size. For the single-shot path the `IOSQE_BUFFER_SELECT`
+/// bit is set in `sqe_flags`, not here -- `Recv::build()` sets only the
+/// `buf_group` field (`io_uring_prep_recv.3`; the flag is `RecvMulti`-only in
+/// the io-uring crate). `buf_group` is always `Some` for a provided-recv
+/// request; `0` is the sole per-worker group and a safe default.
 pub(crate) fn build_recv_provided(fd: i32, buf_group: Option<u16>, flags: OpFlags) -> Entry {
+    if flags.multishot {
+        return build_recv_multishot_provided(fd, buf_group, flags);
+    }
     let group = buf_group.unwrap_or(0);
     if flags.fixed_fd {
         opcode::Recv::new(Fixed(fd as u32), std::ptr::null_mut(), 0)
@@ -49,6 +55,21 @@ pub(crate) fn build_recv_provided(fd: i32, buf_group: Option<u16>, flags: OpFlag
         opcode::Recv::new(Fd(fd), std::ptr::null_mut(), 0)
             .buf_group(group)
             .build()
+    }
+}
+
+/// Build a multishot provided-buffer recv SQE (`io_uring_prep_recv_multishot.3`).
+///
+/// `RecvMulti::build()` sets the `IOSQE_BUFFER_SELECT` bit and the multishot
+/// marker itself, so one SQE re-arms and streams a CQE per selected buffer until
+/// cancelled. `buf_group` mirrors the single-shot path -- `0` is the sole
+/// per-worker group and a safe default.
+fn build_recv_multishot_provided(fd: i32, buf_group: Option<u16>, flags: OpFlags) -> Entry {
+    let group = buf_group.unwrap_or(0);
+    if flags.fixed_fd {
+        opcode::RecvMulti::new(Fixed(fd as u32), group).build()
+    } else {
+        opcode::RecvMulti::new(Fd(fd), group).build()
     }
 }
 

@@ -250,6 +250,16 @@ impl IoRequest<()> {
         request
     }
 
+    /// Receive on `fd` into kernel-selected provided buffers, multishot variant.
+    ///
+    /// One SQE streams a CQE per received buffer until cancelled; each carries
+    /// the chosen buffer id in its CQE flags, the same as
+    /// [`recv_provided`](Self::recv_provided) but re-armed by the kernel after
+    /// every buffer.
+    pub fn recv_multishot_provided(fd: i32, group: BufGroupId) -> Self {
+        Self::recv_provided(fd, group).with_multishot()
+    }
+
     /// Connect `fd` to `addr`.
     pub fn connect(fd: i32, addr: SockAddr) -> Self {
         Self::build(fd, OpCode::Connect, OpPayload::Socket { addr, buf: None })
@@ -442,6 +452,19 @@ mod tests {
     fn recv_multishot_sets_flag() {
         let request = IoRequest::recv_multishot(3, MockBuf::new(64));
         assert!(request.flags.multishot);
+    }
+
+    #[test]
+    fn recv_multishot_provided_sets_flags() {
+        let request =
+            IoRequest::<()>::recv_multishot_provided(3, crate::buffer::slot::BufGroupId::new(0));
+        assert!(request.flags.multishot, "the multishot flag is set");
+        assert!(request.flags.buffer_select, "the buffer-select flag is set");
+        assert_eq!(
+            request.common.buf_group,
+            Some(0),
+            "the buffer group carries"
+        );
     }
 
     #[test]
