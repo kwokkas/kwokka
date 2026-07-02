@@ -414,8 +414,15 @@ impl IoSeam {
         Some(result)
     }
 
-    /// Submits a multishot provided-buffer recv on `fd` for the polling task,
-    /// addressed by `token` for the `user_data` round trip.
+    /// Submits a multishot provided-buffer recv on `fd` for the polling task.
+    ///
+    /// `token` must be the recv-multishot sentinel the registry issues for this
+    /// stream, not a bare task token: the completion drain routes a CQE into the
+    /// recv-multishot slab only when its `user_data` is a recv-multishot
+    /// sentinel (see [`is_recv_multishot_sentinel`]), so a task token would
+    /// misroute the stream's completions onto the single-shot wake path. The
+    /// slab allocation that issues the sentinel lands with the drain-wiring
+    /// slice; this entry is the submit half of that pair.
     ///
     /// One SQE streams a CQE per received buffer until cancelled; each carries
     /// the kernel-selected buffer id. The capability is probed up front: a
