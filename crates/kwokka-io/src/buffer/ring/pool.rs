@@ -188,7 +188,7 @@ pub struct ProvidedBuf {
     worker_id: u8,
     /// Pool-registration epoch captured at construction; access through a
     /// slot a later registration re-claimed is refused on mismatch.
-    epoch: u32,
+    epoch: u64,
     /// Keeps the handle off `Send`/`Sync`: the recycle push and the byte
     /// window are contracts with one worker thread.
     _local: PhantomData<*const ()>,
@@ -196,7 +196,7 @@ pub struct ProvidedBuf {
 
 impl ProvidedBuf {
     /// Wraps the kernel-selected buffer `buf_id` holding `len` received bytes.
-    pub(crate) const fn new(worker_id: u8, epoch: u32, buf_id: u16, len: u32) -> Self {
+    pub(crate) const fn new(worker_id: u8, epoch: u64, buf_id: u16, len: u32) -> Self {
         Self {
             buf_id: Some(buf_id),
             len,
@@ -282,6 +282,12 @@ impl Drop for ProvidedBuf {
         // Failure mode: a recycle into a torn-down or re-claimed ring --
         // excluded by the null and epoch refusals.
         let pool = unsafe { pool.as_ref() };
+        // A drop must never panic: an id past the ring (a malformed
+        // completion whose byte access already panicked) is skipped rather
+        // than recycled, so unwinding cannot double-panic here.
+        if check_bid(buf_id, pool.entries()).is_err() {
+            return;
+        }
         pool.recycle(buf_id);
     }
 }

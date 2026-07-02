@@ -6,7 +6,7 @@
 
 pub(crate) mod abi;
 pub(crate) mod memory;
-pub mod pool;
+pub(crate) mod pool;
 
 pub(crate) use abi::BufRingEntry;
 pub(crate) use memory::BufRing;

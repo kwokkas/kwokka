@@ -14,3 +14,5 @@ pub use future::{
     socket::{RecvFuture, SendFuture},
 };
 pub use request::{CommonFields, ControlPayload, IoRequest, OpPayload};
+
+pub use crate::buffer::ring::pool::ProvidedBuf;

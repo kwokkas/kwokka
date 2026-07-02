@@ -20,7 +20,7 @@
 
 use core::{
     ptr::{self, NonNull},
-    sync::atomic::{AtomicPtr, AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering},
     task::Waker,
 };
 use std::os::fd::{FromRawFd, OwnedFd};
@@ -914,9 +914,12 @@ static PROVIDED_POOLS: [AtomicPtr<BufRingPool>; PROVIDED_POOL_SLOTS] =
 /// A `ProvidedBuf` captures the epoch at construction and every access
 /// re-checks it, so a handle outliving its run-loop session can never read
 /// through -- or recycle into -- a pool a later registration installed in the
-/// same slot (a rebuilt runtime re-claiming the worker id).
-static PROVIDED_POOL_EPOCHS: [AtomicU32; PROVIDED_POOL_SLOTS] =
-    [const { AtomicU32::new(0) }; PROVIDED_POOL_SLOTS];
+/// same slot (a rebuilt runtime re-claiming the worker id). The counter is
+/// 64-bit, so the wrap that would let a stale handle match again is
+/// effectively unreachable -- the same headroom the buffer registries use
+/// for their generations.
+static PROVIDED_POOL_EPOCHS: [AtomicU64; PROVIDED_POOL_SLOTS] =
+    [const { AtomicU64::new(0) }; PROVIDED_POOL_SLOTS];
 
 /// RAII bracket that installs a worker's provided-buffer pool for its whole
 /// run-loop and clears it on drop.
@@ -974,7 +977,7 @@ impl Drop for ProvidedPoolGuard {
 /// refused rather than read through the wrong pool. The pointee is live for
 /// exactly the reasons the guard doc states; the caller performs the deref
 /// under that contract.
-pub(crate) fn provided_pool(worker_id: u8, epoch: u32) -> Option<NonNull<BufRingPool>> {
+pub(crate) fn provided_pool(worker_id: u8, epoch: u64) -> Option<NonNull<BufRingPool>> {
     let pool = NonNull::new(PROVIDED_POOLS[worker_id as usize].load(Ordering::Acquire))?;
     if PROVIDED_POOL_EPOCHS[worker_id as usize].load(Ordering::Acquire) != epoch {
         return None;
@@ -986,7 +989,7 @@ pub(crate) fn provided_pool(worker_id: u8, epoch: u32) -> Option<NonNull<BufRing
 ///
 /// Captured into each `ProvidedBuf` at construction; [`provided_pool`]
 /// re-checks it on every access.
-pub(crate) fn provided_pool_epoch(worker_id: u8) -> u32 {
+pub(crate) fn provided_pool_epoch(worker_id: u8) -> u64 {
     PROVIDED_POOL_EPOCHS[worker_id as usize].load(Ordering::Acquire)
 }
 
@@ -1395,14 +1398,17 @@ pub fn submit_cancel_for<const A: usize, const P: usize>(
 ///
 /// One task dropping an in-flight accept AND an in-flight provided recv
 /// shares one token across both sets, and a bufferless completion then cannot
-/// name its op: the accept set takes it first, a bounded mis-disposal (a
-/// stale entry in the other set, or an end-of-stream `0` adopted as a
-/// descriptor) -- the same ambiguity the accept set already carries against
-/// dropped buffered ops sharing a token. The same holds within one kind: a
-/// task that drops an in-flight provided recv and reissues one before the
-/// first completes shares the token across both ops, and whichever
-/// completion lands first is disposed as the dropped one. A per-op registry
-/// (the multishot model) is the structural fix, deferred with multishot recv.
+/// name its op. An end-of-stream `0` is taken by the provided set first --
+/// adopted as an accept result it would close descriptor zero -- and every
+/// other bufferless result checks the accepts before the provided recvs, so
+/// the residue is a misrouted disposal (a stale entry in the wrong set, or a
+/// leaked descriptor), never an unrelated close: the same ambiguity class
+/// the accept set already carries against dropped buffered ops sharing a
+/// token. The same holds within one kind: a task that drops an in-flight
+/// provided recv and reissues one before the first completes shares the
+/// token across both ops, and whichever completion lands first is disposed
+/// as the dropped one. A per-op registry (the multishot model) is the
+/// structural fix, deferred with multishot recv.
 pub fn dispose_cancelled_op<const A: usize, const P: usize>(
     driver: &DriverType,
     accepts: &mut AcceptCancelSet<A>,
@@ -1421,6 +1427,13 @@ pub fn dispose_cancelled_op<const A: usize, const P: usize>(
         if let Some(pool) = driver.provided_recv_pool() {
             pool.recycle(id);
         }
+        return true;
+    }
+    // An end-of-stream completion whose token names a dropped provided recv
+    // is taken before the accept check: a `0` result adopted as an accept
+    // descriptor would close descriptor zero, so the ambiguous case prefers
+    // a bounded accept-side leak over an unrelated close.
+    if result == 0 && !provided_recvs.is_empty() && provided_recvs.take(token) {
         return true;
     }
     if dispose_cancelled_accept(accepts, token, result) {
@@ -2520,6 +2533,20 @@ mod tests {
             "a cancelled provided recv disposes with nothing to recycle",
         );
         assert!(provided_recvs.is_empty());
+        // An end-of-stream `0` with the token in both sets prefers the
+        // provided set: adopted as an accept result it would close
+        // descriptor zero, so the accept entry stays as a bounded leak.
+        accepts.insert(0x5);
+        provided_recvs.insert(0x5);
+        assert!(
+            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x5, 0, None),
+            "the ambiguous end-of-stream completion is consumed",
+        );
+        assert!(provided_recvs.is_empty(), "the provided set took it");
+        assert!(
+            accepts.take(0x5),
+            "the accept entry survives instead of adopting descriptor zero",
+        );
     }
 
     #[test]
