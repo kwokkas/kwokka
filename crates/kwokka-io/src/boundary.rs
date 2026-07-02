@@ -29,7 +29,10 @@ use crate::{
     DriverType, IoDriver,
     buffer::{
         inflight::{InflightBufSlab, InflightSlotKey},
-        multishot::{MultishotPush, MultishotSlab, MultishotSlotKey},
+        multishot::{
+            MultishotPush, MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotPush,
+            RecvMultishotSlab, RecvMultishotSlotKey,
+        },
         ring::pool::BufRingPool,
     },
     operation::{CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
@@ -102,6 +105,40 @@ pub enum MultishotAlloc {
     /// Every slot is occupied; the stream degrades to a single-shot accept.
     Full,
     /// The seam carries no multishot registry (a test seam).
+    Unsupported,
+}
+
+/// The outcome of advancing a multishot recv stream by one completion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvMultishotNext {
+    /// A completion: a nonnegative byte count paired with the kernel-selected
+    /// buffer id it consumed (`None` at end of stream), or a negative `-errno`.
+    Item {
+        /// Byte count, or a negative `-errno`.
+        result: i32,
+        /// Kernel-selected provided buffer id, `None` when none was consumed.
+        buf_id: Option<u16>,
+    },
+    /// The op is in flight with an empty FIFO; poll again on wake.
+    Pending,
+    /// The op posted its terminal CQE and its FIFO is drained; the slot is freed.
+    Ended,
+}
+
+/// The outcome of reserving a multishot recv slot for a stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecvMultishotAlloc {
+    /// A slot was reserved; the stream tags its SQE with `sentinel` and drains
+    /// and cancels through `key`.
+    Allocated {
+        /// Handle that drains the slot's FIFO and cancels its op.
+        key: RecvMultishotSlotKey,
+        /// `user_data` sentinel the multishot recv SQE carries.
+        sentinel: u64,
+    },
+    /// Every slot is occupied; the stream degrades to a single-shot provided recv.
+    Full,
+    /// The seam carries no multishot recv registry (a test seam).
     Unsupported,
 }
 
@@ -1073,6 +1110,22 @@ pub fn push_multishot_cancel_for_worker(key: MultishotSlotKey) {
     });
 }
 
+/// Queues a cancel for a dropped multishot recv stream on its owning worker.
+///
+/// Mirrors [`push_multishot_cancel_for_worker`] for the recv registry: the
+/// dropped stream's op is `io_bound`, so the drop runs on the owning worker and
+/// the push is single-writer. The recv slot rides an [`InflightSlotKey`] whose
+/// `op_token` is the recv-multishot sentinel; the worker's cancel drain routes
+/// it to the recv registry through [`submit_recv_multishot_cancel`].
+pub fn push_recv_multishot_cancel_for_worker(key: RecvMultishotSlotKey) {
+    push_cancel_for_worker(InflightSlotKey {
+        slot: key.slot,
+        generation: key.generation,
+        worker_id: key.worker_id,
+        op_token: encode_recv_multishot_sentinel(key),
+    });
+}
+
 /// `user_data` marker for a buffered-op cancel completion.
 ///
 /// Tags every cancel SQE the worker's cancel-drain submits so the completion
@@ -1165,6 +1218,35 @@ pub(crate) const fn multishot_sentinel_generation(user_data: u64) -> u16 {
     ((user_data >> 16) & 0xFFFF) as u16
 }
 
+/// `user_data` marker base for a multishot recv completion.
+///
+/// A multishot recv posts many CQEs sharing one `user_data`, routed to the
+/// [`RecvMultishotSlab`] rather than the per-task wake slot. The upper 32 bits
+/// read `0xFFFF_FFFD`: the arena tag bit, worker id 127, and generation
+/// `MAX - 2`, one corner below the multishot accept base. That keeps all four
+/// completion sentinels disjoint by upper-32 -- wake and cancel read
+/// `0xFFFF_FFFF`, multishot accept `0xFFFF_FFFE`, and this `0xFFFF_FFFD`. It is
+/// unreachable for the same reason the others are: generation `MAX - 2` needs
+/// ~2^24 slot reuses, and a slab-path token clears the arena tag bit entirely.
+/// The low 32 bits carry the slot and its low 16 generation bits, the layout
+/// [`multishot_sentinel_slot`] and [`multishot_sentinel_generation`] decode.
+const RECV_MULTISHOT_TOKEN_BASE: u64 = 0xFFFF_FFFD_0000_0000;
+
+/// Encodes the multishot-recv-completion `user_data` for `key`.
+pub(crate) const fn encode_recv_multishot_sentinel(key: RecvMultishotSlotKey) -> u64 {
+    RECV_MULTISHOT_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
+}
+
+/// Whether `user_data` is a multishot-recv-completion sentinel.
+///
+/// The completion drain calls this to route the CQE into the
+/// [`RecvMultishotSlab`]. It sits one corner below the multishot accept base,
+/// so no wake-value guard is needed: `u64::MAX` reads upper-32 `0xFFFF_FFFF`,
+/// already excluded.
+pub const fn is_recv_multishot_sentinel(user_data: u64) -> bool {
+    user_data & CANCEL_TOKEN_HIGH_MASK == RECV_MULTISHOT_TOKEN_BASE
+}
+
 /// The wake and retire targets a multishot CQE resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultishotCompletion {
@@ -1238,6 +1320,73 @@ fn dispose_accept_result(result: i32) {
     drop(adopt_accepted_fd(result));
 }
 
+/// Recycles a completion's kernel-selected buffer id to the driver's pool.
+///
+/// A dropped or overflowed multishot recv completion still consumed a provided
+/// buffer the caller will never take; this returns it to the ring exactly once
+/// so the ring does not silently shrink. A `None` id (end of stream or error)
+/// or a backend with no pool is a no-op.
+fn recycle_provided(driver: &DriverType, buf_id: Option<u16>) {
+    let Some(id) = buf_id else {
+        return;
+    };
+    if let Some(pool) = driver.provided_recv_pool() {
+        pool.recycle(id);
+    }
+}
+
+/// Routes a multishot recv op's completion CQE into the worker's registry.
+///
+/// The completion drain calls this on a CQE whose `user_data` is a
+/// multishot-recv sentinel (see [`is_recv_multishot_sentinel`]). It queues the
+/// `(result, buf_id)` for the owning stream and returns the
+/// [`MultishotCompletion`] targets, the same wake and retire contract the accept
+/// path uses. Nothing is queued when the slot is stale, the FIFO overflowed, or
+/// the stream dropped; in each of those cases the completion's provided buffer is
+/// recycled here so it returns to the ring exactly once.
+///
+/// Unlike the accept path, the buffer id is read and recycled on every CQE
+/// regardless of the `MORE` flag: the recv-multishot ABI reports a selected
+/// buffer on intermediate and terminal CQEs alike, and a buffer returned twice
+/// would let the kernel hand one region to two ops at once.
+pub fn push_recv_multishot_completion(
+    slab: &mut RecvMultishotSlab,
+    driver: &DriverType,
+    user_data: u64,
+    result: i32,
+    flags: CqeFlags,
+    buf_id: Option<u16>,
+) -> MultishotCompletion {
+    let slot = multishot_sentinel_slot(user_data);
+    let generation = multishot_sentinel_generation(user_data);
+    let is_more = flags.contains(CqeFlags::MORE);
+    let owner = slab.owner(slot, generation);
+    let retire = if is_more { None } else { owner };
+    if slab.is_cancel_pending(slot, generation) {
+        // The owning stream dropped. Recycle the buffer this CQE consumed -- on
+        // every CQE, MORE or not -- and free the slot on the terminal CQE.
+        recycle_provided(driver, buf_id);
+        if !is_more {
+            slab.free_by_slot(slot, generation);
+        }
+        return MultishotCompletion { wake: None, retire };
+    }
+    let wake = match slab.push(
+        slot,
+        generation,
+        result,
+        buf_id.unwrap_or(NO_BUFFER),
+        is_more,
+    ) {
+        RecvMultishotPush::Queued => owner,
+        RecvMultishotPush::Overflowed | RecvMultishotPush::Stale => {
+            recycle_provided(driver, buf_id);
+            None
+        }
+    };
+    MultishotCompletion { wake, retire }
+}
+
 /// Disposes the descriptor from a cancelled single-shot accept's completion.
 ///
 /// The completion drain calls this on every task-token CQE. When `token` names a
@@ -1308,6 +1457,42 @@ pub fn submit_multishot_cancel(
         dispose_accept_result(result);
     }
     slab.mark_cancel_pending(slot);
+    let request =
+        IoRequest::<()>::cancel(SubmitToken::new(key.op_token)).with_user_data(key.op_token);
+    // IGNORE: submit_internal is best-effort; a refused cancel leaves the slot
+    // cancel-pending, and the op's own completions still drive the free, so this
+    // is a bounded hurry-up, never a leak or a use-after-free.
+    let _ = driver.submit_internal(request);
+}
+
+/// Submits a cancel for a dropped multishot recv stream's op and marks its slot
+/// cancel-pending.
+///
+/// Mirrors [`submit_multishot_cancel`] for the recv registry: it recycles any
+/// buffers already queued for the gone stream (a dropped recv never takes them,
+/// and each is a provided buffer that must return to the ring), marks the slot
+/// cancel-pending, then submits an `ASYNC_CANCEL` targeting the op by its
+/// sentinel `user_data`. The op's terminal completion frees the slot through
+/// [`push_recv_multishot_completion`]; buffers arriving after the mark are
+/// recycled there.
+pub fn submit_recv_multishot_cancel(
+    driver: &DriverType,
+    slab: &mut RecvMultishotSlab,
+    key: InflightSlotKey,
+) {
+    let recv_key = RecvMultishotSlotKey {
+        slot: key.slot,
+        generation: key.generation,
+        worker_id: key.worker_id,
+    };
+    // Recycle every buffer queued for the gone stream so no provided buffer
+    // leaks out of the ring; a NO_BUFFER entry carries nothing to recycle.
+    while let Some((_, buf_id)) = slab.pop(recv_key) {
+        if buf_id != NO_BUFFER {
+            recycle_provided(driver, Some(buf_id));
+        }
+    }
+    slab.mark_cancel_pending(recv_key);
     let request =
         IoRequest::<()>::cancel(SubmitToken::new(key.op_token)).with_user_data(key.op_token);
     // IGNORE: submit_internal is best-effort; a refused cancel leaves the slot
@@ -2341,6 +2526,219 @@ mod tests {
         // none; a probe of a closed fd reports `EBADF`, which is the assertion.
         let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
         assert!(!still_open, "the cancel closed the queued accepted fd");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_completion_wakes_owner() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(30, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0xF00D) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_recv_multishot_sentinel(key);
+        assert_eq!(
+            push_recv_multishot_completion(
+                &mut slab,
+                &driver,
+                sentinel,
+                9,
+                CqeFlags::MORE,
+                Some(3)
+            ),
+            MultishotCompletion {
+                wake: Some(0xF00D),
+                retire: None,
+            },
+            "an intermediate completion wakes the owner without retiring the op",
+        );
+        assert_eq!(
+            slab.pop(key),
+            Some((9, 3)),
+            "the byte count and buffer id both reached the FIFO",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_terminal_retires_owner() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(31, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0xBEEF) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_recv_multishot_sentinel(key);
+        assert_eq!(
+            push_recv_multishot_completion(&mut slab, &driver, sentinel, 0, CqeFlags::EMPTY, None),
+            MultishotCompletion {
+                wake: Some(0xBEEF),
+                retire: Some(0xBEEF),
+            },
+            "a live terminal CQE both wakes and retires the owner",
+        );
+        assert_eq!(
+            slab.pop(key),
+            Some((0, NO_BUFFER)),
+            "an end-of-stream terminal queues the no-buffer sentinel",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_cancel_frees_on_terminal() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(32, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        slab.mark_cancel_pending(key);
+        let sentinel = encode_recv_multishot_sentinel(key);
+        // An intermediate CQE for a dropped stream wakes nothing; its buffer is
+        // recycled (a no-op against the poolless Epoll seam) rather than queued.
+        assert_eq!(
+            push_recv_multishot_completion(
+                &mut slab,
+                &driver,
+                sentinel,
+                4,
+                CqeFlags::MORE,
+                Some(2)
+            ),
+            MultishotCompletion {
+                wake: None,
+                retire: None,
+            },
+            "a cancel-pending intermediate wakes and retires nothing",
+        );
+        assert!(
+            slab.is_live(key),
+            "the slot survives until its terminal CQE"
+        );
+        assert_eq!(
+            push_recv_multishot_completion(
+                &mut slab,
+                &driver,
+                sentinel,
+                -125,
+                CqeFlags::EMPTY,
+                None
+            ),
+            MultishotCompletion {
+                wake: None,
+                retire: Some(0x1),
+            },
+            "the terminal CQE retires the owner without waking",
+        );
+        assert!(
+            !slab.is_live(key),
+            "the terminal CQE frees the cancel-pending slot",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_stale_sentinel_wakes_nothing() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(33, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_recv_multishot_sentinel(key);
+        slab.free(key);
+        assert_eq!(
+            push_recv_multishot_completion(
+                &mut slab,
+                &driver,
+                sentinel,
+                4,
+                CqeFlags::MORE,
+                Some(1)
+            ),
+            MultishotCompletion {
+                wake: None,
+                retire: None,
+            },
+            "a sentinel naming a freed slot routes to nothing",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_overflow_wakes_nothing() {
+        use crate::buffer::multishot::MULTISHOT_FIFO_DEPTH;
+
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(34, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let sentinel = encode_recv_multishot_sentinel(key);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        for value in 0..i32::from(MULTISHOT_FIFO_DEPTH) {
+            slab.push(key.slot, gen_low16, value, 0, true);
+        }
+        assert_eq!(
+            push_recv_multishot_completion(
+                &mut slab,
+                &driver,
+                sentinel,
+                4,
+                CqeFlags::MORE,
+                Some(5)
+            ),
+            MultishotCompletion {
+                wake: None,
+                retire: None,
+            },
+            "an overflowing completion recycles its buffer and routes to nothing",
+        );
+        assert_eq!(
+            push_recv_multishot_completion(&mut slab, &driver, sentinel, 0, CqeFlags::EMPTY, None),
+            MultishotCompletion {
+                wake: None,
+                retire: Some(0x1),
+            },
+            "a terminal CQE still retires the owner when the FIFO is full",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_cancel_drains_buffers() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(35, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        // Two provided-buffer recvs sit unconsumed in the FIFO when the stream
+        // drops; the cancel must drain (and recycle) every one before marking.
+        slab.push(key.slot, gen_low16, 8, 2, true);
+        slab.push(key.slot, gen_low16, 8, 3, true);
+        let cancel = InflightSlotKey {
+            slot: key.slot,
+            generation: key.generation,
+            worker_id: key.worker_id,
+            op_token: encode_recv_multishot_sentinel(key),
+        };
+        submit_recv_multishot_cancel(&driver, &mut slab, cancel);
+        assert_eq!(slab.pop(key), None, "the cancel drained the queued buffers");
+        assert!(
+            slab.is_cancel_pending(key.slot, gen_low16),
+            "the slot is marked cancel-pending",
+        );
     }
 
     #[test]
