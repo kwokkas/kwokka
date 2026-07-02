@@ -21,4 +21,4 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub use kwokka_net::tcp::{RecvFuture, SendFuture, TcpListener, TcpStream};
+pub use kwokka_net::tcp::{TcpListener, TcpStream};

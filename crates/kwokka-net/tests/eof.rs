@@ -10,10 +10,7 @@
 #![cfg(target_os = "linux")]
 #![cfg(not(any(miri, loom)))]
 
-use std::{
-    net::{TcpListener, TcpStream},
-    os::fd::AsRawFd,
-};
+use std::net::{TcpListener, TcpStream};
 
 #[test]
 fn recv_resolves_zero_when_peer_closes() {
@@ -38,8 +35,8 @@ fn recv_resolves_zero_when_peer_closes() {
     let Ok(mut runtime) = kwokka_runtime::Runtime::affine() else {
         panic!("the affine runtime must build on this host");
     };
-    let (result, _buf) =
-        runtime.block_on(kwokka_net::tcp::RecvFuture::<64>::new(server.as_raw_fd()));
+    let server = kwokka_net::tcp::TcpStream::from(server);
+    let (result, _buf) = runtime.block_on(server.recv::<64>());
 
     let Ok(received) = result else {
         panic!("a recv on a closed peer resolves with EOF, not an error");

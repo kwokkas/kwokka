@@ -20,7 +20,7 @@ use std::{
 
 use kwokka_io::boundary;
 
-use crate::tcp::{AcceptFuture, AcceptStream, TcpStream};
+use crate::tcp::{AcceptStream, TcpStream, accept::AcceptFuture};
 
 /// A TCP socket listening for inbound connections.
 ///
