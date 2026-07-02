@@ -1,11 +1,13 @@
 //! End-to-end buffered recv through the affine run-loop.
 //!
-//! Connects a loopback socket pair via std, writes bytes on the client end, then
-//! drives [`RecvFuture`] on the server fd through the real `io_uring` ring:
-//! submit a recv into the future's inline buffer, park, harvest the CQE, wake,
-//! and read the bytes back. The socket counterpart of the buffered-read e2e
-//! test. The write buffers into the server's receive queue, so the recv harvests
-//! it sequentially with no concurrent peer.
+//! Connects a loopback socket pair via std, writes bytes on the client end,
+//! then drives the public [`TcpStream::recv`] entry on the adopted server end
+//! through the real `io_uring` ring: submit a recv, park, harvest the CQE,
+//! wake, and read the bytes back. The socket counterpart of the buffered-read
+//! e2e test. The write buffers into the server's receive queue, so the recv
+//! harvests it sequentially with no concurrent peer.
+//!
+//! [`TcpStream::recv`]: kwokka_net::tcp::TcpStream::recv
 
 #![cfg(target_os = "linux")]
 #![cfg(not(any(miri, loom)))]
@@ -13,7 +15,6 @@
 use std::{
     io::Write,
     net::{TcpListener, TcpStream},
-    os::fd::AsRawFd,
 };
 
 #[test]
@@ -41,8 +42,8 @@ fn recv_returns_sent_bytes() {
     let Ok(mut runtime) = kwokka_runtime::Runtime::affine() else {
         panic!("the affine runtime must build on this host");
     };
-    let (result, buf) =
-        runtime.block_on(kwokka_net::tcp::RecvFuture::<64>::new(server.as_raw_fd()));
+    let server = kwokka_net::tcp::TcpStream::from(server);
+    let (result, buf) = runtime.block_on(server.recv::<64>());
 
     // Hold the connection open until the recv has drained its bytes.
     drop(client);

@@ -1,12 +1,13 @@
 //! Connected TCP socket -- the owned endpoint an accept or connect lands.
 
+use core::future::Future;
 use std::{
     io,
     net::{self, SocketAddr},
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
-use crate::tcp::{RecvFuture, SendFuture};
+use kwokka_io::operation::{RecvFuture, SendFuture};
 
 /// A connected TCP socket.
 ///
@@ -44,7 +45,11 @@ impl TcpStream {
     /// Hands out the future receiving up to `CAP` bytes from this socket.
     ///
     /// Awaiting it resolves to an [`io::Result`] byte count paired with the
-    /// filled buffer. See [`RecvFuture`] for the await-to-completion contract.
+    /// filled buffer: the bytes received (a short count on a partial read, or
+    /// `0` at end of stream), or the mapped error. The bytes live in a
+    /// worker-owned registry for the op lifetime, so dropping the future
+    /// mid-flight is safe. Await it directly on a runtime task: polling it
+    /// through a waker the runtime did not build panics.
     ///
     /// # Examples
     ///
@@ -60,7 +65,9 @@ impl TcpStream {
     /// let _read = result?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn recv<const CAP: usize>(&self) -> RecvFuture<CAP> {
+    pub fn recv<const CAP: usize>(
+        &self,
+    ) -> impl Future<Output = (io::Result<usize>, [u8; CAP])> + use<CAP> {
         RecvFuture::new(self.inner.as_raw_fd())
     }
 
@@ -69,8 +76,10 @@ impl TcpStream {
     ///
     /// `data` is a `CAP`-byte array and `len` marks how many of its leading
     /// bytes to send; the rest is ignored. Awaiting it resolves to an
-    /// [`io::Result`] byte count. See [`SendFuture`] for the
-    /// await-to-completion contract.
+    /// [`io::Result`] byte count (a short count when the socket send buffer
+    /// fills). The kernel reads a worker-owned copy of the bytes, so dropping
+    /// the future mid-flight is safe. Await it directly on a runtime task:
+    /// polling it through a waker the runtime did not build panics.
     ///
     /// # Examples
     ///
@@ -87,7 +96,11 @@ impl TcpStream {
     /// let _sent = runtime.block_on(stream.send::<64>(data, 5))?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn send<const CAP: usize>(&self, data: [u8; CAP], len: usize) -> SendFuture<CAP> {
+    pub fn send<const CAP: usize>(
+        &self,
+        data: [u8; CAP],
+        len: usize,
+    ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
         SendFuture::new(self.inner.as_raw_fd(), data, len)
     }
 }

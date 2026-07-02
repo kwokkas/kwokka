@@ -42,7 +42,7 @@ use crate::tcp::TcpStream;
 /// `user_data` round trip decodes the polling task from the waker, so
 /// await it directly.
 #[must_use = "futures do nothing unless polled"]
-pub struct AcceptFuture {
+pub(super) struct AcceptFuture {
     /// Listening socket file descriptor.
     fd: i32,
     /// The worker and token the accept submitted under, once in flight. `Some`
@@ -60,7 +60,7 @@ struct AcceptOp {
 
 impl AcceptFuture {
     /// Constructs an accept future for listening socket `fd`.
-    pub const fn new(fd: i32) -> Self {
+    pub(crate) const fn new(fd: i32) -> Self {
         Self {
             fd,
             submitted: None,
@@ -149,7 +149,7 @@ enum AcceptState {
     Done,
 }
 
-impl<'listener> AcceptStream<'listener> {
+impl AcceptStream<'_> {
     /// Builds an accept stream for listening socket `fd`.
     pub(crate) const fn new(fd: i32) -> Self {
         Self {
@@ -162,9 +162,39 @@ impl<'listener> AcceptStream<'listener> {
     /// Awaits the next accepted connection, or `None` once the stream ends.
     ///
     /// Written for the ordinary `while let Some(conn) = stream.next().await`
-    /// loop.
-    pub const fn next(&mut self) -> AcceptNext<'_, 'listener> {
-        AcceptNext { stream: self }
+    /// loop. Await it directly on a runtime task: the returned future panics
+    /// when polled through a waker the runtime did not build.
+    pub async fn next(&mut self) -> Option<io::Result<TcpStream>> {
+        core::future::poll_fn(|cx| self.poll_next(cx)).await
+    }
+
+    /// Advances the stream by one completion.
+    fn poll_next(&mut self, cx: &mut Context<'_>) -> Poll<Option<io::Result<TcpStream>>> {
+        let Some(binding) = boundary::decode_waker(cx.waker()) else {
+            panic!("AcceptStream requires the runtime task waker; await it directly");
+        };
+        if matches!(self.state, AcceptState::Idle) {
+            self.state = start_multishot(self.fd, binding);
+        }
+        let multishot_key = match &self.state {
+            AcceptState::Multishot(key) => Some(*key),
+            _ => None,
+        };
+        if let Some(key) = multishot_key {
+            return match multishot_next(binding, key) {
+                MultishotNext::Item(result) => Poll::Ready(Some(adopt(result))),
+                MultishotNext::Pending => Poll::Pending,
+                MultishotNext::Ended => {
+                    self.state = AcceptState::Done;
+                    Poll::Ready(None)
+                }
+            };
+        }
+        if matches!(self.state, AcceptState::Fallback(_)) {
+            return poll_fallback(self, cx);
+        }
+        // `Idle` is left non-`Idle` by `start_multishot`; `Done` yields `None`.
+        Poll::Ready(None)
     }
 }
 
@@ -175,45 +205,6 @@ impl Drop for AcceptStream<'_> {
             // worker; the cancel reaches the inbox single-writer.
             boundary::push_multishot_cancel_for_worker(*key);
         }
-    }
-}
-
-/// The future returned by [`AcceptStream::next`].
-#[must_use = "futures do nothing unless polled"]
-pub struct AcceptNext<'stream, 'listener> {
-    stream: &'stream mut AcceptStream<'listener>,
-}
-
-impl Future for AcceptNext<'_, '_> {
-    type Output = Option<io::Result<TcpStream>>;
-
-    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let Some(binding) = boundary::decode_waker(cx.waker()) else {
-            panic!("AcceptStream requires the runtime task waker; await it directly");
-        };
-        let stream = &mut *self.get_mut().stream;
-        if matches!(stream.state, AcceptState::Idle) {
-            stream.state = start_multishot(stream.fd, binding);
-        }
-        let multishot_key = match &stream.state {
-            AcceptState::Multishot(key) => Some(*key),
-            _ => None,
-        };
-        if let Some(key) = multishot_key {
-            return match multishot_next(binding, key) {
-                MultishotNext::Item(result) => Poll::Ready(Some(adopt(result))),
-                MultishotNext::Pending => Poll::Pending,
-                MultishotNext::Ended => {
-                    stream.state = AcceptState::Done;
-                    Poll::Ready(None)
-                }
-            };
-        }
-        if matches!(stream.state, AcceptState::Fallback(_)) {
-            return poll_fallback(stream, cx);
-        }
-        // `Idle` is left non-`Idle` by `start_multishot`; `Done` yields `None`.
-        Poll::Ready(None)
     }
 }
 

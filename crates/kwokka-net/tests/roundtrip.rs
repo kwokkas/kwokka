@@ -1,28 +1,26 @@
-//! End-to-end socket roundtrip on the runtime's own futures.
+//! End-to-end socket roundtrip over the public entries.
 //!
-//! Drives [`AcceptFuture`], [`SendFuture`], and [`RecvFuture`] sequentially
-//! inside one task on the real `io_uring` ring: accept the backlog connection,
-//! send a payload from the client fd, then receive it back on the accepted fd.
-//! The first test composing several I/O ops in a single task, so it proves the
-//! per-op wake-data handoff and the submit-once gating across consecutive
-//! awaits. The connect op stays out: std cannot produce an unconnected TCP fd,
-//! so [`ConnectFuture`] is covered by its own datagram-socket test.
+//! Composes accept, send, and recv sequentially inside one task on the real
+//! `io_uring` ring: accept the backlog connection through
+//! [`TcpListener::accept`], send a payload from the adopted client end, then
+//! receive it back on the accepted stream. The first test composing several
+//! I/O ops in a single task, so it proves the per-op wake-data handoff and
+//! the submit-once gating across consecutive awaits. The connect op stays
+//! out: std cannot produce an unconnected TCP fd, so the connect future is
+//! covered by its own in-crate datagram-socket test.
 //!
-//! [`ConnectFuture`]: kwokka_net::tcp::ConnectFuture
+//! [`TcpListener::accept`]: kwokka_net::tcp::TcpListener::accept
 
 #![cfg(target_os = "linux")]
 #![cfg(not(any(miri, loom)))]
 
-use std::{
-    net::{TcpListener, TcpStream},
-    os::fd::AsRawFd,
-};
+use std::net::TcpStream;
 
-use kwokka_net::tcp::{AcceptFuture, RecvFuture, SendFuture};
+use kwokka_net::tcp::TcpListener;
 use kwokka_runtime::Runtime;
 
 #[test]
-fn roundtrip_delivers_payload_over_runtime_futures() {
+fn roundtrip_delivers_payload_over_public_entries() {
     let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
         panic!("binding a loopback listener must succeed");
     };
@@ -35,6 +33,7 @@ fn roundtrip_delivers_payload_over_runtime_futures() {
     let Ok(client) = TcpStream::connect(addr) else {
         panic!("connecting to the loopback listener must succeed");
     };
+    let client = kwokka_net::tcp::TcpStream::from(client);
 
     let payload = b"kwokka runtime roundtrip";
     let mut data = [0u8; 64];
@@ -43,19 +42,19 @@ fn roundtrip_delivers_payload_over_runtime_futures() {
     let Ok(mut runtime) = Runtime::affine() else {
         panic!("the affine runtime must build on this host");
     };
-    let listener_fd = listener.as_raw_fd();
-    let client_fd = client.as_raw_fd();
     let (accepted, sent, received, buf) = runtime.block_on(async move {
-        let accepted = AcceptFuture::new(listener_fd).await;
-        let sent = SendFuture::<64>::new(client_fd, data, payload.len()).await;
-        let (received, buf) = RecvFuture::<64>::new(accepted).await;
-        (accepted, sent, received, buf)
+        let accepted = listener.accept().await;
+        let sent = client.send::<64>(data, payload.len()).await;
+        let (received, buf) = match &accepted {
+            Ok(conn) => conn.recv::<64>().await,
+            Err(_) => (Ok(0), [0u8; 64]),
+        };
+        (accepted.map(drop), sent, received, buf)
     });
 
-    assert!(
-        accepted >= 0,
-        "the accept completed with an error: {accepted}"
-    );
+    let Ok(()) = accepted else {
+        panic!("the accept must resolve with a connection, not an error");
+    };
     let Ok(sent) = sent else {
         panic!("the send must resolve with a byte count");
     };

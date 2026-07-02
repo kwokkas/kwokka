@@ -1,11 +1,13 @@
 //! End-to-end buffered send through the affine run-loop.
 //!
-//! Connects a loopback socket pair via std, then drives [`SendFuture`] on the
-//! client fd through the real `io_uring` ring: submit a send from the future's
-//! inline buffer, park, harvest the CQE, wake, and read the byte count back.
-//! The socket counterpart of the buffered-write e2e test. The sent bytes land
-//! in the server's receive queue, so a std read harvests them sequentially with
-//! no concurrent peer.
+//! Connects a loopback socket pair via std, then drives the public
+//! [`TcpStream::send`] entry on the adopted client end through the real
+//! `io_uring` ring: submit a send, park, harvest the CQE, wake, and read the
+//! byte count back. The socket counterpart of the buffered-write e2e test.
+//! The sent bytes land in the server's receive queue, so a std read harvests
+//! them sequentially with no concurrent peer.
+//!
+//! [`TcpStream::send`]: kwokka_net::tcp::TcpStream::send
 
 #![cfg(target_os = "linux")]
 #![cfg(not(any(miri, loom)))]
@@ -13,10 +15,8 @@
 use std::{
     io::Read,
     net::{TcpListener, TcpStream},
-    os::fd::AsRawFd,
 };
 
-use kwokka_net::tcp::SendFuture;
 use kwokka_runtime::Runtime;
 
 #[test]
@@ -41,11 +41,8 @@ fn send_delivers_buffer_bytes() {
     let Ok(mut runtime) = Runtime::affine() else {
         panic!("the affine runtime must build on this host");
     };
-    let result = runtime.block_on(SendFuture::<64>::new(
-        client.as_raw_fd(),
-        data,
-        message.len(),
-    ));
+    let client = kwokka_net::tcp::TcpStream::from(client);
+    let result = runtime.block_on(client.send::<64>(data, message.len()));
 
     let Ok(sent) = result else {
         panic!("the send must resolve with a byte count, not an error");
