@@ -7,7 +7,7 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
-use kwokka_io::operation::{RecvFuture, SendFuture};
+use kwokka_io::operation::{ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture};
 
 /// A connected TCP socket.
 ///
@@ -69,6 +69,49 @@ impl TcpStream {
         &self,
     ) -> impl Future<Output = (io::Result<usize>, [u8; CAP])> + use<CAP> {
         RecvFuture::new(self.inner.as_raw_fd())
+    }
+
+    /// Hands out the future receiving into a kernel-selected provided buffer.
+    ///
+    /// Awaiting it resolves to an [`io::Result`] holding a [`ProvidedBuf`]: a
+    /// borrowed, zero-copy view over the worker's provided-buffer ring, spanning
+    /// the bytes received (an empty view at end of stream), or the mapped error.
+    /// No byte is copied between the kernel write and the caller's read. The
+    /// view borrows the worker's pool, so it is `!Send` and stays valid only
+    /// within the runtime run that produced it. Await it directly on a runtime
+    /// task: polling it through a waker the runtime did not build panics.
+    ///
+    /// The pool owns the bytes for the op lifetime, so dropping the future
+    /// mid-flight is safe. A task that drops an in-flight provided recv must not
+    /// issue another before it settles -- two ops sharing one task token cannot
+    /// be told apart by the completion drain.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: needs a connected peer, io_uring, and a registered buf_ring.
+    /// use kwokka_net::tcp::TcpListener;
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let stream = runtime.block_on(listener.accept())?;
+    /// let received = runtime.block_on(stream.recv_provided());
+    /// let buf = received?;
+    /// let _bytes: &[u8] = &buf;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// Resolves [`io::ErrorKind::Unsupported`] when the backend registered no
+    /// provided-buffer ring (a kernel without `buf_ring`, or a ring that failed
+    /// to register); the caller falls back to [`recv`](Self::recv). A pool
+    /// exhausted of free buffers surfaces `-ENOBUFS` as its raw OS error, the
+    /// caller's signal to re-arm; other negative completions map to their
+    /// `-errno`.
+    pub fn recv_provided(&self) -> impl Future<Output = io::Result<ProvidedBuf>> + use<> {
+        ProvidedRecvFuture::new(self.inner.as_raw_fd())
     }
 
     /// Hands out the future sending the first `len` bytes of `data` (clamped
