@@ -14,7 +14,10 @@ use kwokka_core::{
 };
 use kwokka_io::{
     DriverType,
-    buffer::{inflight::InflightBufSlab, multishot::MultishotSlab},
+    buffer::{
+        inflight::InflightBufSlab,
+        multishot::{MultishotSlab, RecvMultishotSlab},
+    },
 };
 
 #[cfg(feature = "steal")]
@@ -85,6 +88,7 @@ pub(crate) fn tick<C: Clock>(
     driver: Option<NonNull<DriverType>>,
     inflight_slab: Option<NonNull<InflightBufSlab>>,
     multishot_slab: Option<NonNull<MultishotSlab>>,
+    recv_multishot_slab: Option<NonNull<RecvMultishotSlab>>,
     #[cfg(feature = "steal")] forward: &ForwardTable,
 ) -> Tick {
     let now = timer.now_tick();
@@ -122,6 +126,7 @@ pub(crate) fn tick<C: Clock>(
             driver,
             inflight_slab,
             multishot_slab,
+            recv_multishot_slab,
             Some(NonNull::from(&mut *timer_requests)),
         ) else {
             continue;
@@ -280,6 +285,7 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
                 &forward,
             )
         }
@@ -293,6 +299,7 @@ mod tests {
                 &mut reap,
                 &mut timer_requests,
                 worker(0),
+                None,
                 None,
                 None,
                 None,

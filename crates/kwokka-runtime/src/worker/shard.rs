@@ -14,11 +14,14 @@ use kwokka_io::{
     DriverType,
     boundary::{
         ACCEPT_CANCEL_CAPACITY, AcceptCancelSet, CANCEL_INBOX_CAPACITY, CancelInbox,
-        PROVIDED_RECV_CANCEL_CAPACITY, ProvidedRecvCancelSet,
+        PROVIDED_RECV_CANCEL_CAPACITY, ProvidedRecvCancelSet, RECV_CANCEL_INBOX_CAPACITY,
+        RecvCancelInbox,
     },
     buffer::{
         inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
-        multishot::{DEFAULT_MULTISHOT_CAP, MultishotSlab},
+        multishot::{
+            DEFAULT_MULTISHOT_CAP, DEFAULT_RECV_MULTISHOT_CAP, MultishotSlab, RecvMultishotSlab,
+        },
     },
 };
 
@@ -80,6 +83,18 @@ pub(crate) struct WorkerShard {
     /// Per-worker multishot registry, holding the FIFO of completions for each
     /// in-flight multishot op. Drop-order independent (no heap, no fd).
     pub(crate) multishot_slab: MultishotSlab,
+    /// Per-worker multishot recv registry, holding the FIFO of `(count, buf_id)`
+    /// completions for each in-flight recv stream. mmap-backed FIFO payload,
+    /// declared after `driver` for the same teardown discipline as the buffered
+    /// slab, though the kernel never writes into it directly: the FIFO holds
+    /// CQE-derived tuples, and the provided buffers themselves live in the
+    /// driver's pool.
+    pub(crate) recv_multishot_slab: RecvMultishotSlab,
+    /// Per-worker cancel queue for dropped multishot recv streams. Dedicated and
+    /// mmap-backed -- kept off the shared `cancel_inbox` ring, which sits at the
+    /// shard's stack-frame budget. Drop-order independent (no fd, no kernel
+    /// writes).
+    pub(crate) recv_cancel_inbox: RecvCancelInbox<RECV_CANCEL_INBOX_CAPACITY>,
     /// Per-worker generational slab holding task headers and futures.
     pub(crate) tasks: Slab<TaskSlot>,
     /// Hierarchical timer wheel for deadline-based wakeups.
@@ -136,6 +151,8 @@ impl WorkerShard {
             accept_cancels: AcceptCancelSet::new(),
             provided_recv_cancels: ProvidedRecvCancelSet::new(),
             multishot_slab: MultishotSlab::new(id.raw(), DEFAULT_MULTISHOT_CAP),
+            recv_multishot_slab: RecvMultishotSlab::new(id.raw(), DEFAULT_RECV_MULTISHOT_CAP)?,
+            recv_cancel_inbox: RecvCancelInbox::new()?,
             tasks: Slab::new(task_capacity),
             timer,
             run_queue: LocalRunQueue::new(),

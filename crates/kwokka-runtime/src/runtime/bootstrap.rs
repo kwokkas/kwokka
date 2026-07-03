@@ -22,9 +22,10 @@ use kwokka_core::{namespace::Namespace, slab::SlabKey};
 use kwokka_io::{
     IoDriver,
     boundary::{
-        CancelInboxGuard, ProvidedPoolGuard, dispose_cancelled_op, is_cancel_sentinel,
-        is_multishot_sentinel, push_multishot_completion, reclaim_cancel_completion,
-        reclaim_dropped_slot, submit_cancel_for,
+        CancelInboxGuard, ProvidedPoolGuard, RecvCancelInboxGuard, dispose_cancelled_op,
+        is_cancel_sentinel, is_multishot_sentinel, is_recv_multishot_sentinel,
+        push_multishot_completion, push_recv_multishot_completion, reclaim_cancel_completion,
+        reclaim_dropped_slot, submit_cancel_for, submit_recv_multishot_cancel,
     },
     operation::Completion,
     wake,
@@ -91,6 +92,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         Some(NonNull::from(&mut shard.driver)),
         Some(NonNull::from(&mut shard.inflight_slab)),
         Some(NonNull::from(&mut shard.multishot_slab)),
+        Some(NonNull::from(&mut shard.recv_multishot_slab)),
         &shard.forward,
     );
     #[cfg(not(feature = "steal"))]
@@ -105,6 +107,7 @@ pub(crate) fn run_pass(shard: &mut WorkerShard, wake_fd: i32) -> Tick {
         Some(NonNull::from(&mut shard.driver)),
         Some(NonNull::from(&mut shard.inflight_slab)),
         Some(NonNull::from(&mut shard.multishot_slab)),
+        Some(NonNull::from(&mut shard.recv_multishot_slab)),
     );
     cycle::drain_spawns(
         &mut shard.tasks,
@@ -295,6 +298,38 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             }
             continue;
         }
+        if is_recv_multishot_sentinel(user_data) {
+            // A multishot recv op's CQE. Route the `(result, buf_id)` into its
+            // registry FIFO and wake the owning stream; the buffer id is read and
+            // recycled inside on every stale, overflowed, or cancel-pending CQE
+            // (recv reports a selected buffer on intermediate and terminal CQEs
+            // alike), and a terminal cancel CQE frees the slot in there. The
+            // terminal CQE also retires the one SQE `poll_one` counted, even when
+            // no wake is returned, so the task's in-flight count settles.
+            let outcome = push_recv_multishot_completion(
+                &mut shard.recv_multishot_slab,
+                &shard.driver,
+                user_data,
+                completion.result,
+                completion.flags,
+                completion.buf_id,
+            );
+            if let Some(owner) = outcome.wake {
+                wake_local(
+                    &mut shard.tasks,
+                    &mut shard.run_queue,
+                    TaskRef::from_raw(owner),
+                );
+            }
+            if let Some(owner) = outcome.retire {
+                let task_ref = TaskRef::from_raw(owner);
+                let key = SlabKey::new(task_ref.index(), task_ref.generation());
+                if let Some(slot) = shard.tasks.get_mut(key) {
+                    slot.header_mut().retire_in_flight_op();
+                }
+            }
+            continue;
+        }
         // The original op's completion is the kernel's done-with-the-bytes
         // signal. If a dropped buffered future owned this op, free its slot now;
         // a live future's slot is not retire-pending, so this is a no-op and it
@@ -345,6 +380,13 @@ fn drain_cancels(shard: &mut WorkerShard) {
             &mut shard.provided_recv_cancels,
             key,
         );
+    }
+    // Recv-multishot cancels ride a dedicated per-worker inbox, not the shared
+    // ring, so they drain here on their own key type. Each recycles any buffers
+    // still queued for the gone stream, marks the slot cancel-pending, and
+    // submits a hurry-up cancel; the op's terminal completion frees the slot.
+    while let Some(key) = shard.recv_cancel_inbox.pop() {
+        submit_recv_multishot_cancel(&shard.driver, &mut shard.recv_multishot_slab, key);
     }
 }
 
@@ -433,6 +475,8 @@ impl Runtime<Affine> {
     pub fn block_on<F: Future>(&mut self, future: F) -> F::Output {
         let worker_id = self.shard.id.raw();
         let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
+        let _recv_cancel_guard =
+            RecvCancelInboxGuard::install(worker_id, &mut self.shard.recv_cancel_inbox);
         // The pool outlives this run (it is driver-owned); the guard scopes
         // handle access to the run-loop, clearing the slot on exit.
         let _pool_guard = ProvidedPoolGuard::install(worker_id, &self.shard.driver);

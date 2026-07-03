@@ -23,12 +23,16 @@ use core::{
     sync::atomic::{AtomicPtr, AtomicU16, AtomicU64, Ordering},
     task::Waker,
 };
-use std::os::fd::{FromRawFd, OwnedFd};
+use std::{
+    io,
+    os::fd::{FromRawFd, OwnedFd},
+};
 
 use crate::{
     DriverType, IoDriver,
     buffer::{
         inflight::{InflightBufSlab, InflightSlotKey},
+        mmap::MmapRegion,
         multishot::{
             MultishotPush, MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotPush,
             RecvMultishotSlab, RecvMultishotSlotKey,
@@ -221,6 +225,10 @@ pub struct IoSeam {
     /// stream allocates and drains a slot here through [`IoSeam::allocate_multishot_slot`]
     /// and [`IoSeam::multishot_next`].
     multishot_slab: Option<NonNull<MultishotSlab>>,
+    /// The worker's multishot recv registry, or `None` for a test seam. A recv
+    /// stream allocates and drains a slot here through
+    /// [`IoSeam::allocate_recv_multishot_slot`] and [`IoSeam::recv_multishot_next`].
+    recv_multishot_slab: Option<NonNull<RecvMultishotSlab>>,
     /// The polling task's captured completion result, when one has arrived.
     wake_slot: Option<WakeSlot>,
     /// Ops submitted through the seam this poll. The runtime folds the count
@@ -243,6 +251,7 @@ impl IoSeam {
             driver,
             inflight_slab,
             multishot_slab: None,
+            recv_multishot_slab: None,
             wake_slot,
             submitted: AtomicU16::new(0),
         }
@@ -255,6 +264,19 @@ impl IoSeam {
     #[must_use]
     pub const fn with_multishot_slab(mut self, slab: Option<NonNull<MultishotSlab>>) -> Self {
         self.multishot_slab = slab;
+        self
+    }
+
+    /// Attaches the worker's multishot recv registry to the seam.
+    ///
+    /// The run-loop calls this only on the production path; a test seam keeps
+    /// `None` and a recv stream resolves as unsupported.
+    #[must_use]
+    pub const fn with_recv_multishot_slab(
+        mut self,
+        slab: Option<NonNull<RecvMultishotSlab>>,
+    ) -> Self {
+        self.recv_multishot_slab = slab;
         self
     }
 
@@ -631,6 +653,105 @@ impl IoSeam {
         let slab = unsafe { slab.as_mut() };
         slab.free(key);
     }
+
+    /// Reserves a multishot recv slot for the polling task.
+    ///
+    /// `owner_token` is the polling task, woken on each completion. On
+    /// [`RecvMultishotAlloc::Allocated`] the stream tags its multishot recv SQE
+    /// with the returned sentinel, drains the slot's FIFO on later polls via
+    /// [`IoSeam::recv_multishot_next`], and hands the key to
+    /// [`push_recv_multishot_cancel_for_worker`] if it drops before the op
+    /// terminates. Returns [`RecvMultishotAlloc::Full`] when every slot is
+    /// occupied, so the stream can degrade to a single-shot provided recv, and
+    /// [`RecvMultishotAlloc::Unsupported`] when the seam carries no recv registry
+    /// (a test seam).
+    pub fn allocate_recv_multishot_slot(&self, owner_token: u64) -> RecvMultishotAlloc {
+        let Some(mut slab) = self.recv_multishot_slab else {
+            return RecvMultishotAlloc::Unsupported;
+        };
+        // SAFETY: Invariant -- `slab` points at the worker's `recv_multishot_slab`
+        // field, formed by the run-loop via `NonNull::from(&mut ...)` and
+        // disjoint from the driver, task slab, inflight slab, accept multishot
+        // slab, and inboxes the runtime borrows separately across the poll. The
+        // field lives on the worker, which outlives every poll window it hosts.
+        // Precondition (why this `&mut` is unique for the window): the runtime
+        // polls one task at a time per worker -- `poll_one` is not re-entrant and
+        // `SeamGuard` is not re-entrant, so at most one `IoSeam` is installed per
+        // worker, and `allocate_recv_multishot_slot` / `recv_multishot_next` /
+        // `recv_multishot_free` are the only paths that form a
+        // `&mut RecvMultishotSlab` during a poll, each running to completion
+        // before the next. A nested `block_on` claims a different worker id with
+        // its own slab, so it aliases nothing here.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // aliases this one (double-mutable-aliasing UB); the non-reentrant poll
+        // structure excludes it, and a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        slab.allocate(owner_token)
+            .map_or(RecvMultishotAlloc::Full, |key| {
+                RecvMultishotAlloc::Allocated {
+                    key,
+                    sentinel: encode_recv_multishot_sentinel(key),
+                }
+            })
+    }
+
+    /// Advances `key`'s multishot recv stream by one completion.
+    ///
+    /// Returns the next queued `(result, buf_id)`, `Pending` while the op is in
+    /// flight with an empty FIFO, or `Ended` once the op posted its terminal CQE
+    /// and the FIFO is drained -- freeing the slot. A seam with no recv slab
+    /// yields `Ended`. A [`NO_BUFFER`](crate::buffer::multishot::recv) entry
+    /// (end of stream or a negative result) reports `buf_id: None`.
+    ///
+    /// Buffer-recycle contract: a `Some(buf_id)` handed back in an
+    /// [`RecvMultishotNext::Item`] names a kernel-selected provided buffer the
+    /// caller now owns. The drain recycles a buffer only on the paths where no
+    /// consumer takes it (a stale, overflowed, or dropped stream); a buffer
+    /// successfully dequeued here is NOT recycled by the runtime, so the caller
+    /// must read it and return it to the driver's pool, or the pool entry leaks
+    /// until teardown. This mirrors the borrow-then-recycle discipline the
+    /// single-shot provided-recv path enforces through its buffer view's drop.
+    pub fn recv_multishot_next(&self, key: RecvMultishotSlotKey) -> RecvMultishotNext {
+        let Some(mut slab) = self.recv_multishot_slab else {
+            return RecvMultishotNext::Ended;
+        };
+        // SAFETY: identical contract to `allocate_recv_multishot_slot` -- the sole
+        // `&mut RecvMultishotSlab` for the non-reentrant poll window, over the
+        // worker's live `recv_multishot_slab` field reached via `with_current`,
+        // each slab-forming path running to completion before the next.
+        let slab = unsafe { slab.as_mut() };
+        if let Some((result, buf_id)) = slab.pop(key) {
+            let buf_id = if buf_id == NO_BUFFER {
+                None
+            } else {
+                Some(buf_id)
+            };
+            return RecvMultishotNext::Item { result, buf_id };
+        }
+        if slab.is_terminated(key) {
+            slab.free(key);
+            return RecvMultishotNext::Ended;
+        }
+        RecvMultishotNext::Pending
+    }
+
+    /// Frees `key`'s multishot recv slot without draining it.
+    ///
+    /// The stream calls this only when a submit fails right after an allocate,
+    /// so the slot carries no in-flight op. A stale key is a no-op; a seam with
+    /// no recv slab is a no-op.
+    pub fn recv_multishot_free(&self, key: RecvMultishotSlotKey) {
+        let Some(mut slab) = self.recv_multishot_slab else {
+            return;
+        };
+        // SAFETY: identical contract to `allocate_recv_multishot_slot` -- the
+        // sole `&mut RecvMultishotSlab` for the non-reentrant poll window, over
+        // the worker's live `recv_multishot_slab` field reached via
+        // `with_current`.
+        let slab = unsafe { slab.as_mut() };
+        slab.free(key);
+    }
 }
 
 /// RAII bracket that installs a seam for one poll window and clears it on
@@ -767,6 +888,140 @@ impl<const N: usize> CancelInbox<N> {
 impl<const N: usize> Default for CancelInbox<N> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Per-worker capacity for pending multishot recv cancels.
+///
+/// Sized to the multishot recv registry itself
+/// ([`DEFAULT_RECV_MULTISHOT_CAP`](crate::buffer::multishot::DEFAULT_RECV_MULTISHOT_CAP)),
+/// so a worker can queue a cancel for every occupied recv slot in one tick. A
+/// recv slot stays occupied until its terminal completion frees it, so no slot
+/// drops twice before a drain and this window bounds the pending cancels. Kept
+/// off the shared [`CancelInbox`] ring -- which sits at the shard's stack-frame
+/// budget -- and backed by an `mmap` region so its slots do not inflate the
+/// shard's inline frame. Overflow keeps the established meaning: the cancel
+/// record is lost, a bounded leak of pool buffer ids reclaimed at pool teardown,
+/// never a free under a live kernel access.
+pub const RECV_CANCEL_INBOX_CAPACITY: usize =
+    crate::buffer::multishot::DEFAULT_RECV_MULTISHOT_CAP as usize;
+
+/// Bytes per queued recv cancel: a `u64` generation, a `u16` slot, and a `u8`
+/// worker id, little-endian packed.
+const RECV_CANCEL_ENTRY_LEN: usize = 11;
+
+/// Fixed-capacity mmap-backed ring of pending cancels for dropped multishot recv
+/// streams.
+///
+/// A recv stream whose op is still in flight cannot recycle its provided buffers
+/// on drop -- the kernel still owns the buffer choice. It instead pushes its
+/// [`RecvMultishotSlotKey`] here; the owning worker drains the ring each tick,
+/// recycles any queued buffers, marks the slot cancel-pending, and submits a
+/// cancel SQE, and the op's terminal completion frees the slot.
+///
+/// The caller keeps an in-flight recv op pinned to its worker (`io_bound`), so
+/// every push runs on the owning worker thread. The ring is therefore
+/// single-writer and needs no atomics. Unlike the inline [`CancelInbox`], the
+/// slot payload lives in an `mmap` region so the ring's
+/// [`RECV_CANCEL_INBOX_CAPACITY`] entries do not inflate the shard's stack frame;
+/// only the head/len cursor is inline.
+///
+/// At [`RECV_CANCEL_INBOX_CAPACITY`] there is one slot per recv op that can drop
+/// between drains, so overflow is a safety backstop, not a steady state: a full
+/// ring drops the cancel, a bounded leak of pool buffer ids, and the op's own
+/// terminal completion still recycles its buffers and frees the slot, so no
+/// buffer is freed under a live kernel write.
+pub struct RecvCancelInbox<const N: usize> {
+    /// mmap-backed ring of `RECV_CANCEL_ENTRY_LEN`-byte packed slot keys, oldest
+    /// at `head`.
+    storage: MmapRegion,
+    /// Ring read cursor, always in `[0, N)`.
+    head: usize,
+    /// Count of queued cancels; `(head + len) % N` is the next write slot.
+    len: usize,
+}
+
+impl<const N: usize> RecvCancelInbox<N> {
+    /// Creates an empty recv cancel inbox.
+    ///
+    /// # Errors
+    ///
+    /// Returns the `mmap` error when backing allocation fails.
+    ///
+    /// # Panics
+    ///
+    /// Compile-time panic if `N` is zero.
+    pub fn new() -> io::Result<Self> {
+        const {
+            assert!(N > 0, "N must be positive");
+        }
+        let storage = MmapRegion::new(N * RECV_CANCEL_ENTRY_LEN)?;
+        Ok(Self {
+            storage,
+            head: 0,
+            len: 0,
+        })
+    }
+
+    /// Queues a cancel for a dropped recv stream's in-flight op.
+    ///
+    /// A full ring drops the cancel -- a bounded leak: the op's own terminal
+    /// completion still recycles its buffers and frees its slot. The caller does
+    /// not retry. At [`RECV_CANCEL_INBOX_CAPACITY`] the ring holds every recv op
+    /// that can drop between drains, so the full case is a backstop.
+    pub fn push_cancel(&mut self, key: RecvMultishotSlotKey) {
+        if self.len >= N {
+            return;
+        }
+        let index = (self.head + self.len) % N;
+        let offset = index * RECV_CANCEL_ENTRY_LEN;
+        let bytes = self.storage.as_mut_slice();
+        // Bounds-checked once through `get_mut`; a `None` never occurs (the region
+        // is sized `N * RECV_CANCEL_ENTRY_LEN` and `index < N`), but gating here
+        // keeps the write panic-free like the recv slab's byte accessors.
+        let Some(record) = bytes.get_mut(offset..offset + RECV_CANCEL_ENTRY_LEN) else {
+            return;
+        };
+        record[0..8].copy_from_slice(&key.generation.to_le_bytes());
+        record[8..10].copy_from_slice(&key.slot.to_le_bytes());
+        record[10] = key.worker_id;
+        self.len += 1;
+    }
+
+    /// Pops the oldest pending cancel, or `None` when the inbox is empty.
+    pub fn pop(&mut self) -> Option<RecvMultishotSlotKey> {
+        if self.len == 0 {
+            return None;
+        }
+        let offset = self.head * RECV_CANCEL_ENTRY_LEN;
+        let bytes = self.storage.as_slice();
+        let record = bytes.get(offset..offset + RECV_CANCEL_ENTRY_LEN)?;
+        let Ok(generation) = <[u8; 8]>::try_from(&record[0..8]) else {
+            return None;
+        };
+        let Ok(slot) = <[u8; 2]>::try_from(&record[8..10]) else {
+            return None;
+        };
+        let worker_id = record[10];
+        self.head = (self.head + 1) % N;
+        self.len -= 1;
+        Some(RecvMultishotSlotKey {
+            slot: u16::from_le_bytes(slot),
+            generation: u64::from_le_bytes(generation),
+            worker_id,
+        })
+    }
+
+    /// Number of pending cancels.
+    #[cfg(test)]
+    pub(crate) const fn len(&self) -> usize {
+        self.len
+    }
+
+    /// `true` when no cancels are pending.
+    #[cfg(test)]
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
@@ -975,6 +1230,57 @@ impl Drop for CancelInboxGuard {
     }
 }
 
+/// One recv-cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
+const RECV_CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
+
+/// The installed recv cancel inbox for each worker, or null outside a run-loop,
+/// indexed by worker id.
+///
+/// Run-loop scoped like [`CANCEL_INBOXES`]: a recv stream's `Drop` runs outside
+/// the poll window (task reap, or an early cancel-drop) yet still on the owning
+/// worker thread, so the cancel must reach the inbox without the poll bracket. A
+/// dedicated static keeps recv cancels off the shared [`CancelInbox`] ring, whose
+/// inline capacity sits at the shard's stack-frame budget.
+/// `AtomicPtr<RecvCancelInbox>` is `Sync` regardless of `RecvCancelInbox`, so the
+/// array is a sound `static` with no `unsafe impl`.
+static RECV_CANCEL_INBOXES: [AtomicPtr<RecvCancelInbox<RECV_CANCEL_INBOX_CAPACITY>>;
+    RECV_CANCEL_INBOX_SLOTS] = [const { AtomicPtr::new(ptr::null_mut()) }; RECV_CANCEL_INBOX_SLOTS];
+
+/// RAII bracket that installs a worker's recv cancel inbox for its whole run-loop
+/// and clears it on drop.
+///
+/// Declared after the `WorkerShard` local in each run-loop entry, so Rust LIFO
+/// drop clears the static before the shard -- and its `recv_cancel_inbox` field
+/// -- is reclaimed. A recv stream dropped during shard teardown then finds a null
+/// slot and its [`push_recv_multishot_cancel_for_worker`] is a no-op, an accepted
+/// bounded leak the same as an overflowed ring.
+///
+/// Not re-entrant: one run-loop per worker installs one guard.
+pub struct RecvCancelInboxGuard {
+    /// Worker slot to clear on drop.
+    worker_id: u8,
+}
+
+impl RecvCancelInboxGuard {
+    /// Installs `inbox` for `worker_id` for the run-loop, returning the guard
+    /// that clears it.
+    ///
+    /// Takes `&mut` only to form the pointer; the guard stores no reference, so
+    /// the caller's borrow of the inbox ends when this returns and the run-loop
+    /// can borrow the owning shard again.
+    #[must_use]
+    pub fn install(worker_id: u8, inbox: &mut RecvCancelInbox<RECV_CANCEL_INBOX_CAPACITY>) -> Self {
+        RECV_CANCEL_INBOXES[worker_id as usize].store(ptr::from_mut(inbox), Ordering::Release);
+        Self { worker_id }
+    }
+}
+
+impl Drop for RecvCancelInboxGuard {
+    fn drop(&mut self) {
+        RECV_CANCEL_INBOXES[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
+    }
+}
+
 /// One provided-pool slot per possible worker id byte, like [`SEAM_SLOTS`].
 const PROVIDED_POOL_SLOTS: usize = u8::MAX as usize + 1;
 
@@ -1157,18 +1463,36 @@ pub fn push_multishot_cancel_for_worker(key: MultishotSlotKey) {
 
 /// Queues a cancel for a dropped multishot recv stream on its owning worker.
 ///
-/// Mirrors [`push_multishot_cancel_for_worker`] for the recv registry: the
-/// dropped stream's op is `io_bound`, so the drop runs on the owning worker and
-/// the push is single-writer. The recv slot rides an [`InflightSlotKey`] whose
-/// `op_token` is the recv-multishot sentinel; the worker's cancel drain routes
-/// it to the recv registry through [`submit_recv_multishot_cancel`].
+/// The dropped stream's op is `io_bound`, so the drop runs on the owning worker
+/// and the push is single-writer, the same contract [`push_cancel_for_worker`]
+/// holds. Unlike a buffered-op cancel, this pushes into the dedicated
+/// [`RecvCancelInbox`] rather than the shared [`CancelInbox`] ring: a recv slot
+/// is per-connection, so the worker drains it separately through
+/// [`submit_recv_multishot_cancel`]. A no-op when no inbox is installed for
+/// `key.worker_id` (a bounded leak at worker teardown, reclaimed by the op's
+/// terminal completion).
 pub fn push_recv_multishot_cancel_for_worker(key: RecvMultishotSlotKey) {
-    push_cancel_for_worker(InflightSlotKey {
-        slot: key.slot,
-        generation: key.generation,
-        worker_id: key.worker_id,
-        op_token: encode_recv_multishot_sentinel(key),
-    });
+    let inbox = RECV_CANCEL_INBOXES[key.worker_id as usize].load(Ordering::Acquire);
+    if inbox.is_null() {
+        return;
+    }
+    // SAFETY: Invariant -- a non-null pointer in
+    // `RECV_CANCEL_INBOXES[key.worker_id]` was stored by
+    // `RecvCancelInboxGuard::install` over the owning `WorkerShard`'s
+    // `recv_cancel_inbox` field. The guard is declared after the shard in the
+    // run-loop entry, so Rust LIFO drop nulls this slot before the shard, and its
+    // field, is reclaimed; a non-null load therefore names a live field.
+    // Precondition (why the single-writer contract holds): a recv stream's `Drop`
+    // fires only on the owning worker's thread, because submitting the multishot
+    // recv set `header.io_bound = true`, which pins the task off the steal path
+    // so it never migrates. Callers must invoke this only from such a stream's
+    // `Drop`, so the worker that installed the inbox is the only thread that ever
+    // pushes -- the inbox needs no atomics.
+    // Failure mode: null is the early return above. A cross-thread push races the
+    // single writer; the call-site invariant excludes it. A dangling pointer
+    // cannot arise -- LIFO drop order excludes it.
+    let inbox = unsafe { &mut *inbox };
+    inbox.push_cancel(key);
 }
 
 /// `user_data` marker for a buffered-op cancel completion.
@@ -1523,23 +1847,18 @@ pub fn submit_multishot_cancel(
 pub fn submit_recv_multishot_cancel(
     driver: &DriverType,
     slab: &mut RecvMultishotSlab,
-    key: InflightSlotKey,
+    key: RecvMultishotSlotKey,
 ) {
-    let recv_key = RecvMultishotSlotKey {
-        slot: key.slot,
-        generation: key.generation,
-        worker_id: key.worker_id,
-    };
     // Recycle every buffer queued for the gone stream so no provided buffer
     // leaks out of the ring; a NO_BUFFER entry carries nothing to recycle.
-    while let Some((_, buf_id)) = slab.pop(recv_key) {
+    while let Some((_, buf_id)) = slab.pop(key) {
         if buf_id != NO_BUFFER {
             recycle_provided(driver, Some(buf_id));
         }
     }
-    slab.mark_cancel_pending(recv_key);
-    let request =
-        IoRequest::<()>::cancel(SubmitToken::new(key.op_token)).with_user_data(key.op_token);
+    slab.mark_cancel_pending(key);
+    let sentinel = encode_recv_multishot_sentinel(key);
+    let request = IoRequest::<()>::cancel(SubmitToken::new(sentinel)).with_user_data(sentinel);
     // IGNORE: submit_internal is best-effort; a refused cancel leaves the slot
     // cancel-pending, and the op's own completions still drive the free, so this
     // is a bounded hurry-up, never a leak or a use-after-free.
@@ -2430,6 +2749,248 @@ mod tests {
     }
 
     #[test]
+    fn recv_multishot_seam_allocates_and_decodes_sentinel() {
+        let Ok(mut slab) = RecvMultishotSlab::new(41, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let seam = IoSeam::new(41, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        let RecvMultishotAlloc::Allocated { key, sentinel } =
+            seam.allocate_recv_multishot_slot(0xABCD)
+        else {
+            panic!("a seam carrying a recv slab allocates a slot");
+        };
+        assert_eq!(key.worker_id, 41);
+        assert!(
+            is_recv_multishot_sentinel(sentinel),
+            "the SQE user_data is a recv-multishot sentinel",
+        );
+        assert_eq!(
+            multishot_sentinel_slot(sentinel),
+            key.slot,
+            "the sentinel names the allocated slot",
+        );
+        assert_eq!(
+            multishot_sentinel_generation(sentinel),
+            (key.generation & 0xFFFF) as u16,
+            "the sentinel carries the slot generation",
+        );
+    }
+
+    #[test]
+    fn recv_multishot_seam_next_is_pending_while_armed() {
+        let Ok(mut slab) = RecvMultishotSlab::new(42, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let seam = IoSeam::new(42, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        let RecvMultishotAlloc::Allocated { key, .. } = seam.allocate_recv_multishot_slot(0x9)
+        else {
+            panic!("a seam carrying a recv slab allocates a slot");
+        };
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Pending,
+            "a freshly armed slot with an empty FIFO polls Pending",
+        );
+    }
+
+    #[test]
+    fn recv_multishot_seam_drains_then_ends_and_frees() {
+        // Queue a terminal completion before the seam forms its pointer, so the
+        // only slab reference the seam holds is the last-derived one.
+        let Ok(mut slab) = RecvMultishotSlab::new(44, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x5) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        slab.push(key.slot, gen_low16, 7, 3, false);
+        let seam = IoSeam::new(44, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Item {
+                result: 7,
+                buf_id: Some(3),
+            },
+            "the queued result drains first, carrying its buffer id",
+        );
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Ended,
+            "an empty terminated FIFO ends the stream",
+        );
+        let RecvMultishotAlloc::Allocated { key: reused, .. } =
+            seam.allocate_recv_multishot_slot(0x5)
+        else {
+            panic!("ending the stream freed the slot for reuse");
+        };
+        assert_eq!(reused.slot, key.slot);
+        assert_eq!(
+            reused.generation,
+            key.generation + 1,
+            "the freed slot is reused with a bumped generation",
+        );
+    }
+
+    #[test]
+    fn recv_multishot_seam_item_without_buffer_reports_none() {
+        let Ok(mut slab) = RecvMultishotSlab::new(45, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x5) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        // An end-of-stream (zero-length) completion carries no provided buffer.
+        slab.push(key.slot, gen_low16, 0, NO_BUFFER, false);
+        let seam = IoSeam::new(45, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Item {
+                result: 0,
+                buf_id: None,
+            },
+            "a NO_BUFFER entry reports buf_id None",
+        );
+    }
+
+    #[test]
+    fn recv_multishot_seam_free_returns_the_slot() {
+        let Ok(mut slab) = RecvMultishotSlab::new(46, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let seam = IoSeam::new(46, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        let RecvMultishotAlloc::Allocated { key, .. } = seam.allocate_recv_multishot_slot(0) else {
+            panic!("a seam carrying a recv slab allocates a slot");
+        };
+        seam.recv_multishot_free(key);
+        let RecvMultishotAlloc::Allocated { key: reused, .. } =
+            seam.allocate_recv_multishot_slot(0)
+        else {
+            panic!("freeing the slot returns it for reuse");
+        };
+        assert_eq!(reused.slot, key.slot);
+        assert_eq!(
+            reused.generation,
+            key.generation + 1,
+            "free bumps the generation so a stale handle is rejected",
+        );
+    }
+
+    #[test]
+    fn recv_multishot_seam_reports_full_when_saturated() {
+        let Ok(mut slab) = RecvMultishotSlab::new(47, 2) else {
+            panic!("the registry mmap must succeed");
+        };
+        let seam = IoSeam::new(47, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        assert!(matches!(
+            seam.allocate_recv_multishot_slot(0x1),
+            RecvMultishotAlloc::Allocated { .. }
+        ));
+        assert!(matches!(
+            seam.allocate_recv_multishot_slot(0x2),
+            RecvMultishotAlloc::Allocated { .. }
+        ));
+        assert_eq!(
+            seam.allocate_recv_multishot_slot(0x3),
+            RecvMultishotAlloc::Full,
+            "a saturated registry reports Full so the stream degrades to single-shot",
+        );
+    }
+
+    #[test]
+    fn recv_multishot_seam_needs_a_slab() {
+        let seam = IoSeam::new(51, None, None, None);
+        assert_eq!(
+            seam.allocate_recv_multishot_slot(0),
+            RecvMultishotAlloc::Unsupported,
+            "a seam with no recv slab reports Unsupported",
+        );
+        let key = RecvMultishotSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 51,
+        };
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Ended,
+            "a seam with no recv slab resolves the stream as ended",
+        );
+        // free with no slab is a no-op, never a panic.
+        seam.recv_multishot_free(key);
+    }
+
+    #[test]
+    fn recv_cancel_inbox_push_pop_is_fifo() {
+        let Ok(mut inbox) = RecvCancelInbox::<4>::new() else {
+            panic!("the inbox mmap must succeed");
+        };
+        assert!(inbox.is_empty());
+        let key = |slot, generation| RecvMultishotSlotKey {
+            slot,
+            generation,
+            worker_id: 7,
+        };
+        inbox.push_cancel(key(1, 100));
+        inbox.push_cancel(key(2, 200));
+        assert_eq!(inbox.len(), 2);
+        assert_eq!(inbox.pop(), Some(key(1, 100)), "oldest pops first");
+        assert_eq!(inbox.pop(), Some(key(2, 200)));
+        assert_eq!(inbox.pop(), None);
+        assert!(inbox.is_empty());
+    }
+
+    #[test]
+    fn recv_cancel_inbox_drops_on_overflow() {
+        let Ok(mut inbox) = RecvCancelInbox::<2>::new() else {
+            panic!("the inbox mmap must succeed");
+        };
+        let key = |slot| RecvMultishotSlotKey {
+            slot,
+            generation: 0,
+            worker_id: 3,
+        };
+        inbox.push_cancel(key(0));
+        inbox.push_cancel(key(1));
+        inbox.push_cancel(key(2));
+        assert_eq!(inbox.len(), 2, "a full ring drops the newest push");
+        assert_eq!(inbox.pop(), Some(key(0)));
+        assert_eq!(inbox.pop(), Some(key(1)));
+        assert_eq!(inbox.pop(), None, "the overflowing push was dropped");
+    }
+
+    #[test]
+    fn recv_cancel_inbox_guard_routes_push() {
+        let Ok(mut inbox) = RecvCancelInbox::<RECV_CANCEL_INBOX_CAPACITY>::new() else {
+            panic!("the inbox mmap must succeed");
+        };
+        let key = RecvMultishotSlotKey {
+            slot: 5,
+            generation: 9,
+            worker_id: 60,
+        };
+        // With no guard installed, the push finds a null slot and is a no-op.
+        push_recv_multishot_cancel_for_worker(key);
+        {
+            let _guard = RecvCancelInboxGuard::install(60, &mut inbox);
+            push_recv_multishot_cancel_for_worker(key);
+        }
+        // The guard cleared the slot on drop; the one routed push is still queued.
+        assert_eq!(
+            inbox.pop(),
+            Some(key),
+            "the guard routed the push into the worker's inbox",
+        );
+        assert_eq!(inbox.pop(), None, "the no-guard push was a no-op");
+    }
+
+    #[test]
     fn multishot_completion_queues_and_wakes_owner() {
         let mut slab = MultishotSlab::new(15, 4);
         let Some(key) = slab.allocate(0xF00D) else {
@@ -2809,13 +3370,7 @@ mod tests {
         // drops; the cancel must drain (and recycle) every one before marking.
         slab.push(key.slot, gen_low16, 8, 2, true);
         slab.push(key.slot, gen_low16, 8, 3, true);
-        let cancel = InflightSlotKey {
-            slot: key.slot,
-            generation: key.generation,
-            worker_id: key.worker_id,
-            op_token: encode_recv_multishot_sentinel(key),
-        };
-        submit_recv_multishot_cancel(&driver, &mut slab, cancel);
+        submit_recv_multishot_cancel(&driver, &mut slab, key);
         assert_eq!(slab.pop(key), None, "the cancel drained the queued buffers");
         assert!(
             slab.is_cancel_pending(key.slot, gen_low16),
