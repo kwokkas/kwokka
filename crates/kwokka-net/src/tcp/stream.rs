@@ -9,6 +9,8 @@ use std::{
 
 use kwokka_io::operation::{ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture};
 
+use crate::tcp::RecvStream;
+
 /// A connected TCP socket.
 ///
 /// Owns the socket for its lifetime; dropping the stream closes the fd
@@ -112,6 +114,52 @@ impl TcpStream {
     /// `-errno`.
     pub fn recv_provided(&self) -> impl Future<Output = io::Result<ProvidedBuf>> + use<> {
         ProvidedRecvFuture::new(self.inner.as_raw_fd())
+    }
+
+    /// Streams received chunks into kernel-selected provided buffers.
+    ///
+    /// Returns a [`RecvStream`] bound to this connection: `next().await` yields
+    /// `Some(Ok(buf))` for each received chunk, `Some(Err(_))` for a per-recv
+    /// error, or `None` once a multishot op ends. On a kernel with multishot
+    /// recv, one submitted op streams a completion per chunk; without it, the
+    /// stream degrades to one single-shot provided recv per item. Each `Ok` item
+    /// is a [`ProvidedBuf`] borrowing the worker's pool, recycled to the ring on
+    /// drop, and an empty view marks end of stream. The stream borrows `self`, so
+    /// it cannot outlive the connection and observe a closed fd.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: needs a connected peer, io_uring, and a registered buf_ring.
+    /// use kwokka_net::tcp::TcpListener;
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let stream = runtime.block_on(listener.accept())?;
+    /// runtime.block_on(async move {
+    ///     let mut recv = stream.recv_multishot();
+    ///     while let Some(chunk) = recv.next().await {
+    ///         let buf = chunk?;
+    ///         if buf.is_empty() {
+    ///             break;
+    ///         }
+    ///         let _bytes: &[u8] = &buf;
+    ///     }
+    ///     Ok::<(), std::io::Error>(())
+    /// })?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Errors
+    ///
+    /// A backend with no provided-buffer ring resolves the first item as
+    /// [`io::ErrorKind::Unsupported`]: the caller falls back to
+    /// [`recv`](Self::recv). A pool exhausted of free buffers surfaces `-ENOBUFS`
+    /// as its raw OS error, the caller's signal to re-arm; other negative
+    /// completions map to their `-errno`.
+    pub fn recv_multishot(&self) -> RecvStream<'_> {
+        RecvStream::new(self.inner.as_raw_fd())
     }
 
     /// Hands out the future sending the first `len` bytes of `data` (clamped
