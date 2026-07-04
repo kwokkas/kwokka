@@ -45,6 +45,17 @@ pub(super) struct ConnectFuture {
     /// deadline-armed connect has no separate cancel path, so that result is
     /// unambiguous.
     deadline_ns: Option<u64>,
+    /// The worker and token the connect submitted under, once in flight. `Some`
+    /// gates the cancel on drop; cleared when the op resolves, so a completed
+    /// connect is never cancelled.
+    submitted: Option<ConnectOp>,
+}
+
+/// The worker and `user_data` token a submitted connect is cancelled by.
+#[derive(Clone, Copy)]
+struct ConnectOp {
+    worker_id: u8,
+    token: u64,
 }
 
 impl ConnectFuture {
@@ -58,6 +69,7 @@ impl ConnectFuture {
             fd,
             addr: Some(addr),
             deadline_ns: None,
+            submitted: None,
         }
     }
 
@@ -76,6 +88,7 @@ impl ConnectFuture {
             fd,
             addr: Some(addr),
             deadline_ns: Some(deadline_ns),
+            submitted: None,
         }
     }
 }
@@ -95,7 +108,11 @@ impl Future for ConnectFuture {
         // op submitted, so later polls fall through to the result read.
         let Some(addr) = this.addr.take() else {
             return match IoSeam::with_current(binding.worker_id, IoSeam::completion_result) {
-                Some(Some(slot)) => Poll::Ready(slot.result),
+                Some(Some(slot)) => {
+                    // The op resolved; clear the cancel guard so drop is a no-op.
+                    this.submitted = None;
+                    Poll::Ready(slot.result)
+                }
                 _ => Poll::Pending,
             };
         };
@@ -109,12 +126,29 @@ impl Future for ConnectFuture {
             None => seam.submit_internal(request),
         });
         match submit {
-            Some(Some(SubmitResult::Submitted(_))) => Poll::Pending,
+            Some(Some(SubmitResult::Submitted(_))) => {
+                // Record the op so a drop before completion cancels it.
+                this.submitted = Some(ConnectOp {
+                    worker_id: binding.worker_id,
+                    token: binding.token,
+                });
+                Poll::Pending
+            }
             // No seam, no driver, or the backend rejected the op (including a
             // deadline requested where the kernel lacks link_timeout). The
             // production path runs on a real io_uring driver, so this is the
             // test-seam / unsupported path; resolve with -EINVAL rather than hang.
             _ => Poll::Ready(-22),
+        }
+    }
+}
+
+impl Drop for ConnectFuture {
+    fn drop(&mut self) {
+        if let Some(op) = self.submitted {
+            // The submitted connect made the task `io_bound`, so this drop runs
+            // on the owning worker and the cancel reaches the inbox single-writer.
+            boundary::push_connect_cancel_for_worker(op.worker_id, op.token);
         }
     }
 }
@@ -222,6 +256,59 @@ mod tests {
             &buf[..received],
             &payload[..],
             "the peer holds the bytes sent over the deadline-armed connected socket",
+        );
+    }
+
+    // Polls one connect exactly once -- submitting it and yielding `Pending` --
+    // then drops it in flight, firing `ConnectFuture::drop` and its cancel.
+    struct DropInFlightConnect(Option<ConnectFuture>);
+
+    impl Future for DropInFlightConnect {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if let Some(mut connect) = self.0.take() {
+                let _outcome = Pin::new(&mut connect).poll(cx);
+                drop(connect);
+            }
+            Poll::Ready(())
+        }
+    }
+
+    // Dropping an in-flight connect queues its cancel on the owning worker; a
+    // fresh connect on the same runtime drains that cancel and the dropped op's
+    // completion and must still succeed, proving the drop-cancel path wires
+    // through without wedging or corrupting the shard. The fd-0 non-close
+    // guarantee is proven at the io layer.
+    #[test]
+    fn dropped_connect_keeps_serving() {
+        let Ok(peer) = UdpSocket::bind("127.0.0.1:0") else {
+            panic!("binding the peer socket must succeed");
+        };
+        let Ok(SocketAddr::V4(peer_v4)) = peer.local_addr() else {
+            panic!("a loopback bind must report a V4 local address");
+        };
+        let Ok(dropped_client) = UdpSocket::bind("127.0.0.1:0") else {
+            panic!("binding the dropped client socket must succeed");
+        };
+        let Ok(fresh_client) = UdpSocket::bind("127.0.0.1:0") else {
+            panic!("binding the fresh client socket must succeed");
+        };
+
+        let Ok(mut runtime) = Runtime::affine() else {
+            panic!("the affine runtime must build on this host");
+        };
+        runtime.block_on(DropInFlightConnect(Some(ConnectFuture::new(
+            dropped_client.as_raw_fd(),
+            SockAddr::V4(peer_v4),
+        ))));
+        let result = runtime.block_on(ConnectFuture::new(
+            fresh_client.as_raw_fd(),
+            SockAddr::V4(peer_v4),
+        ));
+        assert_eq!(
+            result, 0,
+            "a fresh connect after the in-flight drop must succeed: {result}",
         );
     }
 }

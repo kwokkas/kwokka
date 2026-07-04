@@ -1312,6 +1312,85 @@ impl<const N: usize> Default for ProvidedRecvCancelSet<N> {
     }
 }
 
+/// Per-worker capacity for pending single-shot connect cancels.
+///
+/// Holds a token from a dropped `connect()` between its cancel submission and
+/// the op's completion. A connect submits at most once per worker (the driver
+/// packs the address into its single submission scratch), so the window holds
+/// few tokens; a full set drops the record, at worst re-exposing the stray-wake
+/// window for that one token, never corruption.
+pub const CONNECT_CANCEL_CAPACITY: usize = 8;
+
+/// [`InflightSlotKey`] `slot` marker for a slotless single-shot connect cancel.
+///
+/// A single-shot connect carries no inflight slab slot -- it submits under the
+/// polling task's token. This reserved slot routes its cancel to
+/// [`submit_connect_cancel`] rather than the buffered-op path; it sits one below
+/// [`PROVIDED_RECV_CANCEL_SLOT`], and no real slab slot reaches any of them (the
+/// inflight cap is far smaller).
+const CONNECT_CANCEL_SLOT: u16 = u16::MAX - 2;
+
+/// Per-worker set of dropped single-shot connects awaiting their completion.
+///
+/// A dropped `connect()` cancels its op and records the op's token here. Unlike
+/// accept, a connect produces no descriptor (success is result `0`, not an fd),
+/// so the completion drain disposes nothing -- the set exists to divert the
+/// belated CQE out of the generic task-token path, so a stray result never
+/// overwrites a live task's wake slot.
+pub struct ConnectCancelSet<const N: usize> {
+    /// Pending tokens packed in `[0, len)`; order does not matter.
+    tokens: [u64; N],
+    /// Count of pending tokens.
+    len: usize,
+}
+
+impl<const N: usize> ConnectCancelSet<N> {
+    /// Creates an empty set.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            tokens: [0; N],
+            len: 0,
+        }
+    }
+
+    /// Records `token` as a cancelled connect awaiting disposal.
+    ///
+    /// A full set drops the record: the belated CQE then re-enters the generic
+    /// path for that one token, never corruption, and the caller does not retry.
+    pub(crate) const fn insert(&mut self, token: u64) {
+        if self.len < N {
+            self.tokens[self.len] = token;
+            self.len += 1;
+        }
+    }
+
+    /// Removes `token` if pending, reporting whether it was.
+    pub(crate) const fn take(&mut self, token: u64) -> bool {
+        let mut index = 0;
+        while index < self.len {
+            if self.tokens[index] == token {
+                self.tokens[index] = self.tokens[self.len - 1];
+                self.len -= 1;
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    /// `true` when no cancelled connect is pending.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
+impl<const N: usize> Default for ConnectCancelSet<N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// One cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
 const CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
 
@@ -1570,6 +1649,23 @@ pub fn push_accept_cancel_for_worker(worker_id: u8, token: u64) {
 pub fn push_provided_recv_cancel_for_worker(worker_id: u8, token: u64) {
     push_cancel_for_worker(InflightSlotKey {
         slot: PROVIDED_RECV_CANCEL_SLOT,
+        generation: 0,
+        worker_id,
+        op_token: token,
+    });
+}
+
+/// Queues a cancel for a dropped single-shot connect on its worker.
+///
+/// The connect op carries the polling task's `token` as its `user_data` and
+/// holds no inflight slab slot, so the queued key uses the `CONNECT_CANCEL_SLOT`
+/// marker; the drain routes it to [`submit_connect_cancel`]. Submitting the
+/// connect set the task `io_bound`, so its `Drop` runs on the owning worker and
+/// the push is single-writer, the same contract
+/// [`push_accept_cancel_for_worker`] holds.
+pub fn push_connect_cancel_for_worker(worker_id: u8, token: u64) {
+    push_cancel_for_worker(InflightSlotKey {
+        slot: CONNECT_CANCEL_SLOT,
         generation: 0,
         worker_id,
         op_token: token,
@@ -1972,6 +2068,23 @@ pub fn dispose_cancelled_accept<const N: usize>(
     true
 }
 
+/// Consumes a cancelled single-shot connect's completion, disposing nothing.
+///
+/// The completion drain calls this before the generic task-token path. When
+/// `token` names a dropped connect recorded by [`submit_connect_cancel`], the
+/// belated CQE is taken here so its result never reaches a live task's wake
+/// slot. Unlike accept, a connect produces no descriptor -- success is result
+/// `0`, not an fd -- so there is nothing to close; this never inspects the
+/// result, which is why a cancelled successful connect can never close fd `0`.
+/// Returns whether it consumed the CQE; the common empty-set case is an `O(1)`
+/// miss.
+pub fn dispose_cancelled_connect<const N: usize>(
+    connects: &mut ConnectCancelSet<N>,
+    token: u64,
+) -> bool {
+    !connects.is_empty() && connects.take(token)
+}
+
 /// Submits a cancel for a dropped buffered future's in-flight op and marks its
 /// slot retire-pending.
 ///
@@ -2104,18 +2217,40 @@ pub fn submit_provided_recv_cancel<const N: usize>(
     let _ = driver.submit_internal(request);
 }
 
+/// Submits a cancel for a dropped single-shot connect.
+///
+/// The connect holds no slab slot, so this only records the token in `connects`
+/// and submits an `ASYNC_CANCEL` targeting the op by its `user_data` token. A
+/// completion arriving after the cancel routes through [`dispose_cancelled_op`],
+/// which disposes nothing -- a connect owns no descriptor -- but diverts the CQE
+/// off the task-token path; the cancel's own CQE decodes to a slot no registry
+/// owns, so [`reclaim_cancel_completion`] treats it as a no-op.
+pub fn submit_connect_cancel<const N: usize>(
+    driver: &DriverType,
+    connects: &mut ConnectCancelSet<N>,
+    key: InflightSlotKey,
+) {
+    connects.insert(key.op_token);
+    let request = IoRequest::<()>::cancel(SubmitToken::new(key.op_token))
+        .with_user_data(encode_cancel_sentinel(key));
+    // IGNORE: submit_internal is best-effort; a refused cancel leaves the connect
+    // running, and its completion still routes through dispose_cancelled_op.
+    let _ = driver.submit_internal(request);
+}
+
 /// Routes a queued cancel to the mechanism that owns its op.
 ///
 /// A cancel whose `op_token` is a multishot sentinel targets the multishot
 /// registry; the `ACCEPT_CANCEL_SLOT` marker targets a slotless single-shot
 /// accept; the `PROVIDED_RECV_CANCEL_SLOT` marker targets a slotless
 /// provided-buffer recv; every other cancel is a buffered op's in-flight slot.
-pub fn submit_cancel_for<const A: usize, const P: usize>(
+pub fn submit_cancel_for<const A: usize, const P: usize, const C: usize>(
     driver: &DriverType,
     inflight: &mut InflightBufSlab,
     multishot: &mut MultishotSlab,
     accepts: &mut AcceptCancelSet<A>,
     provided_recvs: &mut ProvidedRecvCancelSet<P>,
+    connects: &mut ConnectCancelSet<C>,
     key: InflightSlotKey,
 ) {
     if is_multishot_sentinel(key.op_token) {
@@ -2124,6 +2259,8 @@ pub fn submit_cancel_for<const A: usize, const P: usize>(
         submit_accept_cancel(driver, accepts, key);
     } else if key.slot == PROVIDED_RECV_CANCEL_SLOT {
         submit_provided_recv_cancel(driver, provided_recvs, key);
+    } else if key.slot == CONNECT_CANCEL_SLOT {
+        submit_connect_cancel(driver, connects, key);
     } else {
         submit_cancel(driver, inflight, key);
     }
@@ -2155,10 +2292,11 @@ pub fn submit_cancel_for<const A: usize, const P: usize>(
 /// token across both ops, and whichever completion lands first is disposed
 /// as the dropped one. A per-op registry (the multishot model) is the
 /// structural fix, deferred with multishot recv.
-pub fn dispose_cancelled_op<const A: usize, const P: usize>(
+pub fn dispose_cancelled_op<const A: usize, const P: usize, const C: usize>(
     driver: &DriverType,
     accepts: &mut AcceptCancelSet<A>,
     provided_recvs: &mut ProvidedRecvCancelSet<P>,
+    connects: &mut ConnectCancelSet<C>,
     token: u64,
     result: i32,
     buf_id: Option<u16>,
@@ -2173,6 +2311,13 @@ pub fn dispose_cancelled_op<const A: usize, const P: usize>(
         if let Some(pool) = driver.provided_recv_pool() {
             pool.recycle(id);
         }
+        return true;
+    }
+    // A dropped connect owns no descriptor, so its belated CQE is taken by token
+    // alone, ahead of every result-inspecting path: a successful connect's `0`
+    // result never reaches the accept path that would adopt it as descriptor
+    // zero, and the diversion keeps the stale result off a live task's wake slot.
+    if dispose_cancelled_connect(connects, token) {
         return true;
     }
     // An end-of-stream completion whose token names a dropped provided recv
@@ -3806,6 +3951,7 @@ mod tests {
         let mut multishot = MultishotSlab::new(7, 4);
         let mut accepts = AcceptCancelSet::<4>::new();
         let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
+        let mut connects = ConnectCancelSet::<4>::new();
         let key = InflightSlotKey {
             slot: ACCEPT_CANCEL_SLOT,
             generation: 0,
@@ -3818,6 +3964,7 @@ mod tests {
             &mut multishot,
             &mut accepts,
             &mut provided_recvs,
+            &mut connects,
             key,
         );
         assert!(
@@ -3890,6 +4037,7 @@ mod tests {
         let mut multishot = MultishotSlab::new(8, 4);
         let mut accepts = AcceptCancelSet::<4>::new();
         let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
+        let mut connects = ConnectCancelSet::<4>::new();
         let key = InflightSlotKey {
             slot: PROVIDED_RECV_CANCEL_SLOT,
             generation: 0,
@@ -3902,6 +4050,7 @@ mod tests {
             &mut multishot,
             &mut accepts,
             &mut provided_recvs,
+            &mut connects,
             key,
         );
         assert!(
@@ -3917,30 +4066,71 @@ mod tests {
         let driver = DriverType::Epoll(());
         let mut accepts = AcceptCancelSet::<4>::new();
         let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
+        let mut connects = ConnectCancelSet::<4>::new();
         assert!(
-            !dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x1, 4, Some(2)),
+            !dispose_cancelled_op(
+                &driver,
+                &mut accepts,
+                &mut provided_recvs,
+                &mut connects,
+                0x1,
+                4,
+                Some(2)
+            ),
             "empty sets dispose nothing",
         );
         // A buffer-carrying CQE is definitively a provided recv's; a live
         // recv (token not recorded) falls through to the task path.
         provided_recvs.insert(0x1);
         assert!(
-            !dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x2, 4, Some(2)),
+            !dispose_cancelled_op(
+                &driver,
+                &mut accepts,
+                &mut provided_recvs,
+                &mut connects,
+                0x2,
+                4,
+                Some(2)
+            ),
             "an unrecorded token is a live future's completion",
         );
         assert!(
-            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x1, 4, Some(2)),
+            dispose_cancelled_op(
+                &driver,
+                &mut accepts,
+                &mut provided_recvs,
+                &mut connects,
+                0x1,
+                4,
+                Some(2)
+            ),
             "a recorded token consumes its buffer-carrying completion",
         );
         // A bufferless CQE checks the accepts first, then the provided recvs.
         accepts.insert(0x3);
         provided_recvs.insert(0x4);
         assert!(
-            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x3, -125, None),
+            dispose_cancelled_op(
+                &driver,
+                &mut accepts,
+                &mut provided_recvs,
+                &mut connects,
+                0x3,
+                -125,
+                None
+            ),
             "a bufferless completion matches the accept set first",
         );
         assert!(
-            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x4, -125, None),
+            dispose_cancelled_op(
+                &driver,
+                &mut accepts,
+                &mut provided_recvs,
+                &mut connects,
+                0x4,
+                -125,
+                None
+            ),
             "a cancelled provided recv disposes with nothing to recycle",
         );
         assert!(provided_recvs.is_empty());
@@ -3950,7 +4140,15 @@ mod tests {
         accepts.insert(0x5);
         provided_recvs.insert(0x5);
         assert!(
-            dispose_cancelled_op(&driver, &mut accepts, &mut provided_recvs, 0x5, 0, None),
+            dispose_cancelled_op(
+                &driver,
+                &mut accepts,
+                &mut provided_recvs,
+                &mut connects,
+                0x5,
+                0,
+                None
+            ),
             "the ambiguous end-of-stream completion is consumed",
         );
         assert!(provided_recvs.is_empty(), "the provided set took it");
@@ -3958,6 +4156,95 @@ mod tests {
             accepts.take(0x5),
             "the accept entry survives instead of adopting descriptor zero",
         );
+    }
+
+    #[test]
+    fn connect_cancel_set_inserts_and_takes() {
+        let mut cancels = ConnectCancelSet::<2>::new();
+        assert!(cancels.is_empty());
+        cancels.insert(0xA);
+        cancels.insert(0xB);
+        // A full set drops the record rather than growing.
+        cancels.insert(0xC);
+        assert!(!cancels.take(0xC), "the overflowed record was dropped");
+        assert!(cancels.take(0xB));
+        assert!(cancels.take(0xA));
+        assert!(cancels.is_empty());
+        assert!(!cancels.take(0xA), "a taken token does not linger");
+    }
+
+    #[test]
+    fn push_connect_cancel_carries_the_slotless_marker() {
+        let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
+        {
+            let _guard = CancelInboxGuard::install(11, &mut inbox);
+            push_connect_cancel_for_worker(11, 0xC0DE);
+        }
+        let Some(key) = inbox.pop() else {
+            panic!("the connect cancel reached the inbox");
+        };
+        assert_eq!(
+            key.slot, CONNECT_CANCEL_SLOT,
+            "the slotless connect marker rides along",
+        );
+        assert_ne!(key.slot, ACCEPT_CANCEL_SLOT);
+        assert_ne!(key.slot, PROVIDED_RECV_CANCEL_SLOT);
+        assert_eq!(key.op_token, 0xC0DE);
+        assert_eq!(key.worker_id, 11);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn submit_cancel_for_routes_the_connect_marker() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut inflight) = InflightBufSlab::new(11, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let mut multishot = MultishotSlab::new(11, 4);
+        let mut accepts = AcceptCancelSet::<4>::new();
+        let mut provided_recvs = ProvidedRecvCancelSet::<4>::new();
+        let mut connects = ConnectCancelSet::<4>::new();
+        let key = InflightSlotKey {
+            slot: CONNECT_CANCEL_SLOT,
+            generation: 0,
+            worker_id: 11,
+            op_token: 0xCAFE,
+        };
+        submit_cancel_for(
+            &driver,
+            &mut inflight,
+            &mut multishot,
+            &mut accepts,
+            &mut provided_recvs,
+            &mut connects,
+            key,
+        );
+        assert!(
+            connects.take(0xCAFE),
+            "the connect marker routes the token into the connect set",
+        );
+        assert!(accepts.is_empty(), "the accept set is untouched");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[cfg(not(miri))]
+    #[test]
+    fn dispose_cancelled_connect_never_touches_a_descriptor() {
+        let mut connects = ConnectCancelSet::<4>::new();
+        connects.insert(0xC0);
+        // A successful connect's CQE result is exactly 0 -- the value that on the
+        // accept path would adopt and close fd 0 (stdin). The connect disposal
+        // takes the token by membership alone and never inspects the result.
+        assert!(dispose_cancelled_connect(&mut connects, 0xC0));
+        assert!(
+            !dispose_cancelled_connect(&mut connects, 0xC0),
+            "the token is gone after disposal",
+        );
+        // SAFETY: Invariant -- a non-destructive F_GETFD probe on stdin, closing
+        // nothing. Precondition -- none. Failure mode -- none; a probe reports
+        // the fd state without touching it.
+        let stdin_open = unsafe { libc::fcntl(0, libc::F_GETFD) } != -1;
+        assert!(stdin_open, "connect disposal must never adopt fd 0");
     }
 
     #[test]

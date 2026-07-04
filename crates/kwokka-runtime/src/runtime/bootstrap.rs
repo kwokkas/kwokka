@@ -370,6 +370,7 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             &shard.driver,
             &mut shard.accept_cancels,
             &mut shard.provided_recv_cancels,
+            &mut shard.connect_cancels,
             user_data,
             completion.result,
             completion.buf_id,
@@ -420,6 +421,7 @@ fn drain_cancels(shard: &mut WorkerShard) {
             &mut shard.multishot_slab,
             &mut shard.accept_cancels,
             &mut shard.provided_recv_cancels,
+            &mut shard.connect_cancels,
             key,
         );
     }
