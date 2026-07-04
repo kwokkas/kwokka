@@ -136,7 +136,7 @@ fn build_crew(
             return Err(error);
         }
     };
-    registry::publish_endpoint(lead, wake_fd);
+    registry::publish_endpoint(lead, wake_fd, shard.driver.ring_fd());
     match spawn_crew(lead, ring_entries, task_capacity, workers) {
         Ok(crew) => Ok(Runtime::from_crew(shard, wake_fd, crew)),
         Err(error) => {
@@ -228,7 +228,7 @@ fn sibling_main(
     // Same LIFO bracket: the provided-pool static clears before the shard --
     // and the driver-owned pool -- is reclaimed.
     let _pool_guard = ProvidedPoolGuard::install(id.raw(), &shard.driver);
-    registry::publish_endpoint(id, wake_fd);
+    registry::publish_endpoint(id, wake_fd, shard.driver.ring_fd());
     bootstrap::arm_wake(&shard, wake_fd);
     READY.fetch_add(1, Ordering::SeqCst);
     sibling_loop(

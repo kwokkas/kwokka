@@ -85,10 +85,11 @@ pub(crate) fn pop(_worker_id: WorkerId) -> Option<TaskRef> {
 #[cfg(not(loom))]
 static ENDPOINTS: [EndpointCell; INBOX_SLOTS] = [const { EndpointCell::new() }; INBOX_SLOTS];
 
-/// Publishes `event_fd` as the wake target of `worker_id`.
+/// Publishes `event_fd` and the worker's own `ring_fd` as the wake targets of
+/// `worker_id`.
 #[cfg(not(loom))]
-pub(crate) fn publish_endpoint(worker_id: WorkerId, event_fd: i32) {
-    ENDPOINTS[worker_id.raw() as usize].publish(event_fd);
+pub(crate) fn publish_endpoint(worker_id: WorkerId, event_fd: i32, ring_fd: Option<i32>) {
+    ENDPOINTS[worker_id.raw() as usize].publish(event_fd, ring_fd);
 }
 
 /// Withdraws the wake endpoint of `worker_id`; later signals resolve to
@@ -112,12 +113,12 @@ pub(crate) fn set_parked(worker_id: WorkerId, is_parked: bool) {
 /// `TaskRef`-decoded routing.
 #[cfg(not(loom))]
 pub(crate) fn signal(worker_id: u8) {
-    let Some(fd) = ENDPOINTS[worker_id as usize].signal_target() else {
+    let Some(target) = ENDPOINTS[worker_id as usize].signal_target() else {
         return;
     };
     // IGNORE: a failed eventfd write races endpoint withdrawal; the worker
     // is already draining toward shutdown and needs no unpark.
-    let _ = kwokka_io::wake::signal_wake_fd(fd);
+    let _ = kwokka_io::wake::signal_wake_fd(target.event_fd);
 }
 
 /// Loom variant -- the endpoint table is gated out of the loom build; the
@@ -131,7 +132,7 @@ pub(crate) fn signal(_worker_id: u8) {
 /// Loom variant -- the endpoint table is gated out of the loom build; the
 /// parked-handshake model drives [`EndpointCell`] directly.
 #[cfg(loom)]
-pub(crate) fn publish_endpoint(_worker_id: WorkerId, _event_fd: i32) {
+pub(crate) fn publish_endpoint(_worker_id: WorkerId, _event_fd: i32, _ring_fd: Option<i32>) {
     // Models drive the cell directly; reaching this stub is a model bug.
     unreachable!("the loom build never publishes through the global registry")
 }
@@ -209,7 +210,7 @@ mod tests {
     #[test]
     fn endpoint_gating_swallows_every_non_parked_signal() {
         let id = worker(91);
-        publish_endpoint(id, 5);
+        publish_endpoint(id, 5, None);
         // Published but running: resolves to nothing, no write happens.
         signal(91);
         set_parked(id, true);
