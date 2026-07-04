@@ -23,9 +23,10 @@ use kwokka_io::{
     IoDriver,
     boundary::{
         CancelInboxGuard, ProvidedPoolGuard, RecvCancelInboxGuard, dispose_cancelled_op,
-        is_cancel_sentinel, is_multishot_sentinel, is_recv_multishot_sentinel, mark_notif_expected,
-        push_multishot_completion, push_recv_multishot_completion, reclaim_cancel_completion,
-        reclaim_dropped_slot, reclaim_notif, submit_cancel_for, submit_recv_multishot_cancel,
+        is_cancel_sentinel, is_msg_ring_wake, is_multishot_sentinel, is_recv_multishot_sentinel,
+        mark_notif_expected, push_multishot_completion, push_recv_multishot_completion,
+        reclaim_cancel_completion, reclaim_dropped_slot, reclaim_notif, submit_cancel_for,
+        submit_recv_multishot_cancel,
     },
     operation::Completion,
     wake,
@@ -150,7 +151,7 @@ fn serve_steals(shard: &mut WorkerShard) {
     // victim-side husk unreleased (its settled note never comes) and the
     // thief's reservation until its shutdown unreserve.
     let _ = registry::push_handoff(thief_id, reply);
-    registry::signal(thief_id);
+    registry::signal(Some(&shard.driver), thief_id);
 }
 
 /// Drains this worker's handoff ring: each delivered body installs under
@@ -179,6 +180,9 @@ fn receive_handoffs(shard: &mut WorkerShard) {
 /// bounced note keeps the slot and the origin for a later pass.
 #[cfg(feature = "steal")]
 fn report_settled_relocations(shard: &mut WorkerShard) {
+    // Bind the driver before the disjoint `&mut tasks`/`&mut origins` borrows so
+    // the closure captures only `&shard.driver`, not the whole shard.
+    let driver = &shard.driver;
     handoff::report_settled(&mut shard.tasks, &mut shard.origins, |origin| {
         let note = SettledNote {
             victim_key: origin.victim_key,
@@ -186,7 +190,7 @@ fn report_settled_relocations(shard: &mut WorkerShard) {
         if registry::push_settled(origin.victim_id, note).is_err() {
             return false;
         }
-        registry::signal(origin.victim_id);
+        registry::signal(Some(driver), origin.victim_id);
         true
     });
 }
@@ -223,6 +227,7 @@ fn drain_wakes(shard: &mut WorkerShard) {
             &mut shard.tasks,
             &mut shard.run_queue,
             &shard.forward,
+            Some(&shard.driver),
             task_ref,
         );
         #[cfg(not(feature = "steal"))]
@@ -236,6 +241,16 @@ fn drain_wakes(shard: &mut WorkerShard) {
 /// single pass, so `kwokka_io::buffer::multishot::MULTISHOT_FIFO_DEPTH` must not
 /// be smaller; a runtime-side test enforces that bound.
 const COMPLETION_BATCH: usize = 64;
+
+/// Retires the one in-flight SQE a terminal multishot CQE accounted for, so the
+/// owning task's in-flight count settles even when the CQE carries no wake.
+fn retire_multishot_owner(shard: &mut WorkerShard, owner: u64) {
+    let task_ref = TaskRef::from_raw(owner);
+    let key = SlabKey::new(task_ref.index(), task_ref.generation());
+    if let Some(slot) = shard.tasks.get_mut(key) {
+        slot.header_mut().retire_in_flight_op();
+    }
+}
 
 /// Drains ready completions, storing each result into its task and waking it.
 ///
@@ -260,6 +275,10 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             // sits in the wake inbox, drained right after this pass;
             // re-arm so the next signal lands too.
             arm_wake(shard, wake_fd);
+            continue;
+        }
+        if is_msg_ring_wake(user_data) {
+            // Peer msg_ring wake, or its rare failure CQE; already in the inbox.
             continue;
         }
         if completion.is_notif() {
@@ -304,11 +323,7 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
                 );
             }
             if let Some(owner) = outcome.retire {
-                let task_ref = TaskRef::from_raw(owner);
-                let key = SlabKey::new(task_ref.index(), task_ref.generation());
-                if let Some(slot) = shard.tasks.get_mut(key) {
-                    slot.header_mut().retire_in_flight_op();
-                }
+                retire_multishot_owner(shard, owner);
             }
             continue;
         }
@@ -336,11 +351,7 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
                 );
             }
             if let Some(owner) = outcome.retire {
-                let task_ref = TaskRef::from_raw(owner);
-                let key = SlabKey::new(task_ref.index(), task_ref.generation());
-                if let Some(slot) = shard.tasks.get_mut(key) {
-                    slot.header_mut().retire_in_flight_op();
-                }
+                retire_multishot_owner(shard, owner);
             }
             continue;
         }

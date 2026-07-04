@@ -301,7 +301,7 @@ fn try_steal(shard: &mut WorkerShard, lead: WorkerId, workers: usize) {
         return;
     }
     shard.pending_steal = Some(promised);
-    registry::signal(victim.raw());
+    registry::signal(Some(&shard.driver), victim.raw());
 }
 
 /// The next crew victim in round-robin order, skipping this worker.
@@ -342,6 +342,7 @@ fn park_bracketed(shard: &mut WorkerShard) {
             &mut shard.tasks,
             &mut shard.run_queue,
             &shard.forward,
+            Some(&shard.driver),
             task_ref,
         );
         #[cfg(not(feature = "steal"))]

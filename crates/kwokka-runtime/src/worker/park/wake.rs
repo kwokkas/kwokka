@@ -6,6 +6,8 @@
 )]
 
 use kwokka_core::slab::{Slab, SlabKey};
+#[cfg(feature = "steal")]
+use kwokka_io::DriverType;
 
 use crate::{
     scheduler::queue::LocalRunQueue,
@@ -55,6 +57,7 @@ pub(crate) fn wake_or_forward(
     tasks: &mut Slab<TaskSlot>,
     run_queue: &mut LocalRunQueue,
     forward: &ForwardTable,
+    source: Option<&DriverType>,
     task_ref: TaskRef,
 ) {
     let key = SlabKey::new(task_ref.index(), task_ref.generation());
@@ -73,7 +76,7 @@ pub(crate) fn wake_or_forward(
         // direct waker path.
         return;
     }
-    registry::signal(new_ref.worker_id());
+    registry::signal(source, new_ref.worker_id());
 }
 
 #[cfg(test)]
@@ -169,7 +172,7 @@ mod tests {
         let mut forward = ForwardTable::new(1);
         let new_home = TaskRef::from_slab(18, SlabKey::new(0, Generation::from_raw(1)));
         forward.record(key, new_home);
-        super::wake_or_forward(&mut tasks, &mut run_queue, &forward, stale);
+        super::wake_or_forward(&mut tasks, &mut run_queue, &forward, None, stale);
         assert!(run_queue.is_empty(), "a husk never enters the local queue");
         let Ok(target) = WorkerId::new(18) else {
             panic!("worker id within range");
@@ -199,7 +202,7 @@ mod tests {
             panic!("Sleeping -> Retired must succeed");
         };
         let forward = ForwardTable::new(1);
-        super::wake_or_forward(&mut tasks, &mut run_queue, &forward, stale);
+        super::wake_or_forward(&mut tasks, &mut run_queue, &forward, None, stale);
         assert!(
             run_queue.is_empty(),
             "a reused-slot collision drops rather than misroutes",

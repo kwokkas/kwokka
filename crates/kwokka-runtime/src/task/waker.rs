@@ -106,7 +106,7 @@ fn schedule_wake(task_ref: TaskRef) {
         // count; backpressure and lens visibility are deferred to 0.2.0.
         return;
     }
-    crate::worker::registry::signal(task_ref.worker_id());
+    crate::worker::registry::signal(None, task_ref.worker_id());
 }
 
 /// Drop callback: no-op because [`TaskRef`] is `Copy` and the data pointer
