@@ -100,6 +100,7 @@ fn detect_capabilities(ring: &IoUring, tier: SetupTier) -> io::Result<Capability
         recv_zc: false,
 
         async_cancel: probe.is_supported(opcode::AsyncCancel::CODE),
+        link_timeout: probe.is_supported(opcode::LinkTimeout::CODE),
 
         direct_io_align: 4096,
     })
@@ -222,6 +223,22 @@ mod tests {
         assert!(
             result.capabilities.msg_ring,
             "msg_ring required on 6.0+ kernel",
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn probe_detects_link_timeout() {
+        let result = match probe_and_create(TEST_RING_ENTRIES) {
+            Ok(result) => result,
+            Err(error) => panic!("probe_and_create failed: {error}"),
+        };
+        assert!(
+            result.capabilities.link_timeout,
+            "link_timeout required on 5.5+ kernel",
         );
     }
 

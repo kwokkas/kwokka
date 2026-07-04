@@ -23,10 +23,10 @@ use kwokka_io::{
     IoDriver,
     boundary::{
         CancelInboxGuard, ProvidedPoolGuard, RecvCancelInboxGuard, dispose_cancelled_op,
-        is_cancel_sentinel, is_msg_ring_wake, is_multishot_sentinel, is_recv_multishot_sentinel,
-        mark_notif_expected, push_multishot_completion, push_recv_multishot_completion,
-        reclaim_cancel_completion, reclaim_dropped_slot, reclaim_notif, submit_cancel_for,
-        submit_recv_multishot_cancel,
+        is_cancel_sentinel, is_link_timeout_discard, is_msg_ring_wake, is_multishot_sentinel,
+        is_recv_multishot_sentinel, mark_notif_expected, push_multishot_completion,
+        push_recv_multishot_completion, reclaim_cancel_completion, reclaim_dropped_slot,
+        reclaim_notif, submit_cancel_for, submit_recv_multishot_cancel,
     },
     operation::Completion,
     wake,
@@ -279,6 +279,13 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
         }
         if is_msg_ring_wake(user_data) {
             // Peer msg_ring wake, or its rare failure CQE; already in the inbox.
+            continue;
+        }
+        if is_link_timeout_discard(user_data) {
+            // The paired LINK_TIMEOUT SQE's own CQE (-ETIME / -ECANCELED /
+            // -ENOENT per io_uring_prep_link_timeout.3). The primary op's own
+            // CQE carries the outcome the caller observes, so drop this one with
+            // no route, wake, or slot free.
             continue;
         }
         if completion.is_notif() {
@@ -534,7 +541,8 @@ impl Runtime<Affine> {
 mod tests {
     use kwokka_core::Generation;
     use kwokka_io::boundary::{
-        is_cancel_sentinel, is_multishot_sentinel, is_recv_multishot_sentinel,
+        is_cancel_sentinel, is_link_timeout_discard, is_multishot_sentinel,
+        is_recv_multishot_sentinel,
     };
 
     use crate::task::TaskRef;
@@ -620,6 +628,19 @@ mod tests {
         let below_multishot = Generation::from_raw(Generation::MAX - 2);
         let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, below_multishot);
         assert!(is_recv_multishot_sentinel(corner.raw()));
+        assert!(!is_multishot_sentinel(corner.raw()));
+        assert!(!is_cancel_sentinel(corner.raw()));
+    }
+
+    #[test]
+    fn link_timeout_marker_below_msg_ring_corner() {
+        // The link-timeout discard corner is worker 127 at generation MAX - 4,
+        // one below the msg_ring wake corner (MAX - 3), so the arena encoding
+        // lands exactly on the io-side marker and aliases no other sentinel.
+        let below_msg_ring = Generation::from_raw(Generation::MAX - 4);
+        let corner = TaskRef::from_arena(TaskRef::WORKER_ID_MAX, 0, below_msg_ring);
+        assert!(is_link_timeout_discard(corner.raw()));
+        assert!(!is_recv_multishot_sentinel(corner.raw()));
         assert!(!is_multishot_sentinel(corner.raw()));
         assert!(!is_cancel_sentinel(corner.raw()));
     }

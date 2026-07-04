@@ -37,6 +37,10 @@ pub(crate) struct SubmitScratch {
     pub addr: [u8; 128],
     /// Timespec for timeout ops.
     pub timespec: io_uring::types::Timespec,
+    /// Timespec for the link-timeout half of a linked pair. Separate from
+    /// `timespec` because a linked primary and its timeout SQE are alive in the
+    /// same `push_multiple`, so one field cannot back both pointers.
+    pub link_timeout: io_uring::types::Timespec,
 }
 
 impl SubmitScratch {
@@ -45,6 +49,7 @@ impl SubmitScratch {
         Self {
             addr: [0u8; 128],
             timespec: io_uring::types::Timespec::new(),
+            link_timeout: io_uring::types::Timespec::new(),
         }
     }
 }

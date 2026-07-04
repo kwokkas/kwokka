@@ -321,6 +321,34 @@ impl DriverType {
             _ => SubmitResult::Unsupported,
         }
     }
+
+    /// Submits `request` bounded by a native `IORING_OP_LINK_TIMEOUT` deadline
+    /// on the backend's ring.
+    ///
+    /// [`SubmitResult::Unsupported`] off the uring backend or when the kernel
+    /// lacks `link_timeout`; the caller falls back to the timer-wheel deadline
+    /// (fallback parity).
+    ///
+    /// Kept off the [`IoDriver`](crate::IoDriver) trait like [`park`](Self::park):
+    /// the native deadline is a submit-path optimization, not part of the uniform
+    /// completion API.
+    #[doc(hidden)]
+    #[allow(
+        unused_variables,
+        clippy::missing_const_for_fn,
+        reason = "only the cfg-gated io_uring arm uses `request`/`deadline_ns` or is non-const; on thin-fallback builds the submit degenerates to a trivial const Unsupported"
+    )]
+    pub fn submit_linked_timeout_internal(
+        &self,
+        request: &IoRequest<()>,
+        deadline_ns: u64,
+    ) -> SubmitResult {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => driver.submit_linked_timeout_internal(request, deadline_ns),
+            _ => SubmitResult::Unsupported,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -353,6 +381,19 @@ mod tests {
                 SubmitResult::Unsupported
             ),
             "the msg_ring wake falls back to eventfd off the uring backend",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_linked_timeout_returns_unsupported() {
+        assert!(
+            matches!(
+                DriverType::Epoll(())
+                    .submit_linked_timeout_internal(&IoRequest::<()>::accept(3), 1_000_000),
+                SubmitResult::Unsupported
+            ),
+            "the linked-timeout submit falls back to the timer wheel off the uring backend",
         );
     }
 
