@@ -6,8 +6,10 @@
 //! futures, which read and write the stream's own pinned inline buffers
 //! with no heap allocation. [`recv_provided`](TcpStream::recv_provided)
 //! instead receives into a kernel-selected provided buffer and resolves a
-//! borrowed zero-copy [`ProvidedBuf`]. Client-side connect arrives with a
-//! stream constructor in a later release.
+//! borrowed zero-copy [`ProvidedBuf`]. [`send_zc`](TcpStream::send_zc) sends
+//! zero-copy on a supporting kernel, falling back to a plain copying send
+//! otherwise. Client-side connect arrives with a stream constructor in a
+//! later release.
 //!
 //! # Examples
 //!
