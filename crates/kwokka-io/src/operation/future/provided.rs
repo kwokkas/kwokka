@@ -16,7 +16,7 @@ use core::{
 use std::io;
 
 use crate::{
-    boundary::{self, IoSeam, WakeSlot},
+    boundary::{self, IoSeam},
     buffer::ring::pool::ProvidedBuf,
     operation::SubmitResult,
 };
@@ -99,7 +99,11 @@ impl Future for ProvidedRecvFuture {
             return match IoSeam::with_current(op.worker_id, IoSeam::completion_result) {
                 Some(Some(slot)) => {
                     this.submitted = None;
-                    Poll::Ready(resolve(op.worker_id, slot))
+                    Poll::Ready(boundary::resolve_provided_recv(
+                        op.worker_id,
+                        slot.result,
+                        slot.buf_id,
+                    ))
                 }
                 _ => Poll::Pending,
             };
@@ -138,35 +142,6 @@ impl Drop for ProvidedRecvFuture {
             // single-writer.
             boundary::push_provided_recv_cancel_for_worker(op.worker_id, op.token);
         }
-    }
-}
-
-/// Resolves a provided recv's completion into the buffer view it names.
-///
-/// A negative result is the mapped `-errno`. A nonnegative result normally
-/// carries the kernel-selected buffer id (`io_uring_prep_recv.3`: a
-/// `BUFFER_SELECT` recv reports the chosen buffer in the CQE flags); end of
-/// stream may complete without consuming a buffer, which resolves into the
-/// empty view. Data without a buffer id cannot name its bytes -- a
-/// driver-plumbing fault surfaced as [`io::ErrorKind::InvalidData`] rather
-/// than a panic.
-fn resolve(worker_id: u8, slot: WakeSlot) -> io::Result<ProvidedBuf> {
-    if slot.result < 0 {
-        return Err(io::Error::from_raw_os_error(-slot.result));
-    }
-    let len = u32::try_from(slot.result).unwrap_or(0);
-    match slot.buf_id {
-        Some(buf_id) => Ok(ProvidedBuf::new(
-            worker_id,
-            boundary::provided_pool_epoch(worker_id),
-            buf_id,
-            len,
-        )),
-        None if slot.result == 0 => Ok(ProvidedBuf::empty()),
-        None => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "provided recv completed with data but no kernel-selected buffer",
-        )),
     }
 }
 

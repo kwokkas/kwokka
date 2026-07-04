@@ -37,7 +37,7 @@ use crate::{
             MultishotPush, MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotPush,
             RecvMultishotSlab, RecvMultishotSlotKey,
         },
-        ring::pool::BufRingPool,
+        ring::pool::{BufRingPool, ProvidedBuf},
     },
     operation::{CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
@@ -170,6 +170,51 @@ pub fn adopt_accepted_fd(result: i32) -> Option<OwnedFd> {
     // concern (incorrect close), not a memory-safety concern: no pointer
     // dereference occurs.
     Some(unsafe { OwnedFd::from_raw_fd(result) })
+}
+
+/// Resolves a provided-buffer recv completion into the buffer view it names.
+///
+/// `result` is the CQE result and `buf_id` the kernel-selected provided buffer
+/// (`io_uring_prep_recv.3`: a `BUFFER_SELECT` recv reports its chosen buffer in
+/// the CQE flags). A negative result maps to the corresponding [`io::Error`]. A
+/// nonnegative result with a buffer resolves into a [`ProvidedBuf`] borrowing the
+/// worker pool's bytes, which recycles the buffer to the ring on drop, so the
+/// caller owns that recycle by holding and dropping the view. End of stream
+/// completes with a zero result and no buffer, resolving into the empty view;
+/// data without a buffer id cannot name its bytes and surfaces as
+/// [`io::ErrorKind::InvalidData`] rather than a panic.
+///
+/// The single-shot provided recv and the multishot recv stream both resolve
+/// their completions through this one path, so a caller reading a buffer view
+/// gets identical bytes and identical recycle semantics whichever recv shape
+/// produced it.
+///
+/// # Errors
+///
+/// Returns the mapped `-errno` for a negative completion, or
+/// [`io::ErrorKind::InvalidData`] when a positive result carries no buffer id.
+pub fn resolve_provided_recv(
+    worker_id: u8,
+    result: i32,
+    buf_id: Option<u16>,
+) -> io::Result<ProvidedBuf> {
+    if result < 0 {
+        return Err(io::Error::from_raw_os_error(-result));
+    }
+    let len = u32::try_from(result).unwrap_or(0);
+    match buf_id {
+        Some(buf_id) => Ok(ProvidedBuf::new(
+            worker_id,
+            provided_pool_epoch(worker_id),
+            buf_id,
+            len,
+        )),
+        None if result == 0 => Ok(ProvidedBuf::empty()),
+        None => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provided recv completed with data but no kernel-selected buffer",
+        )),
+    }
 }
 
 /// Registers the runtime's waker decoder, keeping the first registration.

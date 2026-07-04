@@ -8,9 +8,11 @@
 mod accept;
 mod connect;
 mod listener;
+mod recv;
 mod stream;
 
 pub use accept::AcceptStream;
 pub use kwokka_io::operation::ProvidedBuf;
 pub use listener::TcpListener;
+pub use recv::RecvStream;
 pub use stream::TcpStream;
