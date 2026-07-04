@@ -266,10 +266,58 @@ impl DriverType {
     /// Kept off the [`IoDriver`](crate::IoDriver) trait like
     /// [`park`](Self::park): the wake fd is run-loop plumbing, not part of
     /// the uniform completion API.
+    #[allow(
+        unused_variables,
+        clippy::missing_const_for_fn,
+        reason = "only the cfg-gated io_uring arm uses `fd`/`user_data` or is non-const; on thin-fallback builds the arm degenerates to a trivial const Unsupported"
+    )]
     pub fn arm_wake_read(&self, fd: i32, user_data: u64) -> SubmitResult {
         match self {
             #[cfg(target_os = "linux")]
             Self::Uring(driver) => driver.arm_wake_read(fd, user_data),
+            _ => SubmitResult::Unsupported,
+        }
+    }
+
+    /// The raw fd of the backend's own ring -- the target a peer names in an
+    /// `IORING_OP_MSG_RING` wake. `None` off the uring backend, which has no
+    /// ring to target and falls back to the eventfd wake.
+    ///
+    /// Kept off the [`IoDriver`](crate::IoDriver) trait like [`park`](Self::park):
+    /// the ring fd is run-loop plumbing, not part of the uniform completion API.
+    #[doc(hidden)]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "only the cfg-gated io_uring arm is non-const; on thin-fallback builds the accessor degenerates to a trivial const None"
+    )]
+    pub fn ring_fd(&self) -> Option<i32> {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => Some(driver.ring_fd()),
+            _ => None,
+        }
+    }
+
+    /// Submits an `IORING_OP_MSG_RING` wake on the backend's ring targeting
+    /// `target_ring_fd`.
+    ///
+    /// [`SubmitResult::Unsupported`] off the uring backend or when the kernel
+    /// lacks `msg_ring`; the caller falls back to the eventfd wake (fallback
+    /// parity).
+    ///
+    /// Kept off the [`IoDriver`](crate::IoDriver) trait like [`park`](Self::park):
+    /// cross-ring wake is run-loop plumbing, not part of the uniform completion
+    /// API.
+    #[doc(hidden)]
+    #[allow(
+        unused_variables,
+        clippy::missing_const_for_fn,
+        reason = "only the cfg-gated io_uring arm uses `target_ring_fd` or is non-const; on thin-fallback builds the submit degenerates to a trivial const Unsupported"
+    )]
+    pub fn submit_msg_ring_wake(&self, target_ring_fd: i32) -> SubmitResult {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => driver.submit_msg_ring_wake(target_ring_fd),
             _ => SubmitResult::Unsupported,
         }
     }
@@ -284,6 +332,28 @@ mod tests {
     fn epoll_submit_returns_unsupported() {
         let result = DriverType::Epoll(()).submit_internal(IoRequest::<()>::accept(3));
         assert!(matches!(result, SubmitResult::Unsupported));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_ring_fd_is_none() {
+        assert_eq!(
+            DriverType::Epoll(()).ring_fd(),
+            None,
+            "a backend with no ring has no msg_ring target",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn epoll_msg_ring_wake_returns_unsupported() {
+        assert!(
+            matches!(
+                DriverType::Epoll(()).submit_msg_ring_wake(5),
+                SubmitResult::Unsupported
+            ),
+            "the msg_ring wake falls back to eventfd off the uring backend",
+        );
     }
 
     #[cfg(any(

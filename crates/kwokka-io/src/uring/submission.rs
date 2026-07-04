@@ -75,8 +75,8 @@ pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) 
         (OpCode::Cancel, OpPayload::Control(ControlPayload::Cancel { target })) => {
             control::build_cancel(target.user_data())
         }
-        (OpCode::MsgRing, OpPayload::Control(ControlPayload::MsgRing { msg })) => {
-            control::build_msg_ring(request.fd, *msg)
+        (OpCode::MsgRing, OpPayload::Control(ControlPayload::MsgRing { result, sentinel })) => {
+            control::build_msg_ring(request.fd, *result, *sentinel)
         }
         (OpCode::Poll, OpPayload::Control(ControlPayload::PollAdd { events })) => {
             control::build_poll_add(request.fd, *events, request.flags)
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn msg_ring_builds_without_panic() {
-        let request = IoRequest::<()>::msg_ring(10, 0x1234);
+        let request = IoRequest::<()>::msg_ring_wake(10);
         let _entry = build_entry(&request, &mut scratch());
     }
 

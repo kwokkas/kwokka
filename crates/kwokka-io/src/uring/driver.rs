@@ -27,7 +27,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use std::{cell::UnsafeCell, io, time::Duration};
+use std::{cell::UnsafeCell, io, os::fd::AsRawFd, time::Duration};
 
 use io_uring::{
     EnterFlags, IoUring,
@@ -318,6 +318,33 @@ impl UringDriver {
         let request = IoRequest::read(fd, buf, 0).with_user_data(user_data);
         self.submit_read(request)
     }
+
+    /// The raw fd of this driver's own ring -- the target a peer names in an
+    /// `IORING_OP_MSG_RING` wake. Stable for the driver's lifetime; the ring is
+    /// never recreated or resized after construction.
+    ///
+    /// No new `unsafe`: reuses [`Self::ring_mut`]'s single-issuer access to read
+    /// the stored ring fd. `as_raw_fd` performs no syscall and mutates no ring
+    /// state, and `UringDriver` is `!Sync`, so `&self` is never held across
+    /// threads -- the cross-worker wake publishes only the plain fd value, never
+    /// a driver reference.
+    pub(crate) fn ring_fd(&self) -> i32 {
+        self.ring_mut().as_raw_fd()
+    }
+
+    /// Submits an `IORING_OP_MSG_RING` wake on this ring targeting
+    /// `target_ring_fd`.
+    ///
+    /// Carries [`MSG_RING_WAKE_USER_DATA`](crate::boundary::MSG_RING_WAKE_USER_DATA)
+    /// so the target's completion drain recognizes the CQE and unparks. Returns
+    /// [`SubmitResult::Unsupported`] when the kernel lacks `msg_ring`, leaving
+    /// the caller to fall back to the eventfd wake (fallback parity).
+    pub(crate) fn submit_msg_ring_wake(&self, target_ring_fd: i32) -> SubmitResult {
+        if !self.capabilities.msg_ring {
+            return SubmitResult::Unsupported;
+        }
+        self.submit_internal(IoRequest::<()>::msg_ring_wake(target_ring_fd))
+    }
 }
 
 /// Register a per-worker provided-buffer ring for kernel-selected recv.
@@ -545,6 +572,49 @@ mod tests {
 
         let count = driver.poll_completions(4, &mut buf);
         assert!(count <= 4);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn msg_ring_wake_delivers_the_sentinel_to_the_target() {
+        let Ok(target) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        let Ok(source) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        if !source.capabilities().msg_ring {
+            // Kernel below 5.18 or the feature is masked out; the eventfd wake
+            // is the fallback and there is nothing to prove here.
+            return;
+        }
+        assert!(
+            matches!(
+                source.submit_msg_ring_wake(target.ring_fd()),
+                SubmitResult::Submitted(_)
+            ),
+            "the msg_ring wake submits on the source ring",
+        );
+        // The CQE is already posted to the target; a bounded park returns once
+        // it lands rather than blocking.
+        let _outcome = target.park(Some(Duration::from_secs(1)));
+        let mut completions = [Completion {
+            token: SubmitToken::new(0),
+            result: 0,
+            flags: crate::operation::CqeFlags::EMPTY,
+            buf_id: None,
+        }; 4];
+        let count = target.poll_completions(4, &mut completions);
+        assert!(
+            completions[..count]
+                .iter()
+                .any(|completion| completion.token.user_data()
+                    == crate::boundary::MSG_RING_WAKE_USER_DATA),
+            "the target ring receives the msg_ring wake sentinel",
+        );
     }
 
     #[cfg_attr(

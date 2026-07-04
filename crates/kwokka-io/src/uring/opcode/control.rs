@@ -11,7 +11,7 @@
 
 use io_uring::{
     opcode,
-    squeue::Entry,
+    squeue::{Entry, Flags},
     types::{Fd, Fixed, Timespec},
 };
 
@@ -34,14 +34,17 @@ pub(crate) fn build_cancel(user_data: u64) -> Entry {
     opcode::AsyncCancel::new(user_data).build()
 }
 
-/// Build a `msg_ring` SQE.
-pub(crate) fn build_msg_ring(target_ring_fd: i32, msg: u64) -> Entry {
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "msg truncated to i32 result field; the full u64 is carried in user_data"
-    )]
-    let result_i32 = msg as i32;
-    opcode::MsgRingData::new(Fd(target_ring_fd), result_i32, msg, None).build()
+/// Build a `msg_ring` SQE targeting another ring.
+///
+/// `result` and `sentinel` become the target ring's CQE `res` and `user_data`
+/// -- two independent channels per `io_uring_prep_msg_ring.3`.
+/// `IOSQE_CQE_SKIP_SUCCESS` suppresses the source ring's own completion on
+/// success, so a wake costs no local CQE; a submit failure still posts one,
+/// carrying the same sentinel for the source-side drain to recognize.
+pub(crate) fn build_msg_ring(target_ring_fd: i32, result: i32, sentinel: u64) -> Entry {
+    opcode::MsgRingData::new(Fd(target_ring_fd), result, sentinel, None)
+        .build()
+        .flags(Flags::SKIP_SUCCESS)
 }
 
 /// Build a poll-add SQE.

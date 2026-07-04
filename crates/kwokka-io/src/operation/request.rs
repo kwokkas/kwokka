@@ -109,9 +109,13 @@ pub enum ControlPayload {
     /// Wake another ring's driver loop via `IORING_OP_MSG_RING`.
     ///
     /// The target ring fd is carried in [`IoRequest::fd`], not in this payload.
+    /// `result` and `sentinel` become the target CQE's `res` and `user_data`,
+    /// two independent channels per `io_uring_prep_msg_ring.3`.
     MsgRing {
-        /// Opaque message value echoed in the target ring's CQE.
-        msg: u64,
+        /// Value echoed in the target ring's CQE `res` field.
+        result: i32,
+        /// Marker echoed in the target ring's CQE `user_data` field.
+        sentinel: u64,
     },
     /// Add a poll-readiness watch.
     PollAdd {
@@ -371,14 +375,24 @@ impl IoRequest<()> {
         )
     }
 
-    /// Send a message to another ring.
+    /// Wake another ring via `IORING_OP_MSG_RING`.
+    ///
+    /// Posts [`MSG_RING_WAKE_USER_DATA`](crate::boundary::MSG_RING_WAKE_USER_DATA)
+    /// as the target ring's CQE `user_data`, and as this op's own SQE
+    /// `user_data`, so a rare source-side failure CQE (`SKIP_SUCCESS` drops the
+    /// success CQE) is recognized by the same sentinel rather than misrouted
+    /// onto a task slot. The target's completion drain unparks and discards it.
     #[doc(hidden)]
-    pub fn msg_ring(target_ring_fd: i32, msg: u64) -> Self {
+    pub fn msg_ring_wake(target_ring_fd: i32) -> Self {
         Self::build(
             target_ring_fd,
             OpCode::MsgRing,
-            OpPayload::Control(ControlPayload::MsgRing { msg }),
+            OpPayload::Control(ControlPayload::MsgRing {
+                result: 0,
+                sentinel: crate::boundary::MSG_RING_WAKE_USER_DATA,
+            }),
         )
+        .with_user_data(crate::boundary::MSG_RING_WAKE_USER_DATA)
     }
 
     /// Poll a file descriptor for readiness.

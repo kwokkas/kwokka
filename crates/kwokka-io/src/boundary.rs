@@ -1713,6 +1713,39 @@ pub const fn is_recv_multishot_sentinel(user_data: u64) -> bool {
     user_data & CANCEL_TOKEN_HIGH_MASK == RECV_MULTISHOT_TOKEN_BASE
 }
 
+/// `user_data` marker for a cross-ring `msg_ring` wake.
+///
+/// The `IORING_OP_MSG_RING` analog of the wake fd's
+/// [`WAKE_FD_USER_DATA`](crate::wake::WAKE_FD_USER_DATA). A peer worker posts
+/// this as the target CQE's `user_data` purely to break the target's park; the
+/// completion drain recognizes it and unparks without a task route or a stored
+/// result. The upper 32 bits read `0xFFFF_FFFC`: the arena tag
+/// bit, worker id 127, and generation `MAX - 3`, one corner below the
+/// multishot-recv base, so all five completion sentinels stay disjoint by
+/// upper-32 -- wake fd and cancel `0xFFFF_FFFF`, multishot accept `0xFFFF_FFFE`,
+/// multishot recv `0xFFFF_FFFD`, and this `0xFFFF_FFFC`. Unlike the per-slot
+/// sentinels it names no suboperation, so the whole value is the fixed marker
+/// with a zero low half; recognition is an exact-value match, not an upper-32
+/// mask.
+const MSG_RING_WAKE_TOKEN_BASE: u64 = 0xFFFF_FFFC_0000_0000;
+
+/// The CQE `user_data` a cross-ring `msg_ring` wake carries.
+///
+/// The target ring receives it as the delivered wake; the source ring sees it
+/// on the `SKIP_SUCCESS` failure CQE, so a rare send failure is recognized
+/// rather than misrouted onto a task slot.
+pub const MSG_RING_WAKE_USER_DATA: u64 = MSG_RING_WAKE_TOKEN_BASE;
+
+/// Whether `user_data` marks a cross-ring `msg_ring` wake.
+///
+/// The completion drain calls this to recognize a peer's `IORING_OP_MSG_RING`
+/// CQE and unpark without a task route. It is an exact-value match against the
+/// fixed marker, disjoint from every per-slot sentinel corner and from the wake
+/// fd's `u64::MAX`.
+pub const fn is_msg_ring_wake(user_data: u64) -> bool {
+    user_data == MSG_RING_WAKE_USER_DATA
+}
+
 /// The wake and retire targets a multishot CQE resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultishotCompletion {
@@ -2976,6 +3009,28 @@ mod tests {
         );
         // free with no slab is a no-op, never a panic.
         seam.multishot_free(key);
+    }
+
+    #[test]
+    fn msg_ring_wake_sentinel_is_recognized_and_disjoint() {
+        assert!(
+            is_msg_ring_wake(MSG_RING_WAKE_USER_DATA),
+            "the marker recognizes itself",
+        );
+        // Disjoint from every other completion sentinel and the wake fd.
+        assert!(!is_msg_ring_wake(crate::wake::WAKE_FD_USER_DATA));
+        assert!(!is_msg_ring_wake(CANCEL_TOKEN_BASE));
+        assert!(!is_msg_ring_wake(MULTISHOT_TOKEN_BASE));
+        assert!(!is_msg_ring_wake(RECV_MULTISHOT_TOKEN_BASE));
+        // The other predicates reject the msg_ring marker.
+        assert!(!is_cancel_sentinel(MSG_RING_WAKE_USER_DATA));
+        assert!(!is_multishot_sentinel(MSG_RING_WAKE_USER_DATA));
+        assert!(!is_recv_multishot_sentinel(MSG_RING_WAKE_USER_DATA));
+        // One corner below the multishot-recv base.
+        assert_eq!(
+            MSG_RING_WAKE_USER_DATA >> 32,
+            (RECV_MULTISHOT_TOKEN_BASE >> 32) - 1,
+        );
     }
 
     #[test]
