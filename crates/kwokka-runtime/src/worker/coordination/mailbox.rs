@@ -13,6 +13,10 @@
 //! threads, drives the same ring with many producers -- the MPSC contract
 //! holds for both with no API change.
 
+use kwokka_io::DriverType;
+#[cfg(not(loom))]
+use kwokka_io::operation::SubmitResult;
+
 #[cfg(not(loom))]
 use crate::sync::mpsc::MpscRing;
 #[cfg(not(loom))]
@@ -109,13 +113,26 @@ pub(crate) fn set_parked(worker_id: WorkerId, is_parked: bool) {
 /// Signals the wake endpoint of `worker_id` when it is published and
 /// parked; a running, unpublished, or withdrawn worker costs nothing.
 ///
-/// Takes the raw id so the producer side mirrors [`enqueue`]'s
-/// `TaskRef`-decoded routing.
+/// `source` is the producer's own driver when it runs on a worker (the
+/// scheduler-internal wake sites), or `None` from a context with no ring (a
+/// generic waker, a shutdown signal). When both the source and the target
+/// carry a ring and the kernel supports it, the wake rides an `msg_ring` SQE
+/// on the source ring that lands as a CQE on the target; every other case,
+/// a refused submit included, writes the target's eventfd. Takes the raw id so
+/// the producer side mirrors [`enqueue`]'s `TaskRef`-decoded routing.
 #[cfg(not(loom))]
-pub(crate) fn signal(worker_id: u8) {
+pub(crate) fn signal(source: Option<&DriverType>, worker_id: u8) {
     let Some(target) = ENDPOINTS[worker_id as usize].signal_target() else {
         return;
     };
+    if let (Some(driver), Some(ring_fd)) = (source, target.ring_fd) {
+        if matches!(
+            driver.submit_msg_ring_wake(ring_fd),
+            SubmitResult::Submitted(_)
+        ) {
+            return;
+        }
+    }
     // IGNORE: a failed eventfd write races endpoint withdrawal; the worker
     // is already draining toward shutdown and needs no unpark.
     let _ = kwokka_io::wake::signal_wake_fd(target.event_fd);
@@ -124,7 +141,7 @@ pub(crate) fn signal(worker_id: u8) {
 /// Loom variant -- the endpoint table is gated out of the loom build; the
 /// parked-handshake model drives [`EndpointCell`] directly.
 #[cfg(loom)]
-pub(crate) fn signal(_worker_id: u8) {
+pub(crate) fn signal(_source: Option<&DriverType>, _worker_id: u8) {
     // Models drive the cell directly; reaching this stub is a model bug.
     unreachable!("the loom build never signals through the global registry")
 }
@@ -204,7 +221,7 @@ mod tests {
     fn an_unpublished_endpoint_signal_is_silent() {
         // Worker 90 never publishes; the signal resolves to nothing and
         // must not reach a write.
-        signal(90);
+        signal(None, 90);
     }
 
     #[test]
@@ -212,11 +229,66 @@ mod tests {
         let id = worker(91);
         publish_endpoint(id, 5, None);
         // Published but running: resolves to nothing, no write happens.
-        signal(91);
+        signal(None, 91);
         set_parked(id, true);
         withdraw_endpoint(id);
         // Withdrawn: the parked flag went with the cell, still silent.
-        signal(91);
+        signal(None, 91);
         set_parked(id, false);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn signal_reaches_a_parked_worker_through_msg_ring() {
+        use std::time::Duration;
+
+        use kwokka_io::{
+            DriverType, IoDriver, boundary::MSG_RING_WAKE_USER_DATA, operation::Completion, wake,
+        };
+
+        let Ok(target) = DriverType::for_platform(32) else {
+            panic!("driver build must succeed");
+        };
+        let Ok(source) = DriverType::for_platform(32) else {
+            panic!("driver build must succeed");
+        };
+        let Some(ring_fd) = target.ring_fd() else {
+            // A fallback backend with no ring to target; the eventfd wake is the
+            // path here and there is nothing to prove.
+            return;
+        };
+        if !source.capabilities().msg_ring {
+            // Kernel below 5.18 or the feature is masked out.
+            return;
+        }
+        let id = 80u8;
+        let target_worker = worker(id);
+        let Ok(event_fd) = wake::create_wake_fd() else {
+            panic!("wake fd creation must succeed");
+        };
+        publish_endpoint(target_worker, event_fd, Some(ring_fd));
+        set_parked(target_worker, true);
+
+        signal(Some(&source), id);
+
+        // The msg_ring SQE rode the source ring and posted a CQE on the target.
+        let _outcome = target.park(Some(Duration::from_secs(1)));
+        let mut completions = [Completion::default(); 4];
+        let count = target.poll_completions(4, &mut completions);
+        let landed = completions[..count]
+            .iter()
+            .any(|completion| completion.token.user_data() == MSG_RING_WAKE_USER_DATA);
+
+        set_parked(target_worker, false);
+        withdraw_endpoint(target_worker);
+        wake::close_wake_fd(event_fd);
+
+        assert!(
+            landed,
+            "the msg_ring wake sentinel lands on the target ring"
+        );
     }
 }

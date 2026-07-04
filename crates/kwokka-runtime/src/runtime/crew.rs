@@ -68,7 +68,7 @@ impl Crew {
             CrewKind::Solo => return,
         }
         for offset in 1..self.count {
-            registry::signal(sibling_id(lead, offset).raw());
+            registry::signal(None, sibling_id(lead, offset).raw());
         }
         for slot in &mut self.handles[..self.count - 1] {
             let Some(handle) = slot.take() else {

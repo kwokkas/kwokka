@@ -52,13 +52,6 @@ pub(crate) struct WakeTarget {
     /// The eventfd to signal.
     pub(crate) event_fd: i32,
     /// The worker's own ring fd, when it has one.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "read by the msg_ring wake branch in a later part of this change"
-        )
-    )]
     pub(crate) ring_fd: Option<i32>,
 }
 

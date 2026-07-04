@@ -97,7 +97,7 @@ pub(crate) fn tick<C: Clock>(
         // A timer armed before its task relocated fires against the husk;
         // the forwarding wake re-routes it to the task's new worker.
         #[cfg(feature = "steal")]
-        wake_or_forward(tasks, run_queue, forward, task_ref);
+        wake_or_forward(tasks, run_queue, forward, None, task_ref);
         #[cfg(not(feature = "steal"))]
         wake_local(tasks, run_queue, task_ref);
         woke_any = true;
