@@ -13,9 +13,9 @@ use kwokka_core::{id::Pip, slab::Slab};
 use kwokka_io::{
     DriverType,
     boundary::{
-        ACCEPT_CANCEL_CAPACITY, AcceptCancelSet, CANCEL_INBOX_CAPACITY, CancelInbox,
-        PROVIDED_RECV_CANCEL_CAPACITY, ProvidedRecvCancelSet, RECV_CANCEL_INBOX_CAPACITY,
-        RecvCancelInbox,
+        ACCEPT_CANCEL_CAPACITY, AcceptCancelSet, CANCEL_INBOX_CAPACITY, CONNECT_CANCEL_CAPACITY,
+        CancelInbox, ConnectCancelSet, PROVIDED_RECV_CANCEL_CAPACITY, ProvidedRecvCancelSet,
+        RECV_CANCEL_INBOX_CAPACITY, RecvCancelInbox,
     },
     buffer::{
         inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
@@ -80,6 +80,10 @@ pub(crate) struct WorkerShard {
     /// the drain recycles a raced recv's kernel-selected buffer instead of
     /// leaking it. No heap, no fd.
     pub(crate) provided_recv_cancels: ProvidedRecvCancelSet<PROVIDED_RECV_CANCEL_CAPACITY>,
+    /// Tokens of dropped single-shot connects awaiting their completion, so the
+    /// drain diverts a raced connect's belated CQE off the task path instead of
+    /// letting a stale result overwrite a live task's wake slot. No heap, no fd.
+    pub(crate) connect_cancels: ConnectCancelSet<CONNECT_CANCEL_CAPACITY>,
     /// Per-worker multishot registry, holding the FIFO of completions for each
     /// in-flight multishot op. Drop-order independent (no heap, no fd).
     pub(crate) multishot_slab: MultishotSlab,
@@ -150,6 +154,7 @@ impl WorkerShard {
             cancel_inbox: CancelInbox::new(),
             accept_cancels: AcceptCancelSet::new(),
             provided_recv_cancels: ProvidedRecvCancelSet::new(),
+            connect_cancels: ConnectCancelSet::new(),
             multishot_slab: MultishotSlab::new(id.raw(), DEFAULT_MULTISHOT_CAP),
             recv_multishot_slab: RecvMultishotSlab::new(id.raw(), DEFAULT_RECV_MULTISHOT_CAP)?,
             recv_cancel_inbox: RecvCancelInbox::new()?,
