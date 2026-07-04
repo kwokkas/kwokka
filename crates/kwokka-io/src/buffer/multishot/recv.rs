@@ -6,12 +6,17 @@
 //! and the owning task drains on its next poll. Unlike accept, each queued
 //! completion carries two values (the byte count and the provided-buffer id),
 //! and the store is per-connection, so it scales past the inline accept path
-//! with an mmap-backed FIFO payload.
+//! with mmap-backed storage for both the per-slot bookkeeping and the FIFO
+//! payload.
 //!
-//! Zero-heap: one `MmapRegion` for the FIFO payload, allocated at construction
-//! and never grown; the bitmaps and per-slot tables are inline. Pure safe Rust:
-//! the payload is read and written as little-endian bytes through the region's
-//! byte-slice views, the single raw-pointer step confined to `MmapRegion`.
+//! Zero-heap: two `MmapRegion`s, allocated at construction and never grown.
+//! `metadata` holds the per-slot ring cursor, generation, and owner token;
+//! `storage` holds the FIFO payload. Only the three occupancy bitmaps stay
+//! inline -- `first_free` scans them on every allocate, and at 96 bytes total
+//! moving them off-struct would not shrink the worker's stack frame in any
+//! way that matters. Pure safe Rust: every field is read and written as
+//! little-endian bytes through the regions' byte-slice views, the single
+//! raw-pointer step confined to `MmapRegion`.
 //!
 //! Generational: each slot carries a generation bumped on free, so a stale
 //! sentinel naming a reused slot is rejected rather than routed to the new
@@ -32,16 +37,33 @@ use crate::buffer::{mmap::MmapRegion, multishot::MULTISHOT_FIFO_DEPTH};
 /// Recv is per-connection, so this is sized well above the accept path's handful
 /// of listeners. It matches the provided-buffer ring depth that feeds every
 /// stream on the worker: there is no reason to track more concurrent streams
-/// than the shared buffer pool can serve. The FIFO payload is mmap-backed, so
-/// this does not inflate the shard's stack frame the way the inline accept
-/// registry would.
+/// than the shared buffer pool can serve. Both the FIFO payload and the
+/// per-slot metadata are mmap-backed, so this does not inflate the shard's
+/// stack frame the way an inline accept-style registry would.
 pub const DEFAULT_RECV_MULTISHOT_CAP: u16 = 256;
 
 /// Bytes per queued completion in the FIFO payload: an `i32` byte count (or a
 /// negative errno) followed by a `u16` provided-buffer id.
 const ENTRY_LEN: usize = 6;
 
-/// Slot-count ceiling that sizes the inline bitmaps and per-slot tables.
+/// Bytes per slot in the metadata region: a little-endian `u16` ring read
+/// cursor at offset 0, a little-endian `u16` queued-result count at
+/// [`META_LEN_OFFSET`], a little-endian `u64` generation at
+/// [`META_GENERATION_OFFSET`], and a little-endian `u64` owner token at
+/// [`META_OWNER_TOKEN_OFFSET`].
+const META_ENTRY_LEN: usize = 20;
+
+/// Byte offset, within a slot's metadata record, of the `u16` queued-result
+/// count.
+const META_LEN_OFFSET: usize = 2;
+
+/// Byte offset, within a slot's metadata record, of the `u64` generation.
+const META_GENERATION_OFFSET: usize = 4;
+
+/// Byte offset, within a slot's metadata record, of the `u64` owner token.
+const META_OWNER_TOKEN_OFFSET: usize = 12;
+
+/// Slot-count ceiling that sizes the inline bitmaps and the metadata region.
 const MAX_RECV_MULTISHOT_SLOTS: usize = DEFAULT_RECV_MULTISHOT_CAP as usize;
 
 /// Bitmap words covering [`MAX_RECV_MULTISHOT_SLOTS`].
@@ -86,23 +108,21 @@ pub(crate) enum RecvMultishotPush {
 }
 
 /// Per-worker fixed-capacity multishot recv registry.
+///
+/// Only the three occupancy bitmaps live inline; the per-slot ring cursor,
+/// generation, and owner token live in the `metadata` mmap region, so this
+/// type stays a small handle on the worker's stack frame.
 pub struct RecvMultishotSlab {
     /// mmap-backed per-slot ring of `(i32 count, u16 buf_id)` entries.
     storage: MmapRegion,
-    /// Per-slot ring read cursor.
-    head: [u16; MAX_RECV_MULTISHOT_SLOTS],
-    /// Per-slot count of queued results.
-    len: [u16; MAX_RECV_MULTISHOT_SLOTS],
+    /// mmap-backed per-slot cursor, generation, and owner token. See
+    /// [`META_ENTRY_LEN`] for the byte map.
+    metadata: MmapRegion,
     occupied: [u64; BITMAP_WORDS],
     /// The op posted its final (no-`MORE`) CQE; no more results will arrive.
     terminated: [u64; BITMAP_WORDS],
     /// A cancel was submitted for the op; its final CQE frees the slot.
     cancel_pending: [u64; BITMAP_WORDS],
-    /// Per-slot generation, bumped on free. A `u64` makes the ABA window
-    /// effectively unbounded.
-    generation: [u64; MAX_RECV_MULTISHOT_SLOTS],
-    /// Per-slot owning task token, woken when a result lands in the FIFO.
-    owner_token: [u64; MAX_RECV_MULTISHOT_SLOTS],
     worker_id: u8,
     cap: u16,
 }
@@ -118,15 +138,13 @@ impl RecvMultishotSlab {
         let cap = cap.min(DEFAULT_RECV_MULTISHOT_CAP);
         let depth = MULTISHOT_FIFO_DEPTH as usize;
         let storage = MmapRegion::new(MAX_RECV_MULTISHOT_SLOTS * depth * ENTRY_LEN)?;
+        let metadata = MmapRegion::new(MAX_RECV_MULTISHOT_SLOTS * META_ENTRY_LEN)?;
         Ok(Self {
             storage,
-            head: [0; MAX_RECV_MULTISHOT_SLOTS],
-            len: [0; MAX_RECV_MULTISHOT_SLOTS],
+            metadata,
             occupied: [0; BITMAP_WORDS],
             terminated: [0; BITMAP_WORDS],
             cancel_pending: [0; BITMAP_WORDS],
-            generation: [0; MAX_RECV_MULTISHOT_SLOTS],
-            owner_token: [0; MAX_RECV_MULTISHOT_SLOTS],
             worker_id,
             cap,
         })
@@ -141,12 +159,12 @@ impl RecvMultishotSlab {
         self.occupied[word] |= 1u64 << bit;
         self.terminated[word] &= !(1u64 << bit);
         self.cancel_pending[word] &= !(1u64 << bit);
-        self.head[slot as usize] = 0;
-        self.len[slot as usize] = 0;
-        self.owner_token[slot as usize] = owner_token;
+        self.set_slot_head(slot, 0);
+        self.set_slot_len(slot, 0);
+        self.set_slot_owner_token(slot, owner_token);
         Some(RecvMultishotSlotKey {
             slot,
-            generation: self.generation[slot as usize],
+            generation: self.slot_generation(slot),
             worker_id: self.worker_id,
         })
     }
@@ -169,16 +187,17 @@ impl RecvMultishotSlab {
             let (word, bit) = word_bit(slot);
             self.terminated[word] |= 1u64 << bit;
         }
-        let slot_idx = slot as usize;
-        if self.len[slot_idx] >= MULTISHOT_FIFO_DEPTH {
+        let len = self.slot_len(slot);
+        if len >= MULTISHOT_FIFO_DEPTH {
             return RecvMultishotPush::Overflowed;
         }
-        let ring_index = (self.head[slot_idx] + self.len[slot_idx]) % MULTISHOT_FIFO_DEPTH;
+        let head = self.slot_head(slot);
+        let ring_index = (head + len) % MULTISHOT_FIFO_DEPTH;
         let offset = entry_offset(slot, ring_index);
         let bytes = self.storage.as_mut_slice();
         bytes[offset..offset + 4].copy_from_slice(&result.to_le_bytes());
         bytes[offset + 4..offset + ENTRY_LEN].copy_from_slice(&buf_id.to_le_bytes());
-        self.len[slot_idx] += 1;
+        self.set_slot_len(slot, len + 1);
         RecvMultishotPush::Queued
     }
 
@@ -186,11 +205,14 @@ impl RecvMultishotSlab {
     /// FIFO is empty or `key` is stale. A `buf_id` of [`NO_BUFFER`] marks a
     /// completion that consumed no provided buffer.
     pub(crate) fn pop(&mut self, key: RecvMultishotSlotKey) -> Option<(i32, u16)> {
-        if !self.is_live(key) || self.len[key.slot as usize] == 0 {
+        if !self.is_live(key) {
             return None;
         }
-        let slot_idx = key.slot as usize;
-        let head = self.head[slot_idx];
+        let len = self.slot_len(key.slot);
+        if len == 0 {
+            return None;
+        }
+        let head = self.slot_head(key.slot);
         let offset = entry_offset(key.slot, head);
         let bytes = self.storage.as_slice();
         let Ok(result_bytes) = <[u8; 4]>::try_from(&bytes[offset..offset + 4]) else {
@@ -199,8 +221,8 @@ impl RecvMultishotSlab {
         let Ok(buf_id_bytes) = <[u8; 2]>::try_from(&bytes[offset + 4..offset + ENTRY_LEN]) else {
             return None;
         };
-        self.head[slot_idx] = (head + 1) % MULTISHOT_FIFO_DEPTH;
-        self.len[slot_idx] -= 1;
+        self.set_slot_head(key.slot, (head + 1) % MULTISHOT_FIFO_DEPTH);
+        self.set_slot_len(key.slot, len - 1);
         Some((
             i32::from_le_bytes(result_bytes),
             u16::from_le_bytes(buf_id_bytes),
@@ -209,15 +231,15 @@ impl RecvMultishotSlab {
 
     /// Returns the owning task token for `slot` at the sentinel's generation, or
     /// `None` when the slot is stale. The drain calls this to wake the owner.
-    pub(crate) const fn owner(&self, slot: u16, generation_low16: u16) -> Option<u64> {
+    pub(crate) fn owner(&self, slot: u16, generation_low16: u16) -> Option<u64> {
         if !self.is_slot_live(slot, generation_low16) {
             return None;
         }
-        Some(self.owner_token[slot as usize])
+        Some(self.slot_owner_token(slot))
     }
 
     /// Returns whether `key`'s op has posted its final CQE.
-    pub(crate) const fn is_terminated(&self, key: RecvMultishotSlotKey) -> bool {
+    pub(crate) fn is_terminated(&self, key: RecvMultishotSlotKey) -> bool {
         if !self.is_live(key) {
             return false;
         }
@@ -226,7 +248,7 @@ impl RecvMultishotSlab {
     }
 
     /// Marks `key`'s slot cancel-pending. A stale handle is a no-op.
-    pub(crate) const fn mark_cancel_pending(&mut self, key: RecvMultishotSlotKey) {
+    pub(crate) fn mark_cancel_pending(&mut self, key: RecvMultishotSlotKey) {
         if !self.is_live(key) {
             return;
         }
@@ -235,7 +257,7 @@ impl RecvMultishotSlab {
     }
 
     /// Frees `key`'s slot, bumping its generation. A stale handle is a no-op.
-    pub(crate) const fn free(&mut self, key: RecvMultishotSlotKey) {
+    pub(crate) fn free(&mut self, key: RecvMultishotSlotKey) {
         if !self.is_live(key) {
             return;
         }
@@ -243,13 +265,13 @@ impl RecvMultishotSlab {
         self.occupied[word] &= !(1u64 << bit);
         self.terminated[word] &= !(1u64 << bit);
         self.cancel_pending[word] &= !(1u64 << bit);
-        self.len[key.slot as usize] = 0;
-        let generation = &mut self.generation[key.slot as usize];
-        *generation = generation.wrapping_add(1);
+        self.set_slot_len(key.slot, 0);
+        let generation = self.slot_generation(key.slot).wrapping_add(1);
+        self.set_slot_generation(key.slot, generation);
     }
 
     /// Whether `slot` is cancel-pending at `generation_low16`.
-    pub(crate) const fn is_cancel_pending(&self, slot: u16, generation_low16: u16) -> bool {
+    pub(crate) fn is_cancel_pending(&self, slot: u16, generation_low16: u16) -> bool {
         if !self.is_slot_live(slot, generation_low16) {
             return false;
         }
@@ -261,7 +283,7 @@ impl RecvMultishotSlab {
     ///
     /// The drain calls this on the terminal CQE of a cancel-pending op, keyed by
     /// the sentinel's slot and low-16 generation; a stale slot is a no-op.
-    pub(crate) const fn free_by_slot(&mut self, slot: u16, generation_low16: u16) {
+    pub(crate) fn free_by_slot(&mut self, slot: u16, generation_low16: u16) {
         if !self.is_slot_live(slot, generation_low16) {
             return;
         }
@@ -269,12 +291,13 @@ impl RecvMultishotSlab {
         self.occupied[word] &= !(1u64 << bit);
         self.terminated[word] &= !(1u64 << bit);
         self.cancel_pending[word] &= !(1u64 << bit);
-        self.len[slot as usize] = 0;
-        self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
+        self.set_slot_len(slot, 0);
+        let generation = self.slot_generation(slot).wrapping_add(1);
+        self.set_slot_generation(slot, generation);
     }
 
     /// Whether `key` names a currently-occupied slot at its generation.
-    pub(crate) const fn is_live(&self, key: RecvMultishotSlotKey) -> bool {
+    pub(crate) fn is_live(&self, key: RecvMultishotSlotKey) -> bool {
         if key.worker_id != self.worker_id {
             return false;
         }
@@ -282,18 +305,17 @@ impl RecvMultishotSlab {
             return false;
         }
         let (word, bit) = word_bit(key.slot);
-        self.occupied[word] & (1u64 << bit) != 0
-            && self.generation[key.slot as usize] == key.generation
+        self.occupied[word] & (1u64 << bit) != 0 && self.slot_generation(key.slot) == key.generation
     }
 
     /// Whether `slot` is occupied at the low-16-bit `generation`.
-    const fn is_slot_live(&self, slot: u16, generation_low16: u16) -> bool {
+    fn is_slot_live(&self, slot: u16, generation_low16: u16) -> bool {
         if slot >= self.cap {
             return false;
         }
         let (word, bit) = word_bit(slot);
         self.occupied[word] & (1u64 << bit) != 0
-            && self.generation[slot as usize] & 0xFFFF == generation_low16 as u64
+            && self.slot_generation(slot) & 0xFFFF == u64::from(generation_low16)
     }
 
     /// First free slot within `cap`, by inverted-bitmap scan.
@@ -317,6 +339,58 @@ impl RecvMultishotSlab {
         }
         None
     }
+
+    /// Reads `slot`'s ring read cursor from the metadata region.
+    fn slot_head(&self, slot: u16) -> u16 {
+        read_u16(&self.metadata, meta_offset(slot))
+    }
+
+    /// Writes `slot`'s ring read cursor into the metadata region.
+    fn set_slot_head(&mut self, slot: u16, value: u16) {
+        write_u16(&mut self.metadata, meta_offset(slot), value);
+    }
+
+    /// Reads `slot`'s queued-result count from the metadata region.
+    fn slot_len(&self, slot: u16) -> u16 {
+        read_u16(&self.metadata, meta_offset(slot) + META_LEN_OFFSET)
+    }
+
+    /// Writes `slot`'s queued-result count into the metadata region.
+    fn set_slot_len(&mut self, slot: u16, value: u16) {
+        write_u16(
+            &mut self.metadata,
+            meta_offset(slot) + META_LEN_OFFSET,
+            value,
+        );
+    }
+
+    /// Reads `slot`'s generation from the metadata region.
+    fn slot_generation(&self, slot: u16) -> u64 {
+        read_u64(&self.metadata, meta_offset(slot) + META_GENERATION_OFFSET)
+    }
+
+    /// Writes `slot`'s generation into the metadata region.
+    fn set_slot_generation(&mut self, slot: u16, value: u64) {
+        write_u64(
+            &mut self.metadata,
+            meta_offset(slot) + META_GENERATION_OFFSET,
+            value,
+        );
+    }
+
+    /// Reads `slot`'s owner token from the metadata region.
+    fn slot_owner_token(&self, slot: u16) -> u64 {
+        read_u64(&self.metadata, meta_offset(slot) + META_OWNER_TOKEN_OFFSET)
+    }
+
+    /// Writes `slot`'s owner token into the metadata region.
+    fn set_slot_owner_token(&mut self, slot: u16, value: u64) {
+        write_u64(
+            &mut self.metadata,
+            meta_offset(slot) + META_OWNER_TOKEN_OFFSET,
+            value,
+        );
+    }
 }
 
 /// Byte offset of a slot's ring entry in the FIFO payload.
@@ -324,9 +398,60 @@ const fn entry_offset(slot: u16, ring_index: u16) -> usize {
     (slot as usize * MULTISHOT_FIFO_DEPTH as usize + ring_index as usize) * ENTRY_LEN
 }
 
+/// Byte offset of a slot's record in the metadata region.
+const fn meta_offset(slot: u16) -> usize {
+    slot as usize * META_ENTRY_LEN
+}
+
 /// Splits a slot index into its bitmap word and bit offset.
 const fn word_bit(slot: u16) -> (usize, usize) {
     (slot as usize / 64, slot as usize % 64)
+}
+
+/// Reads a little-endian `u16` at `offset` in `region`. Panic-free: an
+/// `offset` that runs past the region (never expected under the slot-index
+/// invariant every caller upholds) reads back `0` rather than panicking.
+fn read_u16(region: &MmapRegion, offset: usize) -> u16 {
+    let bytes = region.as_slice();
+    let Some(slice) = bytes.get(offset..offset + 2) else {
+        return 0;
+    };
+    let Ok(array) = <[u8; 2]>::try_from(slice) else {
+        return 0;
+    };
+    u16::from_le_bytes(array)
+}
+
+/// Writes a little-endian `u16` at `offset` in `region`. Panic-free: a no-op
+/// when `offset` runs past the region.
+fn write_u16(region: &mut MmapRegion, offset: usize, value: u16) {
+    let bytes = region.as_mut_slice();
+    if let Some(slice) = bytes.get_mut(offset..offset + 2) {
+        slice.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
+/// Reads a little-endian `u64` at `offset` in `region`. Panic-free: an
+/// `offset` that runs past the region (never expected under the slot-index
+/// invariant every caller upholds) reads back `0` rather than panicking.
+fn read_u64(region: &MmapRegion, offset: usize) -> u64 {
+    let bytes = region.as_slice();
+    let Some(slice) = bytes.get(offset..offset + 8) else {
+        return 0;
+    };
+    let Ok(array) = <[u8; 8]>::try_from(slice) else {
+        return 0;
+    };
+    u64::from_le_bytes(array)
+}
+
+/// Writes a little-endian `u64` at `offset` in `region`. Panic-free: a no-op
+/// when `offset` runs past the region.
+fn write_u64(region: &mut MmapRegion, offset: usize, value: u64) {
+    let bytes = region.as_mut_slice();
+    if let Some(slice) = bytes.get_mut(offset..offset + 8) {
+        slice.copy_from_slice(&value.to_le_bytes());
+    }
 }
 
 #[cfg(test)]
@@ -538,5 +663,10 @@ mod tests {
         assert!(!registry.is_live(key));
         assert!(!registry.is_terminated(key));
         assert_eq!(registry.pop(key), None);
+    }
+
+    #[test]
+    fn slab_fits_stack_budget() {
+        assert!(std::mem::size_of::<RecvMultishotSlab>() < 512);
     }
 }

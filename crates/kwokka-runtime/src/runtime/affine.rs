@@ -19,7 +19,7 @@ use std::{io, thread};
 
 use kwokka_io::{
     DriverType,
-    boundary::{CancelInboxGuard, ProvidedPoolGuard},
+    boundary::{CancelInboxGuard, ProvidedPoolGuard, RecvCancelInboxGuard},
     wake,
 };
 
@@ -200,6 +200,8 @@ fn sibling_main(id: WorkerId, ring_entries: u32, task_capacity: usize) {
     // Declared after `shard` so LIFO drop nulls the cancel static before
     // `shard.tasks` frees buffered futures, whose drops then no-op.
     let _cancel_guard = CancelInboxGuard::install(id.raw(), &mut shard.cancel_inbox);
+    // Same LIFO bracket for the dedicated recv-multishot cancel inbox.
+    let _recv_cancel_guard = RecvCancelInboxGuard::install(id.raw(), &mut shard.recv_cancel_inbox);
     // Same LIFO bracket: the provided-pool static clears before the shard --
     // and the driver-owned pool -- is reclaimed.
     let _pool_guard = ProvidedPoolGuard::install(id.raw(), &shard.driver);
