@@ -208,6 +208,15 @@ impl<B: IoBuf> IoRequest<B> {
         Self::build(fd, OpCode::Send, OpPayload::Buffer { buf, offset: 0 })
     }
 
+    /// Send `buf` over `fd` zero-copy (`SEND_ZC`).
+    ///
+    /// The kernel reads `buf` in place rather than copying it into kernel space
+    /// (`io_uring_prep_send_zc.3`), so the buffer must outlive the send: the op
+    /// posts a notification completion once the kernel has released it.
+    pub fn send_zc(fd: i32, buf: B) -> Self {
+        Self::build(fd, OpCode::SendZc, OpPayload::Buffer { buf, offset: 0 })
+    }
+
     /// Send `buf` to `addr` over `fd`.
     pub fn sendmsg(fd: i32, addr: SockAddr, buf: B) -> Self {
         Self::build(
@@ -446,6 +455,17 @@ mod tests {
     fn write_sets_correct_opcode() {
         let request = IoRequest::write(3, MockBuf::new(4), 0);
         assert_eq!(request.opcode, OpCode::Write);
+    }
+
+    #[test]
+    fn send_zc_sets_correct_opcode_and_fd() {
+        let request = IoRequest::send_zc(3, MockBuf::new(4));
+        assert_eq!(request.opcode, OpCode::SendZc);
+        assert_eq!(request.fd, 3);
+        assert!(
+            !request.flags.zero_copy,
+            "OpCode::SendZc disambiguates, not the flag"
+        );
     }
 
     #[test]

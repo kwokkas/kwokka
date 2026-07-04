@@ -25,7 +25,7 @@ use crate::{
         CommonFields, ControlPayload, IoBuf, IoBufMut, IoRequest, OpCode, OpFlags, OpPayload,
     },
     uring::{
-        opcode::{control, io, net, sync},
+        opcode::{control, io, net, sync, xfer},
         setup::flags::sqe_flags,
     },
 };
@@ -184,6 +184,9 @@ pub(crate) fn build_entry_write<B: IoBuf>(request: &IoRequest<B>) -> Entry {
         (OpCode::Send, OpPayload::Buffer { buf, .. }) => {
             net::build_send(request.fd, buf.as_ptr(), buf.bytes_init(), request.flags)
         }
+        (OpCode::SendZc, OpPayload::Buffer { buf, .. }) => {
+            xfer::build_send_zc(request.fd, buf.as_ptr(), buf.bytes_init(), request.flags)
+        }
         (opcode, _) => panic!("unsupported opcode {opcode:?} in build_entry_write"),
     };
     apply_common(entry, &request.common, request.flags)
@@ -327,6 +330,12 @@ mod tests {
     #[test]
     fn send_builds_without_panic() {
         let request = IoRequest::send(3, MockBuf::filled(4));
+        let _entry = build_entry_write(&request);
+    }
+
+    #[test]
+    fn send_zc_builds_without_panic() {
+        let request = IoRequest::send_zc(3, MockBuf::filled(4));
         let _entry = build_entry_write(&request);
     }
 
