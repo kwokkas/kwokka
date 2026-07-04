@@ -526,6 +526,32 @@ impl IoSeam {
         Some(result)
     }
 
+    /// Whether the backend supports zero-copy send (`SEND_ZC`, kernel 6.0+).
+    ///
+    /// A send future probes this up front: a backend that reports support
+    /// submits [`IoRequest::send_zc`] so the kernel reads the buffer in place,
+    /// otherwise the future falls back to a plain copying send (fallback
+    /// parity). A seam with no driver (a test seam) reports `false`.
+    ///
+    /// [`IoRequest::send_zc`]: crate::operation::IoRequest::send_zc
+    #[must_use]
+    pub fn is_send_zc_supported(&self) -> bool {
+        let Some(driver) = self.driver else {
+            return false;
+        };
+        // SAFETY: Invariant -- `driver` points at the worker's live driver, a
+        // field disjoint from the task storage the runtime borrows across the
+        // poll; `capabilities` takes `&self`, so this shared reborrow aliases
+        // nothing mutably.
+        // Precondition: reached only via `with_current` during a poll on this
+        // worker; the installing runtime keeps the referent live for the poll
+        // window and the `SeamGuard` bracket clears the seam first.
+        // Failure mode: a read after the guard dropped would deref a dangling
+        // driver pointer; the bracket excludes it.
+        let driver = unsafe { driver.as_ref() };
+        driver.capabilities().send_zc
+    }
+
     /// Allocates an in-flight buffer slot for a buffered op on the polling task.
     ///
     /// Returns the slot handle paired with a writable pointer to its
@@ -2251,6 +2277,28 @@ mod tests {
             "a backend without multishot recv degrades synchronously",
         );
         assert_eq!(seam.submitted(), 0, "a gated submit raises no count");
+    }
+
+    #[test]
+    fn send_zc_unsupported_without_a_driver() {
+        let seam = IoSeam::new(206, None, None, None);
+        assert!(
+            !seam.is_send_zc_supported(),
+            "a seam with no driver reports no zero-copy send",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn send_zc_unsupported_on_epoll() {
+        let mut driver = DriverType::Epoll(());
+        let seam = IoSeam::new(207, Some(NonNull::from(&mut driver)), None, None);
+        // Epoll reports no io_uring capabilities, so the shared driver reborrow
+        // reads send_zc as false and the future takes the plain-send fallback.
+        assert!(
+            !seam.is_send_zc_supported(),
+            "the epoll stub reports no zero-copy send capability",
+        );
     }
 
     #[cfg(target_os = "linux")]

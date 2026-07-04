@@ -7,13 +7,15 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum OpCode {
-    // Group A - hot path (9)
+    // Group A - hot path (10)
     /// Read from a file descriptor.
     Read,
     /// Write to a file descriptor.
     Write,
     /// Send data on a socket.
     Send,
+    /// Send data on a socket zero-copy, the kernel reads the buffer in place (`SEND_ZC`).
+    SendZc,
     /// Receive data on a socket.
     Recv,
     /// Receive into a kernel-selected provided buffer (`buf_ring`).
@@ -247,11 +249,12 @@ mod tests {
     }
 
     #[test]
-    fn op_code_group_a_has_nine_variants() {
+    fn op_code_group_a_has_ten_variants() {
         let variants = [
             OpCode::Read,
             OpCode::Write,
             OpCode::Send,
+            OpCode::SendZc,
             OpCode::Recv,
             OpCode::RecvProvided,
             OpCode::Sendmsg,
@@ -259,7 +262,7 @@ mod tests {
             OpCode::Accept,
             OpCode::Connect,
         ];
-        assert_eq!(variants.len(), 9);
+        assert_eq!(variants.len(), 10);
     }
 
     #[test]
