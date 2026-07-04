@@ -22,7 +22,7 @@ use kwokka_io::{
 /// backend without multishot recv, or when the registry is full, the stream
 /// degrades to one single-shot provided recv per item. Either way `next().await`
 /// yields `Some(Ok(buf))` for a received chunk, `Some(Err(_))` for a per-recv
-/// error, or `None` once a multishot op ends.
+/// error, or `None` once the stream ends (a closed peer, or a terminal error).
 ///
 /// Each `Ok` item is a [`ProvidedBuf`] borrowing the worker pool's bytes; reading
 /// it and dropping it recycles the buffer to the ring, so the caller owns the
@@ -158,8 +158,16 @@ fn multishot_next(binding: WakerBinding, key: RecvMultishotSlotKey) -> RecvMulti
         .unwrap_or(RecvMultishotNext::Ended)
 }
 
-/// Drives one single-shot provided recv, re-arming a fresh one after each item
-/// so a stale completion never repeats.
+/// Drives one single-shot provided recv per item.
+///
+/// A non-empty chunk continues the stream: re-arm a fresh single-shot recv for
+/// the next item, re-reading a stale completion never repeated. End of stream
+/// (an empty view) and any error are terminal -- the state stays `Done` and the
+/// item is handed back once, so the next poll yields `None`. This is where the
+/// recv stream diverges from the accept stream, which re-arms unconditionally
+/// because accepting has no end of stream: re-arming a recv past a closed peer,
+/// or past an `Unsupported` from a backend with no provided-buffer group, would
+/// trap a caller looping on `next()` re-reading a permanent condition.
 fn poll_fallback(
     stream: &mut RecvStream<'_>,
     cx: &mut Context<'_>,
@@ -173,9 +181,12 @@ fn poll_fallback(
             stream.state = RecvState::Fallback(recv);
             Poll::Pending
         }
-        Poll::Ready(result) => {
+        Poll::Ready(Ok(buf)) if !buf.is_empty() => {
             stream.state = RecvState::Fallback(ProvidedRecvFuture::new(stream.fd));
-            Poll::Ready(Some(result))
+            Poll::Ready(Some(Ok(buf)))
         }
+        // End of stream (an empty view) or any error is terminal: the state is
+        // already `Done`, so the stream ends after handing this item back.
+        Poll::Ready(result) => Poll::Ready(Some(result)),
     }
 }
