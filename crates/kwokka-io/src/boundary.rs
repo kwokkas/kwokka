@@ -620,6 +620,32 @@ impl IoSeam {
         slab.free(key);
     }
 
+    /// Whether `key`'s in-flight slot has seen its `SEND_ZC` NOTIF.
+    ///
+    /// A resolve-on-NOTIF send future polls this by key during its own poll:
+    /// `true` means the kernel released the buffer, so the future may resolve
+    /// and free its slot. A seam with no slab, or a stale key, reads `false`.
+    #[must_use]
+    pub const fn slot_notif_ready(&self, key: InflightSlotKey) -> bool {
+        let Some(slab) = self.inflight_slab else {
+            return false;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field,
+        // reached via `with_current` during a poll on this worker; the
+        // `SeamGuard` bracket keeps the referent live. This forms a SHARED
+        // reference (`is_notif_ready` reads only), weaker than the `&mut` the
+        // allocate / harvest / free paths take.
+        // Precondition: single-poll-writer discipline -- `poll_one` and
+        // `SeamGuard` are non-reentrant, so no `&mut InflightBufSlab` is live
+        // anywhere while this shared reference exists.
+        // Failure mode: a `&mut` into the slab overlapping this shared reborrow
+        // would be aliasing UB (the non-reentrant poll excludes it); a call
+        // after `SeamGuard` drops derefs a dangling pointer (the bracket
+        // excludes it).
+        let slab = unsafe { slab.as_ref() };
+        slab.is_notif_ready(key)
+    }
+
     /// Reserves a multishot slot for the polling task.
     ///
     /// `owner_token` is the polling task, woken on each completion. On
@@ -2073,6 +2099,35 @@ pub fn reclaim_cancel_completion(slab: &mut InflightBufSlab, sentinel_user_data:
     slab.free_if_retire_pending(slot, generation_low16);
 }
 
+/// Marks the slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
+///
+/// The completion drain calls this on a primary CQE that carried
+/// `IORING_CQE_F_MORE`, which means a notification CQE releasing the buffer is
+/// still coming (`io_uring_prep_send_zc.3`). Until it lands the kernel may still
+/// read the buffer, so a racing `-ENOENT` cancel must not free the slot:
+/// `InflightBufSlab::free_if_retire_pending` refuses while the slot is
+/// notif-expected but not yet notif-ready. A no-op when the op's slot is not
+/// tracked here.
+pub fn mark_notif_expected(slab: &mut InflightBufSlab, op_token: u64) {
+    slab.mark_notif_expected_by_op_token(op_token);
+}
+
+/// Reclaims or arms a `SEND_ZC` slot on its NOTIF completion.
+///
+/// The completion drain calls this on a NOTIF CQE (`IORING_CQE_F_NOTIF`,
+/// `io_uring_prep_send_zc.3`): the kernel has released the buffer. Two cases,
+/// distinguished by whether the owning future has dropped. A dropped future
+/// left its slot retire-pending, so `InflightBufSlab::free_by_op_token` frees
+/// it now -- the NOTIF is the last signal for that slot. A still-live future
+/// has no retire-pending slot for the op, so the slot is marked notif-ready
+/// instead, and the future frees it on its next poll through
+/// [`IoSeam::slot_notif_ready`].
+pub fn reclaim_notif(slab: &mut InflightBufSlab, op_token: u64) {
+    if !slab.free_by_op_token(op_token) {
+        slab.mark_notif_ready_by_op_token(op_token);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2381,6 +2436,45 @@ mod tests {
     }
 
     #[test]
+    fn slot_notif_ready_reads_the_flag_through_the_seam() {
+        let Ok(mut slab) = InflightBufSlab::new(12, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        {
+            let seam = IoSeam::new(12, None, Some(NonNull::from(&mut slab)), None);
+            assert!(
+                !seam.slot_notif_ready(key),
+                "a fresh slot is not notif-ready through the seam",
+            );
+        }
+        // Arm the flag on the slab, then observe it through a fresh seam.
+        slab.mark_notif_ready_by_op_token(0xABCD);
+        let seam = IoSeam::new(12, None, Some(NonNull::from(&mut slab)), None);
+        assert!(
+            seam.slot_notif_ready(key),
+            "the seam observes the notif-ready flag by key",
+        );
+    }
+
+    #[test]
+    fn slot_notif_ready_needs_a_slab() {
+        let seam = IoSeam::new(13, None, None, None);
+        let key = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 13,
+            op_token: 0,
+        };
+        assert!(
+            !seam.slot_notif_ready(key),
+            "a seam with no slab reports not-ready",
+        );
+    }
+
+    #[test]
     fn harvest_into_copies_then_frees() {
         let Ok(mut slab) = InflightBufSlab::new(9, 8) else {
             panic!("mmap must succeed for the test slab");
@@ -2551,6 +2645,49 @@ mod tests {
         assert_eq!(
             next.slot, key.slot,
             "the slot is reused after its op completion reclaims it",
+        );
+    }
+
+    #[test]
+    fn reclaim_notif_frees_dropped_slot() {
+        let Ok(mut slab) = InflightBufSlab::new(4, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xAA) else {
+            panic!("allocate must succeed");
+        };
+        // Primary carried F_MORE, then the future dropped (retire-pending).
+        mark_notif_expected(&mut slab, 0xAA);
+        slab.mark_retire_pending(key);
+        // The NOTIF is the last signal for a dropped future: free the slot.
+        reclaim_notif(&mut slab, 0xAA);
+        let Some(next) = slab.allocate(0) else {
+            panic!("the freed slot reallocates");
+        };
+        assert_eq!(
+            next.slot, key.slot,
+            "the NOTIF frees a dropped future's slot",
+        );
+    }
+
+    #[test]
+    fn reclaim_notif_arms_live_slot() {
+        let Ok(mut slab) = InflightBufSlab::new(4, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xAA) else {
+            panic!("allocate must succeed");
+        };
+        // Primary carried F_MORE; the future is still live (not retire-pending).
+        mark_notif_expected(&mut slab, 0xAA);
+        reclaim_notif(&mut slab, 0xAA);
+        assert!(
+            slab.is_notif_ready(key),
+            "a live future's slot is armed notif-ready, not freed",
+        );
+        assert!(
+            slab.slot_ptr(key).is_some(),
+            "the live slot survives its NOTIF",
         );
     }
 

@@ -42,8 +42,9 @@ pub trait IoDriver: Send {
 
     /// Drain up to `max` completions into `out`.
     ///
-    /// `NOTIF` CQEs from `SEND_ZC` two-stage completions are absorbed
-    /// internally and never appended to `out`.
+    /// A `NOTIF` CQE from a `SEND_ZC` two-stage completion is appended to
+    /// `out` with `CqeFlags::NOTIF` set; the runtime completion drain absorbs
+    /// it to release the send buffer, so user code never sees it.
     fn poll_completions(&self, max: usize, out: &mut [Completion]) -> usize;
 
     /// Capability snapshot detected at ring setup.

@@ -63,6 +63,16 @@ pub struct InflightBufSlab {
     storage: MmapRegion,
     occupied: [u64; BITMAP_WORDS],
     retire_pending: [u64; BITMAP_WORDS],
+    /// Per-slot flag: a `SEND_ZC` primary CQE arrived with `IORING_CQE_F_MORE`,
+    /// so a notification CQE releasing the buffer is still expected. Gates the
+    /// `-ENOENT` cancel free so a slot the kernel may still read is not freed
+    /// before its NOTIF lands.
+    notif_expected: [u64; BITMAP_WORDS],
+    /// Per-slot flag: the `SEND_ZC` NOTIF CQE arrived while the owning future
+    /// was still live (nothing retire-pending for its op), so the kernel has
+    /// released the buffer. The live future reads this by key on its next poll
+    /// and frees its own slot.
+    notif_ready: [u64; BITMAP_WORDS],
     /// Per-slot generation, bumped on free. A `u64` makes the ABA window
     /// effectively unbounded: a slot would need 2^64 reuses to wrap.
     generation: [u64; MAX_INFLIGHT_SLOTS],
@@ -92,6 +102,8 @@ impl InflightBufSlab {
             storage,
             occupied: [0; BITMAP_WORDS],
             retire_pending: [0; BITMAP_WORDS],
+            notif_expected: [0; BITMAP_WORDS],
+            notif_ready: [0; BITMAP_WORDS],
             generation: [0; MAX_INFLIGHT_SLOTS],
             op_token: [0; MAX_INFLIGHT_SLOTS],
             worker_id,
@@ -127,6 +139,8 @@ impl InflightBufSlab {
         let (word, bit) = word_bit(key.slot);
         self.occupied[word] &= !(1u64 << bit);
         self.retire_pending[word] &= !(1u64 << bit);
+        self.notif_expected[word] &= !(1u64 << bit);
+        self.notif_ready[word] &= !(1u64 << bit);
         let generation = &mut self.generation[key.slot as usize];
         *generation = generation.wrapping_add(1);
     }
@@ -150,7 +164,8 @@ impl InflightBufSlab {
         self.retire_pending[word] & (1u64 << bit) != 0
     }
 
-    /// Frees the retire-pending slot whose op matches `op_token`, if any.
+    /// Frees the retire-pending slot whose op matches `op_token`, returning
+    /// whether a slot was freed.
     ///
     /// Called from the completion drain on the original buffered op's own
     /// completion (keyed by the task token it was submitted with). That CQE is
@@ -160,8 +175,10 @@ impl InflightBufSlab {
     ///
     /// Only retire-pending slots are eligible: a slot still owned by a live
     /// future frees through its own `harvest_into` or `free_slot`, never here.
-    /// The scan is a no-op when no slot is retire-pending, the common case.
-    pub(crate) fn free_by_op_token(&mut self, op_token: u64) {
+    /// The scan is a no-op when no slot is retire-pending, the common case. The
+    /// `bool` lets the `SEND_ZC` NOTIF path tell a dropped-future free (`true`)
+    /// from a still-live future (`false`, which then marks `notif_ready`).
+    pub(crate) fn free_by_op_token(&mut self, op_token: u64) -> bool {
         for word in 0..BITMAP_WORDS {
             let mut pending = self.retire_pending[word];
             while pending != 0 {
@@ -171,15 +188,18 @@ impl InflightBufSlab {
                 if self.op_token[slot] == op_token && self.occupied[word] & (1u64 << bit) != 0 {
                     self.occupied[word] &= !(1u64 << bit);
                     self.retire_pending[word] &= !(1u64 << bit);
+                    self.notif_expected[word] &= !(1u64 << bit);
+                    self.notif_ready[word] &= !(1u64 << bit);
                     self.generation[slot] = self.generation[slot].wrapping_add(1);
-                    return;
+                    return true;
                 }
             }
         }
+        false
     }
 
-    /// Frees `slot` when it is retire-pending, occupied, and at the matching
-    /// truncated generation.
+    /// Frees `slot` when it is retire-pending, occupied, at the matching
+    /// truncated generation, and not awaiting a `SEND_ZC` NOTIF.
     ///
     /// Called from the completion drain on a cancel completion that reported
     /// `-ENOENT`: the target op already completed and posted its one CQE before
@@ -187,6 +207,13 @@ impl InflightBufSlab {
     /// cancel sentinel carries the slot's low 16 generation bits, matched here
     /// so a stale cancel completion cannot free a slot the same op token has
     /// since reused at a later generation.
+    ///
+    /// A `SEND_ZC` slot is the one `-ENOENT` exception: its primary CQE
+    /// completing (hence the `-ENOENT` on the cancel) does not mean the kernel
+    /// is done with the buffer -- the NOTIF has not landed. `notif_expected`
+    /// without `notif_ready` therefore refuses the free, leaving the slot for
+    /// the NOTIF path; once `notif_ready` is set the buffer is released and the
+    /// free proceeds.
     pub(crate) fn free_if_retire_pending(&mut self, slot: u16, generation_low16: u16) {
         if slot >= self.cap {
             return;
@@ -196,12 +223,77 @@ impl InflightBufSlab {
         let is_pending = self.retire_pending[word] & (1u64 << bit) != 0;
         let matches_generation =
             self.generation[slot as usize] & 0xFFFF == u64::from(generation_low16);
-        if !is_occupied || !is_pending || !matches_generation {
+        let is_notif_expected = self.notif_expected[word] & (1u64 << bit) != 0;
+        let is_notif_ready = self.notif_ready[word] & (1u64 << bit) != 0;
+        if !is_occupied
+            || !is_pending
+            || !matches_generation
+            || (is_notif_expected && !is_notif_ready)
+        {
             return;
         }
         self.occupied[word] &= !(1u64 << bit);
         self.retire_pending[word] &= !(1u64 << bit);
+        self.notif_expected[word] &= !(1u64 << bit);
+        self.notif_ready[word] &= !(1u64 << bit);
         self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
+    }
+
+    /// Marks the live slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
+    ///
+    /// Called from the completion drain when a primary CQE carries
+    /// `IORING_CQE_F_MORE`: a notification CQE releasing the buffer is still
+    /// coming, so the slot must not be freed by a racing `-ENOENT` cancel until
+    /// then. This is the op's first event, so exactly one occupied slot carries
+    /// this token; the scan sets that slot's flag and stops. A no-op when no
+    /// occupied slot matches.
+    pub(crate) fn mark_notif_expected_by_op_token(&mut self, op_token: u64) {
+        for word in 0..BITMAP_WORDS {
+            let mut occupied = self.occupied[word];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                if self.op_token[word * 64 + bit] == op_token {
+                    self.notif_expected[word] |= 1u64 << bit;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Marks the live slot for `op_token` as `SEND_ZC` NOTIF-released.
+    ///
+    /// Called from the completion drain on a NOTIF CQE only after
+    /// [`free_by_op_token`](Self::free_by_op_token) reported no retire-pending
+    /// match, which means the owning future is still live. The future reads the
+    /// flag by key on its next poll (see [`is_notif_ready`](Self::is_notif_ready))
+    /// and frees its own slot. A no-op when no occupied slot matches, e.g. the
+    /// future already freed it.
+    pub(crate) fn mark_notif_ready_by_op_token(&mut self, op_token: u64) {
+        for word in 0..BITMAP_WORDS {
+            let mut occupied = self.occupied[word];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                if self.op_token[word * 64 + bit] == op_token {
+                    self.notif_ready[word] |= 1u64 << bit;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Whether `key`'s live slot has seen its `SEND_ZC` NOTIF.
+    ///
+    /// The owning future polls this by key; `true` means the kernel released
+    /// the buffer, so the future may resolve and free the slot. A stale or
+    /// cross-worker key reads `false` through the generation guard.
+    pub(crate) const fn is_notif_ready(&self, key: InflightSlotKey) -> bool {
+        if !self.is_live(key) {
+            return false;
+        }
+        let (word, bit) = word_bit(key.slot);
+        self.notif_ready[word] & (1u64 << bit) != 0
     }
 
     /// Returns a writable pointer to `key`'s slot, or `None` if stale.
@@ -521,6 +613,117 @@ mod tests {
             next.generation,
             key.generation + 1,
             "the slot was freed once, not twice",
+        );
+    }
+
+    #[test]
+    fn free_by_op_token_reports_whether_it_freed() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        // Live (not retire-pending): nothing to free, so it reports false.
+        assert!(
+            !registry.free_by_op_token(0xABCD),
+            "a live slot is not freed",
+        );
+        registry.mark_retire_pending(key);
+        assert!(
+            registry.free_by_op_token(0xABCD),
+            "a retire-pending slot is freed and reported",
+        );
+    }
+
+    #[test]
+    fn notif_ready_roundtrips_by_key_and_clears_on_free() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        assert!(
+            !registry.is_notif_ready(key),
+            "a fresh slot is not notif-ready",
+        );
+        registry.mark_notif_ready_by_op_token(0xABCD);
+        assert!(
+            registry.is_notif_ready(key),
+            "the notif mark is visible by key",
+        );
+        registry.free(key);
+        assert!(
+            !registry.is_notif_ready(key),
+            "free clears the notif flag and the stale key reads false",
+        );
+    }
+
+    // Drop order 1: the future drops before its NOTIF arrives, so the NOTIF's
+    // op-token free reclaims the retire-pending slot.
+    #[test]
+    fn notif_after_drop_frees_via_op_token() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        // Primary CQE carried F_MORE.
+        registry.mark_notif_expected_by_op_token(0xABCD);
+        // Future drops -> its cancel marks the slot retire-pending.
+        registry.mark_retire_pending(key);
+        // NOTIF arrives: the dropped future's slot frees by op token.
+        assert!(
+            registry.free_by_op_token(0xABCD),
+            "the NOTIF frees the slot"
+        );
+        let Some(next) = registry.allocate(0) else {
+            panic!("the freed slot reallocates");
+        };
+        assert_eq!(next.slot, key.slot, "the slot is reused after the NOTIF");
+    }
+
+    // Drop order 2: primary done, an -ENOENT cancel races ahead of the NOTIF.
+    // The kernel may still read the buffer, so the free must be refused.
+    #[test]
+    fn enoent_refuses_free_before_notif() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        registry.mark_notif_expected_by_op_token(0xABCD);
+        registry.mark_retire_pending(key);
+        let generation_low16 = (key.generation & 0xFFFF) as u16;
+        registry.free_if_retire_pending(key.slot, generation_low16);
+        assert!(
+            registry.slot_ptr(key).is_some(),
+            "the slot survives an -ENOENT before its NOTIF",
+        );
+    }
+
+    // Drop order 3 (the leak-fix corner): the NOTIF lands on a still-live
+    // future (marking ready), then the future drops and its cancel returns
+    // -ENOENT. Guarding on notif_expected alone would leak; notif_ready must
+    // permit the -ENOENT free to proceed.
+    #[test]
+    fn enoent_frees_after_notif_ready_then_drop() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        registry.mark_notif_expected_by_op_token(0xABCD);
+        // NOTIF on a live future: not retire-pending, so it marks ready.
+        assert!(
+            !registry.free_by_op_token(0xABCD),
+            "a live future frees nothing here",
+        );
+        registry.mark_notif_ready_by_op_token(0xABCD);
+        // Future drops now; the cancel marks retire-pending and returns -ENOENT.
+        registry.mark_retire_pending(key);
+        let generation_low16 = (key.generation & 0xFFFF) as u16;
+        registry.free_if_retire_pending(key.slot, generation_low16);
+        let Some(next) = registry.allocate(0) else {
+            panic!("the freed slot reallocates once notif-ready");
+        };
+        assert_eq!(
+            next.slot, key.slot,
+            "notif_ready lets the -ENOENT free proceed",
         );
     }
 }
