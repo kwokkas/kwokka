@@ -7,7 +7,7 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
-use kwokka_io::operation::{ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture};
+use kwokka_io::operation::{ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture, SendZcFuture};
 
 use crate::tcp::RecvStream;
 
@@ -193,6 +193,43 @@ impl TcpStream {
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
         SendFuture::new(self.inner.as_raw_fd(), data, len)
+    }
+
+    /// Hands out the future sending the first `len` bytes of `data` (clamped to
+    /// `CAP`) over this socket, zero-copy when the kernel supports it.
+    ///
+    /// Like [`send`](Self::send), but a supporting kernel (6.0 and up) sends the
+    /// bytes without copying them into kernel space and posts a second
+    /// completion once it has released the buffer; the future resolves on that
+    /// notification, so the awaited byte count arrives when the buffer is free
+    /// to reuse. A kernel without zero-copy send falls back to a plain copying
+    /// send. Awaiting it resolves to an [`io::Result`] byte count (a short count
+    /// when the socket send buffer fills). The kernel reads a worker-owned copy
+    /// of the bytes, so dropping the future mid-flight is safe. Await it
+    /// directly on a runtime task: polling it through a waker the runtime did
+    /// not build panics.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: needs a connected peer and io_uring 6.0+ at runtime.
+    /// use kwokka_net::tcp::TcpListener;
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let stream = runtime.block_on(listener.accept())?;
+    /// let mut data = [0u8; 64];
+    /// data[..5].copy_from_slice(b"hello");
+    /// let _sent = runtime.block_on(stream.send_zc::<64>(data, 5))?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn send_zc<const CAP: usize>(
+        &self,
+        data: [u8; CAP],
+        len: usize,
+    ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
+        SendZcFuture::new(self.inner.as_raw_fd(), data, len)
     }
 }
 

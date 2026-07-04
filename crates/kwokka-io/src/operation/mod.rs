@@ -12,6 +12,7 @@ pub use future::{
     file::{FileReadFuture, FileWriteFuture},
     provided::ProvidedRecvFuture,
     socket::{RecvFuture, SendFuture},
+    zerocopy::SendZcFuture,
 };
 pub use request::{CommonFields, ControlPayload, IoRequest, OpPayload};
 
