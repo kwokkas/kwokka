@@ -23,9 +23,9 @@ use kwokka_io::{
     IoDriver,
     boundary::{
         CancelInboxGuard, ProvidedPoolGuard, RecvCancelInboxGuard, dispose_cancelled_op,
-        is_cancel_sentinel, is_multishot_sentinel, is_recv_multishot_sentinel,
+        is_cancel_sentinel, is_multishot_sentinel, is_recv_multishot_sentinel, mark_notif_expected,
         push_multishot_completion, push_recv_multishot_completion, reclaim_cancel_completion,
-        reclaim_dropped_slot, submit_cancel_for, submit_recv_multishot_cancel,
+        reclaim_dropped_slot, reclaim_notif, submit_cancel_for, submit_recv_multishot_cancel,
     },
     operation::Completion,
     wake,
@@ -262,6 +262,20 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             arm_wake(shard, wake_fd);
             continue;
         }
+        if completion.is_notif() {
+            // The notification half of a SEND_ZC op: the kernel has released the
+            // send buffer. Free a dropped future's slot now, or arm a live
+            // future's slot so it frees on its next poll, then wake the awaiting
+            // task. The primary CQE already stored the byte count, so this never
+            // stores again.
+            reclaim_notif(&mut shard.inflight_slab, user_data);
+            wake_local(
+                &mut shard.tasks,
+                &mut shard.run_queue,
+                TaskRef::from_raw(user_data),
+            );
+            continue;
+        }
         if is_cancel_sentinel(user_data) {
             // The cancel op's own CQE. Usually a no-op here: the target op's
             // completion reclaims the slot. The exception is a -ENOENT result,
@@ -347,7 +361,17 @@ fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
             // nothing to reclaim into a slot or wake.
             continue;
         }
-        reclaim_dropped_slot(&mut shard.inflight_slab, user_data);
+        if completion.has_more() {
+            // A SEND_ZC primary CQE carrying F_MORE: the notification releasing
+            // the buffer is still coming. Mark the slot notif-expected so a
+            // racing -ENOENT cancel cannot free it before the kernel is done,
+            // and skip the reclaim here -- the notification frees it. Multishot
+            // ops set F_MORE too but route through their sentinels above, so
+            // F_MORE on this path is a zero-copy send.
+            mark_notif_expected(&mut shard.inflight_slab, user_data);
+        } else {
+            reclaim_dropped_slot(&mut shard.inflight_slab, user_data);
+        }
         let task_ref = TaskRef::from_raw(user_data);
         let key = SlabKey::new(task_ref.index(), task_ref.generation());
         if let Some(slot) = shard.tasks.get_mut(key) {
