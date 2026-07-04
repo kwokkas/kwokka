@@ -93,11 +93,27 @@ fn send_zc_delivers_buffer_bytes() {
 
     let sent = match result {
         Ok(sent) => sent,
-        // The kernel best-effort-refuses a zero-copy send under io_uring
-        // resource pressure with -EINVAL, the same shape as a backend that never
-        // supported it. Accept the refusal the way the provided-recv entries
-        // accept Unsupported, rather than assert a delivery the OS declined.
-        Err(err) if err.raw_os_error() == Some(22) => return,
+        // The kernel best-effort-refuses a zero-copy send under io_uring resource
+        // pressure with -EINVAL, which SendZcFuture also returns defensively when
+        // its own submission machinery fails. Distinguish the two by proving a
+        // plain send on the same connection still delivers: a wiring regression
+        // fails both, a genuine kernel refusal fails only the zero-copy path.
+        Err(err) if err.raw_os_error() == Some(22) => {
+            let Ok(plain) = runtime.block_on(client.send::<64>(data, message.len())) else {
+                panic!("a plain send must still deliver when zero-copy is refused");
+            };
+            assert_eq!(plain, message.len(), "the plain send delivered every byte");
+            let mut received = [0u8; 64];
+            let Ok(()) = server.read_exact(&mut received[..plain]) else {
+                panic!("reading the plain-sent bytes back must succeed");
+            };
+            assert_eq!(
+                &received[..plain],
+                &message[..],
+                "the server holds the bytes the plain send delivered",
+            );
+            return;
+        }
         Err(err) => panic!("the zero-copy send resolved with an unexpected error: {err}"),
     };
     assert_eq!(sent, message.len(), "the kernel sent every requested byte");
