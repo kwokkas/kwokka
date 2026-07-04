@@ -7,7 +7,9 @@ use crate::operation::SubmitToken;
 /// `result` is kept as a raw `i32` (negative = `-errno`). The completion
 /// futures decode it into an `io::Result` before user code sees it; a
 /// direct `Completion` consumer converts the raw value itself.
-/// `NOTIF` CQEs are absorbed by the driver loop and never surface here.
+/// A `NOTIF` CQE surfaces here with [`CqeFlags::NOTIF`] set; the runtime
+/// completion drain absorbs it to release the send buffer, so user code
+/// never sees it.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct Completion {
     /// Opaque token from the originating `IoRequest` - equal to the
@@ -24,7 +26,8 @@ pub struct Completion {
 
 impl Completion {
     /// `true` if this is the `NOTIF` sentinel from a `SEND_ZC`
-    /// two-stage completion. The driver absorbs these; user code never sees them.
+    /// two-stage completion. The runtime completion drain absorbs these to
+    /// release the send buffer; user code never sees them.
     pub const fn is_notif(self) -> bool {
         self.flags.contains(CqeFlags::NOTIF)
     }
