@@ -12,7 +12,7 @@
 use io_uring::{
     opcode,
     squeue::{Entry, Flags},
-    types::{Fd, Fixed, Timespec},
+    types::{Fd, Fixed, TimeoutFlags, Timespec},
 };
 
 use crate::operation::OpFlags;
@@ -27,6 +27,27 @@ pub(crate) fn build_timeout(duration_ns: u64, ts: &mut Timespec) -> Entry {
     let nsecs = (duration_ns % 1_000_000_000) as u32;
     *ts = Timespec::new().sec(secs).nsec(nsecs);
     opcode::Timeout::new(ts).build()
+}
+
+/// Build a link-timeout SQE bounding the preceding linked op.
+///
+/// The op this SQE follows carries `IOSQE_IO_LINK`; the kernel cancels that op
+/// with `-ECANCELED` if `duration_ns` elapses first, or cancels this timeout if
+/// the op completes first. `flags` selects clock source and abs/rel semantics
+/// per `io_uring_prep_link_timeout.3`.
+pub(crate) fn build_link_timeout(
+    duration_ns: u64,
+    ts: &mut Timespec,
+    flags: TimeoutFlags,
+) -> Entry {
+    let secs = duration_ns / 1_000_000_000;
+    #[allow(
+        clippy::cast_possible_truncation,
+        reason = "nanosecond remainder always < 1_000_000_000"
+    )]
+    let nsecs = (duration_ns % 1_000_000_000) as u32;
+    *ts = Timespec::new().sec(secs).nsec(nsecs);
+    opcode::LinkTimeout::new(ts).flags(flags).build()
 }
 
 /// Build an async-cancel SQE.
@@ -59,4 +80,15 @@ pub(crate) fn build_poll_add(fd: i32, events: u32, flags: OpFlags) -> Entry {
 /// Build a poll-remove SQE.
 pub(crate) fn build_poll_remove(user_data: u64) -> Entry {
     opcode::PollRemove::new(user_data).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_link_timeout_builds_without_panic() {
+        let mut ts = Timespec::new();
+        let _entry = build_link_timeout(1_500_000, &mut ts, TimeoutFlags::empty());
+    }
 }

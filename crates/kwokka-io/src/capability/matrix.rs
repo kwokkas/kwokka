@@ -110,6 +110,9 @@ pub struct CapabilityMatrix {
     /// `IORING_OP_ASYNC_CANCEL` - in-flight op cancellation (5.5+).
     pub async_cancel: bool,
 
+    /// `IORING_OP_LINK_TIMEOUT` - native per-op kernel deadline (5.5+).
+    pub link_timeout: bool,
+
     /// Minimum buffer alignment for `O_DIRECT`. Default 4096.
     pub direct_io_align: usize,
 }
@@ -136,6 +139,7 @@ impl CapabilityMatrix {
             sendmsg_zc: false,
             recv_zc: false,
             async_cancel: false,
+            link_timeout: false,
             direct_io_align: 4096,
         }
     }
@@ -159,6 +163,7 @@ impl CapabilityMatrix {
             sendmsg_zc: true,
             recv_zc: true,
             async_cancel: true,
+            link_timeout: true,
             direct_io_align: 4096,
         }
     }
@@ -214,6 +219,7 @@ mod tests {
         assert!(!cap.sendmsg_zc);
         assert!(!cap.recv_zc);
         assert!(!cap.async_cancel);
+        assert!(!cap.link_timeout);
     }
 
     #[test]
@@ -238,6 +244,7 @@ mod tests {
         assert!(cap.multishot_accept);
         assert!(cap.send_zc);
         assert!(cap.async_cancel);
+        assert!(cap.link_timeout);
     }
 
     #[test]

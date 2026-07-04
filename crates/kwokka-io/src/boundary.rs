@@ -392,6 +392,41 @@ impl IoSeam {
         Some(result)
     }
 
+    /// Submits a no-buffer op bounded by a native `link_timeout` deadline for
+    /// the polling task.
+    ///
+    /// Returns `None` when the seam carries no driver. A successful submit
+    /// raises the per-poll count the runtime folds onto the task's in-flight
+    /// accounting; the paired discard CQE is never task-attributed, so only the
+    /// primary op counts. [`SubmitResult::Unsupported`] surfaces when the kernel
+    /// lacks `link_timeout`, leaving the caller to fall back to the timer-wheel
+    /// deadline (fallback parity).
+    pub fn submit_linked_timeout_internal(
+        &self,
+        request: &IoRequest<()>,
+        deadline_ns: u64,
+    ) -> Option<SubmitResult> {
+        let driver = self.driver?;
+        // SAFETY: Invariant -- `driver` points at the worker's live driver, a
+        // field disjoint from the task storage the runtime borrows across the
+        // poll; the submit takes `&self`, so this shared reborrow aliases
+        // nothing mutably.
+        // Precondition: reached only via `with_current` during a poll on this
+        // worker; the installing runtime keeps the referent live for the poll
+        // window and the `SeamGuard` bracket clears the seam first.
+        // Failure mode: a read after the guard dropped would deref a dangling
+        // driver pointer; the bracket excludes it.
+        let result = unsafe {
+            driver
+                .as_ref()
+                .submit_linked_timeout_internal(request, deadline_ns)
+        };
+        if matches!(result, SubmitResult::Submitted(_)) {
+            self.submitted.fetch_add(1, Ordering::Relaxed);
+        }
+        Some(result)
+    }
+
     /// Submits a read-class op (the kernel writes into `request`'s buffer)
     /// for the polling task.
     ///
@@ -1746,6 +1781,38 @@ pub const fn is_msg_ring_wake(user_data: u64) -> bool {
     user_data == MSG_RING_WAKE_USER_DATA
 }
 
+/// `user_data` marker for the discarded half of a linked-timeout pair.
+///
+/// A `submit_linked_timeout_internal` op carries `IOSQE_IO_LINK`; the paired
+/// `IORING_OP_LINK_TIMEOUT` SQE tags its own CQE with this fixed marker. That
+/// CQE (`-ETIME` / `-ECANCELED` / `-ENOENT` per `io_uring_prep_link_timeout.3`)
+/// is pure noise: the primary op's CQE already carries the outcome the caller
+/// observes, and the kernel cancels the timeout once the primary is gone, so
+/// no per-slot registry is needed. The upper 32 bits read `0xFFFF_FFFB`: the
+/// arena tag bit, worker id 127, and generation `MAX - 4`, one corner below the
+/// `msg_ring` wake base, so all six completion sentinels stay disjoint by
+/// upper-32 -- wake fd and cancel `0xFFFF_FFFF`, multishot accept `0xFFFF_FFFE`,
+/// multishot recv `0xFFFF_FFFD`, `msg_ring` `0xFFFF_FFFC`, and this
+/// `0xFFFF_FFFB`. Recognition is an exact-value match, not an upper-32 mask,
+/// like the `msg_ring` wake.
+const LINK_TIMEOUT_TOKEN_BASE: u64 = 0xFFFF_FFFB_0000_0000;
+
+/// The CQE `user_data` the link-timeout half of a linked pair carries.
+///
+/// The completion drain recognizes it and drops the CQE without a task route or
+/// a slot free -- the primary op's own CQE is the caller's result.
+pub(crate) const LINK_TIMEOUT_DISCARD_USER_DATA: u64 = LINK_TIMEOUT_TOKEN_BASE;
+
+/// Whether `user_data` marks the discarded half of a linked-timeout pair.
+///
+/// The completion drain calls this to recognize the paired
+/// `IORING_OP_LINK_TIMEOUT` CQE and drop it. It is an exact-value match against
+/// the fixed marker, disjoint from every per-slot sentinel corner and from the
+/// wake fd's `u64::MAX`.
+pub const fn is_link_timeout_discard(user_data: u64) -> bool {
+    user_data == LINK_TIMEOUT_DISCARD_USER_DATA
+}
+
 /// The wake and retire targets a multishot CQE resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MultishotCompletion {
@@ -3030,6 +3097,30 @@ mod tests {
         assert_eq!(
             MSG_RING_WAKE_USER_DATA >> 32,
             (RECV_MULTISHOT_TOKEN_BASE >> 32) - 1,
+        );
+    }
+
+    #[test]
+    fn link_timeout_discard_sentinel_is_recognized_and_disjoint() {
+        assert!(
+            is_link_timeout_discard(LINK_TIMEOUT_DISCARD_USER_DATA),
+            "the marker recognizes itself",
+        );
+        // Disjoint from every other completion sentinel and the wake fd.
+        assert!(!is_link_timeout_discard(crate::wake::WAKE_FD_USER_DATA));
+        assert!(!is_link_timeout_discard(CANCEL_TOKEN_BASE));
+        assert!(!is_link_timeout_discard(MULTISHOT_TOKEN_BASE));
+        assert!(!is_link_timeout_discard(RECV_MULTISHOT_TOKEN_BASE));
+        assert!(!is_link_timeout_discard(MSG_RING_WAKE_USER_DATA));
+        // The other predicates reject the link-timeout marker.
+        assert!(!is_cancel_sentinel(LINK_TIMEOUT_DISCARD_USER_DATA));
+        assert!(!is_multishot_sentinel(LINK_TIMEOUT_DISCARD_USER_DATA));
+        assert!(!is_recv_multishot_sentinel(LINK_TIMEOUT_DISCARD_USER_DATA));
+        assert!(!is_msg_ring_wake(LINK_TIMEOUT_DISCARD_USER_DATA));
+        // One corner below the msg_ring wake base.
+        assert_eq!(
+            LINK_TIMEOUT_DISCARD_USER_DATA >> 32,
+            (MSG_RING_WAKE_USER_DATA >> 32) - 1,
         );
     }
 

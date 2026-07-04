@@ -31,11 +31,13 @@ use std::{cell::UnsafeCell, io, os::fd::AsRawFd, time::Duration};
 
 use io_uring::{
     EnterFlags, IoUring,
-    types::{SubmitArgs, Timespec},
+    squeue::Flags,
+    types::{SubmitArgs, TimeoutFlags, Timespec},
 };
 
 use crate::{
     CancelError, IoDriver, RegisterError,
+    boundary::LINK_TIMEOUT_DISCARD_USER_DATA,
     buffer::{
         registration::{RegisteredBuffers, RegisteredFds},
         ring::pool::BufRingPool,
@@ -47,6 +49,7 @@ use crate::{
     },
     uring::{
         completion::drain_completions,
+        opcode::control::build_link_timeout,
         setup::{
             detect::{ProbeResult, probe_and_create},
             flags::SetupTier,
@@ -233,6 +236,42 @@ impl UringDriver {
         SubmitResult::Submitted(SubmitToken::new(user_data))
     }
 
+    /// Pushes a two-SQE linked pair atomically and submits, returning a token
+    /// for `primary_user_data`.
+    ///
+    /// The first entry carries `IOSQE_IO_LINK`; the second is its linked
+    /// timeout (`io_uring_linked_requests.7`). Both post their own CQE.
+    fn push_pair_and_submit(
+        &self,
+        entries: &[io_uring::squeue::Entry; 2],
+        primary_user_data: u64,
+    ) -> SubmitResult {
+        let ring = self.ring_mut();
+
+        // SAFETY: Invariant -- SQE validity + single-thread access + atomic pair
+        // push. Both entries were built from valid requests via build_entry and
+        // build_link_timeout; their pointer fields (scratch addr, timespec,
+        // link_timeout) are owned by this driver's SubmitScratch and stay valid
+        // until the synchronous submit below copies them. push_multiple checks SQ
+        // capacity for the whole slice before writing either slot, so a full
+        // queue rejects the pair wholesale -- no dangling IOSQE_IO_LINK primary
+        // can link onto an unrelated later SQE.
+        // Precondition: submission queue accessed exclusively by this worker
+        // thread (SINGLE_ISSUER), the same ownership push_and_submit relies on.
+        // Failure mode: an invalid pointer makes the kernel read freed memory
+        // (undefined behavior); a foreign-thread push races the SQ tail.
+        let push_result = unsafe { ring.submission().push_multiple(entries) };
+
+        if push_result.is_err() {
+            return SubmitResult::QueueFull;
+        }
+
+        // IGNORE: non-blocking submit; error means ring fd invalid (unrecoverable)
+        let _ = ring.submit();
+
+        SubmitResult::Submitted(SubmitToken::new(primary_user_data))
+    }
+
     /// Flushes deferred completion task work on a `DEFER_TASKRUN` ring.
     ///
     /// Under `IORING_SETUP_DEFER_TASKRUN` the kernel posts CQEs only when
@@ -344,6 +383,40 @@ impl UringDriver {
             return SubmitResult::Unsupported;
         }
         self.submit_internal(IoRequest::<()>::msg_ring_wake(target_ring_fd))
+    }
+
+    /// Submits `request` bounded by a native `IORING_OP_LINK_TIMEOUT` deadline.
+    ///
+    /// The op carries `IOSQE_IO_LINK`; a linked timeout SQE follows in the same
+    /// atomic submission (`io_uring_linked_requests.7`). If `deadline_ns` elapses
+    /// first the kernel cancels the op (`-ECANCELED` on its CQE, or `-EINTR` if
+    /// it was already mid-flight); if the op completes first the timeout is
+    /// cancelled. The timeout's own CQE carries
+    /// [`LINK_TIMEOUT_DISCARD_USER_DATA`] so the drain drops it -- the caller
+    /// observes only the op's CQE. Returns [`SubmitResult::Unsupported`] when the
+    /// kernel lacks `link_timeout`, leaving the caller to fall back to the
+    /// timer-wheel deadline (fallback parity).
+    pub(crate) fn submit_linked_timeout_internal(
+        &self,
+        request: &IoRequest<()>,
+        deadline_ns: u64,
+    ) -> SubmitResult {
+        if !self.capabilities.link_timeout {
+            return SubmitResult::Unsupported;
+        }
+        let primary_user_data = request.common.user_data;
+        // One &mut over the scratch: build_entry reborrows it for the primary's
+        // addr/timespec, then link_timeout reborrows the disjoint field. A second
+        // scratch_mut() call would invalidate the primary's stored pointer.
+        let scratch = self.scratch_mut();
+        let primary = build_entry(request, scratch).flags(Flags::IO_LINK);
+        let timeout = build_link_timeout(
+            deadline_ns,
+            &mut scratch.link_timeout,
+            TimeoutFlags::empty(),
+        )
+        .user_data(LINK_TIMEOUT_DISCARD_USER_DATA);
+        self.push_pair_and_submit(&[primary, timeout], primary_user_data)
     }
 }
 
@@ -614,6 +687,65 @@ mod tests {
                 .any(|completion| completion.token.user_data()
                     == crate::boundary::MSG_RING_WAKE_USER_DATA),
             "the target ring receives the msg_ring wake sentinel",
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "io_uring_setup(2) is unsupported under miri; real kernel required"
+    )]
+    #[test]
+    fn linked_timeout_cancels_the_primary_on_deadline() {
+        let Ok(driver) = UringDriver::new(TEST_RING_ENTRIES) else {
+            panic!("UringDriver::new failed");
+        };
+        if !driver.capabilities().link_timeout {
+            // Kernel below 5.5 or the opcode is masked; the timer-wheel deadline
+            // is the fallback and there is nothing to prove here.
+            return;
+        }
+        // A long primary linked to a short deadline: the 1ms link timeout fires
+        // first and cancels the 1s primary. Exercises both scratch timespecs.
+        let primary = IoRequest::<()>::timeout(1_000_000_000).with_user_data(0xF00D);
+        assert!(
+            matches!(
+                driver.submit_linked_timeout_internal(&primary, 1_000_000),
+                SubmitResult::Submitted(_)
+            ),
+            "the linked-timeout pair submits on the ring",
+        );
+        // The deadline (`-ETIME`) and the cancelled primary (`-ECANCELED`) may
+        // post in separate CQE batches, so accumulate across a bounded drain.
+        let mut primary_cancelled = false;
+        let mut discard_seen = false;
+        for _ in 0..20 {
+            if primary_cancelled && discard_seen {
+                break;
+            }
+            let _outcome = driver.park(Some(Duration::from_millis(100)));
+            let mut completions = [Completion {
+                token: SubmitToken::new(0),
+                result: 0,
+                flags: crate::operation::CqeFlags::EMPTY,
+                buf_id: None,
+            }; 4];
+            let count = driver.poll_completions(4, &mut completions);
+            for completion in &completions[..count] {
+                if completion.token.user_data() == 0xF00D && completion.result == -libc::ECANCELED {
+                    primary_cancelled = true;
+                }
+                if crate::boundary::is_link_timeout_discard(completion.token.user_data()) {
+                    discard_seen = true;
+                }
+            }
+        }
+        assert!(
+            primary_cancelled,
+            "the primary op is cancelled with -ECANCELED when the deadline fires",
+        );
+        assert!(
+            discard_seen,
+            "the paired link-timeout CQE carries the discard sentinel",
         );
     }
 
