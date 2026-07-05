@@ -8,8 +8,11 @@
 //! instead receives into a kernel-selected provided buffer and resolves a
 //! borrowed zero-copy [`ProvidedBuf`]. [`send_zc`](TcpStream::send_zc) sends
 //! zero-copy on a supporting kernel, falling back to a plain copying send
-//! otherwise. Client-side connect arrives with a stream constructor in a
-//! later release.
+//! otherwise. The buffer-generic [`recv_buf`](TcpStream::recv_buf),
+//! [`send_buf`](TcpStream::send_buf), and [`send_zc_buf`](TcpStream::send_zc_buf)
+//! take a caller-owned buffer instead of a fixed `CAP` array; [`FixedBuf`]
+//! carries a partial send length. Client-side connect arrives with a stream
+//! constructor in a later release.
 //!
 //! # Examples
 //!
@@ -25,4 +28,4 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub use kwokka_net::tcp::{ProvidedBuf, TcpListener, TcpStream};
+pub use kwokka_net::tcp::{FixedBuf, ProvidedBuf, TcpListener, TcpStream};

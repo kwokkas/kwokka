@@ -1,0 +1,31 @@
+error[E0080]: evaluation panicked: CAP exceeds kwokka_io::MAX_INLINE_CAP -- the in-flight slot stride
+ --> src/tcp/stream.rs
+  |
+  |         const { assert_cap_fits::<CAP>() };
+  |                 ^^^^^^^^^^^^^^^^^^^^^^^^ evaluation of `kwokka_net::tcp::TcpStream::recv::<8192>::{constant#0}` failed inside this call
+  |
+note: inside `tcp::stream::assert_cap_fits::<8192>`
+ --> $RUST/core/src/panic.rs
+  |
+  |           $crate::panicking::panic_fmt($crate::const_format_args!($($t)+));
+  |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the failure occurred here
+  |
+ ::: src/tcp/stream.rs
+  |
+  | /     assert!(
+  | |         CAP <= MAX_INLINE_CAP,
+  | |         "CAP exceeds kwokka_io::MAX_INLINE_CAP -- the in-flight slot stride",
+  | |     );
+  | |_____- in this macro invocation
+
+note: erroneous constant encountered
+ --> src/tcp/stream.rs
+  |
+  |         const { assert_cap_fits::<CAP>() };
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+note: the above error was encountered while instantiating `fn kwokka_net::tcp::TcpStream::recv::<8192>`
+  --> tests/ui/cap_over_limit.rs:10:19
+   |
+10 |     let _future = stream.recv::<8192>();
+   |                   ^^^^^^^^^^^^^^^^^^^^^

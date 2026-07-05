@@ -27,6 +27,16 @@ use crate::buffer::mmap::MmapRegion;
 /// Per-slot byte capacity; a buffered future's `CAP` must not exceed this.
 pub(crate) const INFLIGHT_BUF_STRIDE: u32 = 4096;
 
+/// Public capacity ceiling for a single buffered op's `CAP`.
+///
+/// Mirrors the per-slot in-flight stride as a `usize`. The in-flight slot
+/// registry backs every buffered `recv`/`send`/`send_zc` future regardless of
+/// buffer type, so a `CAP` past this stride cannot submit and the driver rejects it
+/// with `-EINVAL` at runtime. A `CAP`-generic convenience method can compare
+/// its own `CAP` against this constant in a `const` block to turn an oversized
+/// buffer into a compile error instead.
+pub const MAX_INLINE_CAP: usize = INFLIGHT_BUF_STRIDE as usize;
+
 /// Default in-flight slots per worker.
 pub const DEFAULT_INFLIGHT_CAP: u16 = 256;
 

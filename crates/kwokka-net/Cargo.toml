@@ -17,6 +17,7 @@ kwokka-io.workspace = true
 
 [dev-dependencies]
 kwokka-runtime = { path = "../kwokka-runtime" }
+trybuild.workspace = true
 
 [lints]
 workspace = true
