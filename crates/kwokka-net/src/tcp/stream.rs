@@ -7,7 +7,9 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
-use kwokka_io::operation::{ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture, SendZcFuture};
+use kwokka_io::operation::{
+    FixedBuf, ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture, SendZcFuture,
+};
 
 use crate::tcp::RecvStream;
 
@@ -70,7 +72,7 @@ impl TcpStream {
     pub fn recv<const CAP: usize>(
         &self,
     ) -> impl Future<Output = (io::Result<usize>, [u8; CAP])> + use<CAP> {
-        RecvFuture::new(self.inner.as_raw_fd())
+        RecvFuture::new(self.inner.as_raw_fd(), [0u8; CAP])
     }
 
     /// Hands out the future receiving into a kernel-selected provided buffer.
@@ -187,12 +189,18 @@ impl TcpStream {
     /// let _sent = runtime.block_on(stream.send::<64>(data, 5))?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Resolves to the [`io::Error`] the kernel maps the send to (for example a
+    /// reset or closed connection), or an `-EINVAL` error when `len` exceeds the
+    /// in-flight slot stride the worker copies the bytes through.
     pub fn send<const CAP: usize>(
         &self,
         data: [u8; CAP],
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
-        SendFuture::new(self.inner.as_raw_fd(), data, len)
+        SendFuture::new(self.inner.as_raw_fd(), FixedBuf::new(data, len))
     }
 
     /// Hands out the future sending the first `len` bytes of `data` (clamped to
