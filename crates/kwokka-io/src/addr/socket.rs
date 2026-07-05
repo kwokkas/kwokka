@@ -1,6 +1,6 @@
 //! Socket address type covering IPv4, IPv6, and Unix domain sockets.
 
-use std::net::{SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::addr::unix::UnixAddr;
 
@@ -56,6 +56,16 @@ impl SockAddr {
     }
 }
 
+impl From<SocketAddr> for SockAddr {
+    /// Wraps a standard-library IP socket address, preserving its family.
+    fn from(addr: SocketAddr) -> Self {
+        match addr {
+            SocketAddr::V4(v4) => Self::V4(v4),
+            SocketAddr::V6(v6) => Self::V6(v6),
+        }
+    }
+}
+
 /// Address family discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -74,7 +84,7 @@ pub enum AddressFamily {
     reason = "AF_* constants and test path lengths are small, truncation impossible in tests"
 )]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     use super::*;
     use crate::addr::unix::UnixAddr;
@@ -150,6 +160,21 @@ mod tests {
         let v6 = SockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 0));
         assert_eq!(v4.family(), AddressFamily::Inet);
         assert_eq!(v6.family(), AddressFamily::Inet6);
+    }
+
+    #[test]
+    fn from_std_socket_addr_preserves_family() {
+        let v4 = SockAddr::from(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80)));
+        let v6 = SockAddr::from(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            443,
+            0,
+            0,
+        )));
+        assert_eq!(v4.family(), AddressFamily::Inet);
+        assert!(matches!(v4, SockAddr::V4(_)));
+        assert_eq!(v6.family(), AddressFamily::Inet6);
+        assert!(matches!(v6, SockAddr::V6(_)));
     }
 
     #[cfg(target_os = "linux")]
