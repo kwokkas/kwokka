@@ -5,7 +5,8 @@
 //! end through the real `io_uring` ring: submit a send, park, harvest the CQE,
 //! wake, and read the byte count back. The zero-copy entry resolves on the
 //! buffer-release notification on a 6.0+ kernel and falls back to a plain send
-//! below it. The socket counterpart of the buffered-write e2e test. The sent
+//! transparently, including a kernel that best-effort-refuses an individual op
+//! at runtime. The socket counterpart of the buffered-write e2e test. The sent
 //! bytes land in the server's receive queue, so a std read harvests them
 //! sequentially with no concurrent peer.
 //!
@@ -89,35 +90,12 @@ fn send_zc_delivers_buffer_bytes() {
         panic!("the affine runtime must build on this host");
     };
     let client = kwokka_net::tcp::TcpStream::from(client);
-    // A 6.0+ kernel sends zero-copy and resolves only on the release
-    // notification; an older kernel falls back to a plain copying send. Either
-    // path delivers every byte to the server.
-    let result = runtime.block_on(client.send_zc::<64>(data, message.len()));
-
-    let sent = match result {
-        Ok(sent) => sent,
-        // The kernel best-effort-refuses a zero-copy send under io_uring resource
-        // pressure with -EINVAL, which SendZcFuture also returns defensively when
-        // its own submission machinery fails. Distinguish the two by proving a
-        // plain send on the same connection still delivers: a wiring regression
-        // fails both, a genuine kernel refusal fails only the zero-copy path.
-        Err(err) if err.raw_os_error() == Some(22) => {
-            let Ok(plain) = runtime.block_on(client.send::<64>(data, message.len())) else {
-                panic!("a plain send must still deliver when zero-copy is refused");
-            };
-            assert_eq!(plain, message.len(), "the plain send delivered every byte");
-            let mut received = [0u8; 64];
-            let Ok(()) = server.read_exact(&mut received[..plain]) else {
-                panic!("reading the plain-sent bytes back must succeed");
-            };
-            assert_eq!(
-                &received[..plain],
-                &message[..],
-                "the server holds the bytes the plain send delivered",
-            );
-            return;
-        }
-        Err(err) => panic!("the zero-copy send resolved with an unexpected error: {err}"),
+    // A 6.0+ kernel sends zero-copy and resolves on the release notification; a
+    // kernel that best-effort-refuses the op at runtime with -EINVAL falls back
+    // to a plain copying send transparently. Either path delivers every byte, so
+    // the call resolves with a count rather than surfacing the refusal.
+    let Ok(sent) = runtime.block_on(client.send_zc::<64>(data, message.len())) else {
+        panic!("the zero-copy send must deliver; a runtime refusal now falls back to a plain send");
     };
     assert_eq!(sent, message.len(), "the kernel sent every requested byte");
 
@@ -196,36 +174,12 @@ fn send_zc_buf_delivers_bytes() {
         panic!("the affine runtime must build on this host");
     };
     let client = kwokka_net::tcp::TcpStream::from(client);
-    // A 6.0+ kernel sends zero-copy and resolves only on the release
-    // notification; an older kernel falls back to a plain copying send. Either
-    // path delivers every byte to the server.
-    let result = runtime.block_on(client.send_zc_buf(FixedBuf::new(data, message.len())));
-
-    let sent = match result {
-        Ok(sent) => sent,
-        // The kernel best-effort-refuses a zero-copy send under io_uring resource
-        // pressure with -EINVAL. Distinguish that from a wiring regression by
-        // proving the buffer-generic plain send on the same connection still
-        // delivers: a regression fails both, a kernel refusal fails only the
-        // zero-copy path.
-        Err(err) if err.raw_os_error() == Some(22) => {
-            let Ok(plain) = runtime.block_on(client.send_buf(FixedBuf::new(data, message.len())))
-            else {
-                panic!("a plain send must still deliver when zero-copy is refused");
-            };
-            assert_eq!(plain, message.len(), "the plain send delivered every byte");
-            let mut received = [0u8; 64];
-            let Ok(()) = server.read_exact(&mut received[..plain]) else {
-                panic!("reading the plain-sent bytes back must succeed");
-            };
-            assert_eq!(
-                &received[..plain],
-                &message[..],
-                "the server holds the bytes the plain send delivered",
-            );
-            return;
-        }
-        Err(err) => panic!("the zero-copy send resolved with an unexpected error: {err}"),
+    // A 6.0+ kernel sends zero-copy and resolves on the release notification; a
+    // kernel that best-effort-refuses the op at runtime with -EINVAL falls back
+    // to a plain copying send transparently. Either path delivers every byte, so
+    // the call resolves with a count rather than surfacing the refusal.
+    let Ok(sent) = runtime.block_on(client.send_zc_buf(FixedBuf::new(data, message.len()))) else {
+        panic!("the zero-copy send must deliver; a runtime refusal now falls back to a plain send");
     };
     assert_eq!(sent, message.len(), "the kernel sent every requested byte");
 
