@@ -237,7 +237,7 @@ impl TcpStream {
         data: [u8; CAP],
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
-        SendZcFuture::new(self.inner.as_raw_fd(), data, len)
+        SendZcFuture::new(self.inner.as_raw_fd(), FixedBuf::new(data, len))
     }
 }
 
