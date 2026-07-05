@@ -48,8 +48,9 @@ use crate::{
 ///
 /// A kernel that reports `SEND_ZC` support can still best-effort-refuse an
 /// individual send with `-EINVAL`, either at submission (a full ring under
-/// resource pressure) or as the operation's own completion (it pins user pages
-/// against a limited budget). The future treats either refusal as a runtime
+/// resource pressure) or as the operation's own completion. The exact kernel
+/// trigger is not pinned down in the reference mirror; the refusal is observed
+/// empirically under load. The future treats either refusal as a runtime
 /// fallback: it re-submits the same still-held bytes as a plain copying send, so
 /// the caller receives the byte count either way and only observes an error for
 /// a genuine send failure or a fallback the backend also refuses. The
@@ -88,11 +89,11 @@ pub struct SendZcFuture<B: IoBuf> {
     /// (`true`) or a plain send (`false`). Gates the runtime-refusal fallback:
     /// only a zero-copy submit's `-EINVAL` completion re-submits as plain; an
     /// already-plain send's `-EINVAL` is a genuine error and surfaces as one.
-    submitted_zero_copy: bool,
+    was_zero_copy: bool,
     /// Whether the runtime-refusal fallback has already re-submitted once. A
     /// second `-EINVAL` after the fallback surfaces as an error rather than
     /// substituting again.
-    did_fall_back: bool,
+    has_fallen_back: bool,
 }
 
 impl<B: IoBuf> SendZcFuture<B> {
@@ -104,8 +105,8 @@ impl<B: IoBuf> SendZcFuture<B> {
             key: None,
             is_submitted: false,
             primary: None,
-            submitted_zero_copy: false,
-            did_fall_back: false,
+            was_zero_copy: false,
+            has_fallen_back: false,
         }
     }
 }
@@ -124,7 +125,7 @@ enum SubmitOutcome {
 }
 
 /// Copies `buf`'s initialized bytes into a fresh in-flight slot and submits a
-/// send on `fd`, zero-copy when `zero_copy` else plain, reporting whether the op
+/// send on `fd`, zero-copy when `is_zero_copy` else plain, reporting whether the op
 /// reached the driver ([`SubmitOutcome::Submitted`]), the driver refused it
 /// ([`SubmitOutcome::Refused`], retryable), or no backend was available
 /// ([`SubmitOutcome::Unavailable`]). Frees the slot on every non-submitted path.
@@ -134,7 +135,7 @@ fn submit_send<B: IoBuf>(
     fd: i32,
     token: u64,
     buf: &B,
-    zero_copy: bool,
+    is_zero_copy: bool,
 ) -> SubmitOutcome {
     let Some((key, ptr)) = seam.allocate_slot(token) else {
         return SubmitOutcome::Unavailable;
@@ -162,7 +163,7 @@ fn submit_send<B: IoBuf>(
     inline.set_init(len);
     // Zero-copy send when requested, else a plain copying send (fallback parity);
     // the resolve path handles both by the completion's more-to-come flag.
-    let request = if zero_copy {
+    let request = if is_zero_copy {
         IoRequest::send_zc(fd, inline).with_user_data(token)
     } else {
         IoRequest::send(fd, inline).with_user_data(token)
@@ -216,12 +217,13 @@ impl<B: IoBuf> Future for SendZcFuture<B> {
                     };
                     let result = bytes_from_cqe(slot.result);
                     if !CqeFlags::new(slot.flags).contains(CqeFlags::MORE) {
-                        if this.submitted_zero_copy && !this.did_fall_back && slot.result == -22 {
+                        if this.was_zero_copy && !this.has_fallen_back && slot.result == -22 {
                             // The kernel best-effort-refused this zero-copy send at
-                            // runtime (a pinned-page budget, EINVAL per send.2). An
-                            // errored SEND_ZC carries no MORE flag, so no
-                            // notification follows and the slot is free now
-                            // (io_uring_prep_send_zc.3). Free the slot and reset to
+                            // runtime with -EINVAL (observed under load; the exact
+                            // kernel trigger is unconfirmed). An errored SEND_ZC
+                            // carries no MORE flag, so no notification follows and
+                            // the slot is free now (io_uring_prep_send_zc.3). Free
+                            // the slot and reset to
                             // unsubmitted; the poll self-wakes and the next poll
                             // re-submits the still-held bytes plain through the
                             // already-tested first-submit path, so a transient
@@ -230,8 +232,8 @@ impl<B: IoBuf> Future for SendZcFuture<B> {
                             seam.free_slot(key);
                             this.key = None;
                             this.is_submitted = false;
-                            this.did_fall_back = true;
-                            this.submitted_zero_copy = false;
+                            this.has_fallen_back = true;
+                            this.was_zero_copy = false;
                             return ZcStep::Refused;
                         }
                         seam.free_slot(key);
@@ -268,27 +270,30 @@ impl<B: IoBuf> Future for SendZcFuture<B> {
         let fd = this.fd;
         let token = binding.token;
         // After a runtime refusal the resubmit must be a plain send, never another
-        // zero-copy attempt against the same pinned-page budget.
-        let allow_zero_copy = !this.did_fall_back;
+        // zero-copy attempt, which the kernel just refused.
+        let can_zero_copy = !this.has_fallen_back;
         let Some(buf) = this.buf.as_ref() else {
             panic!("SendZcFuture polled after resolving; await it only once");
         };
         let outcome = IoSeam::with_current(binding.worker_id, |seam| {
-            let zero_copy = allow_zero_copy && seam.is_send_zc_supported();
-            (submit_send(seam, fd, token, buf, zero_copy), zero_copy)
+            let is_zero_copy = can_zero_copy && seam.is_send_zc_supported();
+            (
+                submit_send(seam, fd, token, buf, is_zero_copy),
+                is_zero_copy,
+            )
         });
         match outcome {
-            Some((SubmitOutcome::Submitted(key), zero_copy)) => {
+            Some((SubmitOutcome::Submitted(key), is_zero_copy)) => {
                 this.key = Some(key);
                 this.is_submitted = true;
-                this.submitted_zero_copy = zero_copy;
+                this.was_zero_copy = is_zero_copy;
                 Poll::Pending
             }
-            Some((SubmitOutcome::Refused, true)) if !this.did_fall_back => {
+            Some((SubmitOutcome::Refused, true)) if !this.has_fallen_back => {
                 // A zero-copy submit the driver refused (a full submission queue
                 // under resource pressure). Arm the plain fallback and self-wake to
                 // retry once on the next poll, when the queue may have drained.
-                this.did_fall_back = true;
+                this.has_fallen_back = true;
                 cx.waker().wake_by_ref();
                 Poll::Pending
             }
@@ -542,7 +547,7 @@ mod tests {
         let mut future = SendZcFuture::new(writer.as_raw_fd(), FixedBuf::new(*b"payload!", 4));
         future.key = Some(key);
         future.is_submitted = true;
-        future.submitted_zero_copy = true;
+        future.was_zero_copy = true;
         let mut cx = Context::from_waker(Waker::noop());
 
         // Poll 1: inject the runtime EINVAL refusal (one CQE, no MORE, no notif).
@@ -561,9 +566,12 @@ mod tests {
             "the refusal reset the future to unsubmitted"
         );
         assert!(future.key.is_none(), "the refusal freed the zero-copy slot");
-        assert!(future.did_fall_back, "the refusal armed the plain fallback");
         assert!(
-            !future.submitted_zero_copy,
+            future.has_fallen_back,
+            "the refusal armed the plain fallback"
+        );
+        assert!(
+            !future.was_zero_copy,
             "the pending resubmit is plain, not zero-copy"
         );
 
@@ -591,7 +599,7 @@ mod tests {
             "the plain resubmit awaits its completion"
         );
         assert!(
-            !future.submitted_zero_copy,
+            !future.was_zero_copy,
             "the in-flight op is the plain resubmit"
         );
         assert!(future.key.is_some(), "the resubmit holds a fresh slot");
@@ -626,10 +634,10 @@ mod tests {
         let mut future = SendZcFuture::new(5, FixedBuf::new(*b"payload!", 4));
         future.key = Some(key);
         future.is_submitted = true;
-        future.submitted_zero_copy = true;
+        future.was_zero_copy = true;
         // The fallback already fired once; a second -EINVAL must not substitute
         // again but surface as the error.
-        future.did_fall_back = true;
+        future.has_fallen_back = true;
         let wake = WakeSlot {
             result: -22,
             flags: 0,
@@ -670,7 +678,7 @@ mod tests {
         let mut future = SendZcFuture::new(5, FixedBuf::new(*b"payload!", 4));
         future.key = Some(key);
         future.is_submitted = true;
-        // submitted_zero_copy stays false: this op went out as a plain send, so
+        // was_zero_copy stays false: this op went out as a plain send, so
         // its -EINVAL is a genuine error, not a zero-copy refusal to substitute.
         let wake = WakeSlot {
             result: -22,
@@ -695,7 +703,7 @@ mod tests {
             "the plain send's refusal surfaces as the error",
         );
         assert!(
-            !future.did_fall_back,
+            !future.has_fallen_back,
             "a plain send is not eligible for the zero-copy fallback",
         );
     }
