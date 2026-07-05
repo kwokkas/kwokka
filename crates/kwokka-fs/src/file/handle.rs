@@ -13,7 +13,7 @@ use std::{
     path::Path,
 };
 
-use super::{FileReadFuture, FileWriteFuture};
+use kwokka_io::operation::{FileReadFuture, FileWriteFuture, FixedBuf};
 
 /// An open file on the runtime.
 ///
@@ -83,8 +83,8 @@ impl File {
     /// let _read = result?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn read<const CAP: usize>(&self, offset: u64) -> FileReadFuture<CAP> {
-        FileReadFuture::new(self.inner.as_raw_fd(), offset)
+    pub fn read<const CAP: usize>(&self, offset: u64) -> FileReadFuture<[u8; CAP]> {
+        FileReadFuture::new(self.inner.as_raw_fd(), offset, [0u8; CAP])
     }
 
     /// Hands out the future writing `data`'s first `len` bytes at `offset`.
@@ -113,8 +113,8 @@ impl File {
         offset: u64,
         data: [u8; CAP],
         len: usize,
-    ) -> FileWriteFuture<CAP> {
-        FileWriteFuture::new(self.inner.as_raw_fd(), offset, data, len)
+    ) -> FileWriteFuture<FixedBuf<CAP>> {
+        FileWriteFuture::new(self.inner.as_raw_fd(), offset, FixedBuf::new(data, len))
     }
 }
 

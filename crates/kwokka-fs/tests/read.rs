@@ -33,7 +33,7 @@ fn file_read_returns_written_bytes() {
     let Ok(mut runtime) = Runtime::affine() else {
         panic!("the affine runtime must build on this host");
     };
-    let (result, buf) = runtime.block_on(FileReadFuture::<64>::new(file.as_raw_fd(), 0));
+    let (result, buf) = runtime.block_on(FileReadFuture::new(file.as_raw_fd(), 0, [0u8; 64]));
 
     let Ok(read) = result else {
         panic!("the read must resolve with a byte count, not an error");
