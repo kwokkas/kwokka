@@ -323,6 +323,13 @@ impl TcpStream {
     /// let _sent = runtime.block_on(stream.send_buf(FixedBuf::new(*b"hello!", 5)))?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
+    ///
+    /// # Errors
+    ///
+    /// Resolves to the [`io::Error`] the kernel maps the send to (for example a
+    /// reset or closed connection), or an `-EINVAL` error when the buffer's
+    /// initialized length exceeds the in-flight slot stride the worker copies
+    /// the bytes through.
     pub fn send_buf<B: IoBuf>(&self, buf: B) -> impl Future<Output = io::Result<usize>> + use<B> {
         SendFuture::new(self.inner.as_raw_fd(), buf)
     }
