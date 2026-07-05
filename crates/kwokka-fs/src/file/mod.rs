@@ -3,4 +3,4 @@
 mod handle;
 
 pub use handle::File;
-pub use kwokka_io::operation::{FileReadFuture, FileWriteFuture};
+pub use kwokka_io::operation::{FileReadFuture, FileWriteFuture, FixedBuf};

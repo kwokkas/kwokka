@@ -9,7 +9,7 @@
 
 use std::os::fd::AsRawFd;
 
-use kwokka_fs::file::FileWriteFuture;
+use kwokka_fs::file::{FileWriteFuture, FixedBuf};
 use kwokka_runtime::Runtime;
 
 #[test]
@@ -32,11 +32,10 @@ fn file_write_persists_buffer() {
     let Ok(mut runtime) = Runtime::affine() else {
         panic!("the affine runtime must build on this host");
     };
-    let result = runtime.block_on(FileWriteFuture::<64>::new(
+    let result = runtime.block_on(FileWriteFuture::new(
         file.as_raw_fd(),
         0,
-        data,
-        message.len(),
+        FixedBuf::new(data, message.len()),
     ));
 
     let Ok(written) = result else {
