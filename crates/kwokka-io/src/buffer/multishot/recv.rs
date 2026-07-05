@@ -49,9 +49,11 @@ const ENTRY_LEN: usize = 6;
 /// Bytes per slot in the metadata region: a little-endian `u16` ring read
 /// cursor at offset 0, a little-endian `u16` queued-result count at
 /// [`META_LEN_OFFSET`], a little-endian `u64` generation at
-/// [`META_GENERATION_OFFSET`], and a little-endian `u64` owner token at
-/// [`META_OWNER_TOKEN_OFFSET`].
-const META_ENTRY_LEN: usize = 20;
+/// [`META_GENERATION_OFFSET`], a little-endian `u64` owner token at
+/// [`META_OWNER_TOKEN_OFFSET`], a little-endian `i32` stashed terminal result
+/// at [`META_TERMINAL_RESULT_OFFSET`], and a little-endian `u16` stashed
+/// terminal buffer id at [`META_TERMINAL_BUF_ID_OFFSET`].
+const META_ENTRY_LEN: usize = 26;
 
 /// Byte offset, within a slot's metadata record, of the `u16` queued-result
 /// count.
@@ -62,6 +64,16 @@ const META_GENERATION_OFFSET: usize = 4;
 
 /// Byte offset, within a slot's metadata record, of the `u64` owner token.
 const META_OWNER_TOKEN_OFFSET: usize = 12;
+
+/// Byte offset, within a slot's metadata record, of the `i32` stashed terminal
+/// result. The terminal completion is recorded here rather than in the FIFO so
+/// a deep consumer backlog that overflows the FIFO cannot discard the
+/// terminal's clean-close-versus-error signal.
+const META_TERMINAL_RESULT_OFFSET: usize = 20;
+
+/// Byte offset, within a slot's metadata record, of the `u16` stashed terminal
+/// buffer id.
+const META_TERMINAL_BUF_ID_OFFSET: usize = 24;
 
 /// Slot-count ceiling that sizes the inline bitmaps and the metadata region.
 const MAX_RECV_MULTISHOT_SLOTS: usize = DEFAULT_RECV_MULTISHOT_CAP as usize;
@@ -100,6 +112,10 @@ pub struct RecvMultishotSlotKey {
 pub(crate) enum RecvMultishotPush {
     /// The result was queued for the consumer.
     Queued,
+    /// The terminal completion was stashed in the slot rather than the FIFO; the
+    /// consumer takes it after draining the FIFO. Like `Queued`, the caller does
+    /// not recycle the completion's buffer -- the consumer owns it.
+    Terminal,
     /// The FIFO was full; the caller owns recycling the completion's buffer id.
     Overflowed,
     /// The sentinel named a freed or reused slot; not queued. Carries the same
@@ -121,6 +137,10 @@ pub struct RecvMultishotSlab {
     occupied: [u64; BITMAP_WORDS],
     /// The op posted its final (no-`MORE`) CQE; no more results will arrive.
     terminated: [u64; BITMAP_WORDS],
+    /// A terminal completion is stashed in the slot's metadata and not yet taken
+    /// by the consumer. Set together with the terminated bit on the final CQE;
+    /// cleared when the consumer takes the stashed terminal result.
+    terminal_stashed: [u64; BITMAP_WORDS],
     /// A cancel was submitted for the op; its final CQE frees the slot.
     cancel_pending: [u64; BITMAP_WORDS],
     worker_id: u8,
@@ -144,6 +164,7 @@ impl RecvMultishotSlab {
             metadata,
             occupied: [0; BITMAP_WORDS],
             terminated: [0; BITMAP_WORDS],
+            terminal_stashed: [0; BITMAP_WORDS],
             cancel_pending: [0; BITMAP_WORDS],
             worker_id,
             cap,
@@ -158,6 +179,7 @@ impl RecvMultishotSlab {
         let (word, bit) = word_bit(slot);
         self.occupied[word] |= 1u64 << bit;
         self.terminated[word] &= !(1u64 << bit);
+        self.terminal_stashed[word] &= !(1u64 << bit);
         self.cancel_pending[word] &= !(1u64 << bit);
         self.set_slot_head(slot, 0);
         self.set_slot_len(slot, 0);
@@ -169,9 +191,13 @@ impl RecvMultishotSlab {
         })
     }
 
-    /// Queues a completion `(result, buf_id)` for `slot`, marking the slot
-    /// terminated when `is_more` is clear. `generation_low16` rejects a stale
-    /// sentinel; a freed or reused slot yields [`RecvMultishotPush::Stale`].
+    /// Queues a data completion `(result, buf_id)` for `slot` in the FIFO, or,
+    /// on the terminal completion (`is_more` clear), marks the slot terminated
+    /// and stashes the terminal `(result, buf_id)` in the slot's dedicated
+    /// fields rather than the FIFO. `generation_low16` rejects a stale sentinel;
+    /// a freed or reused slot yields [`RecvMultishotPush::Stale`]. A full FIFO
+    /// yields [`RecvMultishotPush::Overflowed`] for a data completion; the
+    /// terminal completion never overflows because it does not use the FIFO.
     pub(crate) fn push(
         &mut self,
         slot: u16,
@@ -184,8 +210,16 @@ impl RecvMultishotSlab {
             return RecvMultishotPush::Stale;
         }
         if !is_more {
+            // The terminal completion is stashed in the slot's dedicated fields,
+            // never the FIFO: a deep consumer backlog can overflow the FIFO, and
+            // discarding the terminal there would erase the
+            // clean-close-versus-error signal (#230). The consumer takes it
+            // after draining the FIFO.
             let (word, bit) = word_bit(slot);
             self.terminated[word] |= 1u64 << bit;
+            self.set_slot_terminal(slot, result, buf_id);
+            self.terminal_stashed[word] |= 1u64 << bit;
+            return RecvMultishotPush::Terminal;
         }
         let len = self.slot_len(slot);
         if len >= MULTISHOT_FIFO_DEPTH {
@@ -229,6 +263,26 @@ impl RecvMultishotSlab {
         ))
     }
 
+    /// Takes `key`'s stashed terminal `(result, buf_id)` when one is pending,
+    /// clearing the pending mark so the terminal is handed back exactly once.
+    ///
+    /// Returns `None` when `key` is stale or no terminal is stashed. The consumer
+    /// calls this after draining the FIFO: a `Some` is the stream's final item
+    /// (a clean close carries `result` 0, an error end a negative errno), after
+    /// which [`is_terminated`](Self::is_terminated) still holds so the next poll
+    /// ends the stream.
+    pub(crate) fn take_terminal(&mut self, key: RecvMultishotSlotKey) -> Option<(i32, u16)> {
+        if !self.is_live(key) {
+            return None;
+        }
+        let (word, bit) = word_bit(key.slot);
+        if self.terminal_stashed[word] & (1u64 << bit) == 0 {
+            return None;
+        }
+        self.terminal_stashed[word] &= !(1u64 << bit);
+        Some(self.slot_terminal(key.slot))
+    }
+
     /// Returns the owning task token for `slot` at the sentinel's generation, or
     /// `None` when the slot is stale. The drain calls this to wake the owner.
     pub(crate) fn owner(&self, slot: u16, generation_low16: u16) -> Option<u64> {
@@ -264,6 +318,7 @@ impl RecvMultishotSlab {
         let (word, bit) = word_bit(key.slot);
         self.occupied[word] &= !(1u64 << bit);
         self.terminated[word] &= !(1u64 << bit);
+        self.terminal_stashed[word] &= !(1u64 << bit);
         self.cancel_pending[word] &= !(1u64 << bit);
         self.set_slot_len(key.slot, 0);
         let generation = self.slot_generation(key.slot).wrapping_add(1);
@@ -290,6 +345,7 @@ impl RecvMultishotSlab {
         let (word, bit) = word_bit(slot);
         self.occupied[word] &= !(1u64 << bit);
         self.terminated[word] &= !(1u64 << bit);
+        self.terminal_stashed[word] &= !(1u64 << bit);
         self.cancel_pending[word] &= !(1u64 << bit);
         self.set_slot_len(slot, 0);
         let generation = self.slot_generation(slot).wrapping_add(1);
@@ -391,6 +447,32 @@ impl RecvMultishotSlab {
             value,
         );
     }
+
+    /// Reads `slot`'s stashed terminal `(result, buf_id)` from the metadata
+    /// region.
+    fn slot_terminal(&self, slot: u16) -> (i32, u16) {
+        let base = meta_offset(slot);
+        (
+            read_i32(&self.metadata, base + META_TERMINAL_RESULT_OFFSET),
+            read_u16(&self.metadata, base + META_TERMINAL_BUF_ID_OFFSET),
+        )
+    }
+
+    /// Writes `slot`'s stashed terminal `(result, buf_id)` into the metadata
+    /// region.
+    fn set_slot_terminal(&mut self, slot: u16, result: i32, buf_id: u16) {
+        let base = meta_offset(slot);
+        write_i32(
+            &mut self.metadata,
+            base + META_TERMINAL_RESULT_OFFSET,
+            result,
+        );
+        write_u16(
+            &mut self.metadata,
+            base + META_TERMINAL_BUF_ID_OFFSET,
+            buf_id,
+        );
+    }
 }
 
 /// Byte offset of a slot's ring entry in the FIFO payload.
@@ -454,6 +536,29 @@ fn write_u64(region: &mut MmapRegion, offset: usize, value: u64) {
     }
 }
 
+/// Reads a little-endian `i32` at `offset` in `region`. Panic-free: an `offset`
+/// that runs past the region (never expected under the slot-index invariant
+/// every caller upholds) reads back `0` rather than panicking.
+fn read_i32(region: &MmapRegion, offset: usize) -> i32 {
+    let bytes = region.as_slice();
+    let Some(slice) = bytes.get(offset..offset + 4) else {
+        return 0;
+    };
+    let Ok(array) = <[u8; 4]>::try_from(slice) else {
+        return 0;
+    };
+    i32::from_le_bytes(array)
+}
+
+/// Writes a little-endian `i32` at `offset` in `region`. Panic-free: a no-op
+/// when `offset` runs past the region.
+fn write_i32(region: &mut MmapRegion, offset: usize, value: i32) {
+    let bytes = region.as_mut_slice();
+    if let Some(slice) = bytes.get_mut(offset..offset + 4) {
+        slice.copy_from_slice(&value.to_le_bytes());
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -508,13 +613,18 @@ mod tests {
         let mut registry = slab();
         let key = allocate(&mut registry, 0x1);
         let gen_low16 = (key.generation & 0xFFFF) as u16;
-        registry.push(key.slot, gen_low16, 0, NO_BUFFER, true);
+        registry.push(key.slot, gen_low16, 12, 3, true);
         registry.push(key.slot, gen_low16, -105, NO_BUFFER, false);
-        assert_eq!(registry.pop(key), Some((0, NO_BUFFER)));
+        assert_eq!(registry.pop(key), Some((12, 3)));
         assert_eq!(
             registry.pop(key),
+            None,
+            "the terminal is stashed in the slot, not queued in the FIFO",
+        );
+        assert_eq!(
+            registry.take_terminal(key),
             Some((-105, NO_BUFFER)),
-            "a negative errno round-trips through the little-endian payload",
+            "a negative errno round-trips through the little-endian terminal stash",
         );
     }
 
@@ -524,7 +634,11 @@ mod tests {
         let key = allocate(&mut registry, 0x1);
         let gen_low16 = (key.generation & 0xFFFF) as u16;
         assert!(!registry.is_terminated(key));
-        registry.push(key.slot, gen_low16, 7, 1, false);
+        assert_eq!(
+            registry.push(key.slot, gen_low16, 7, 1, false),
+            RecvMultishotPush::Terminal,
+            "the terminal completion stashes rather than queuing",
+        );
         assert!(registry.is_terminated(key));
     }
 
@@ -542,6 +656,74 @@ mod tests {
         assert_eq!(
             registry.push(key.slot, gen_low16, 999, 0, true),
             RecvMultishotPush::Overflowed
+        );
+    }
+
+    #[test]
+    fn terminal_survives_full_fifo() {
+        // #230: a terminal completion arriving while the FIFO is full must not
+        // be discarded -- its result distinguishes a clean close from an error
+        // end. The terminal stashes in the slot, so a full FIFO cannot lose it.
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        for value in 0..i32::from(MULTISHOT_FIFO_DEPTH) {
+            assert_eq!(
+                registry.push(key.slot, gen_low16, value, 0, true),
+                RecvMultishotPush::Queued,
+            );
+        }
+        assert_eq!(
+            registry.push(key.slot, gen_low16, -104, NO_BUFFER, false),
+            RecvMultishotPush::Terminal,
+            "the terminal stashes even when the FIFO is full",
+        );
+        assert!(registry.is_terminated(key));
+        for value in 0..i32::from(MULTISHOT_FIFO_DEPTH) {
+            assert_eq!(registry.pop(key), Some((value, 0)));
+        }
+        assert_eq!(registry.pop(key), None);
+        assert_eq!(
+            registry.take_terminal(key),
+            Some((-104, NO_BUFFER)),
+            "the error end survives the full-FIFO overflow",
+        );
+    }
+
+    #[test]
+    fn take_terminal_yields_once() {
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        assert_eq!(
+            registry.take_terminal(key),
+            None,
+            "no terminal is stashed before the final CQE",
+        );
+        registry.push(key.slot, gen_low16, 0, NO_BUFFER, false);
+        assert_eq!(registry.take_terminal(key), Some((0, NO_BUFFER)));
+        assert_eq!(
+            registry.take_terminal(key),
+            None,
+            "the terminal is handed back exactly once",
+        );
+        assert!(
+            registry.is_terminated(key),
+            "termination outlives the taken terminal so the stream still ends",
+        );
+    }
+
+    #[test]
+    fn take_terminal_ignores_stale() {
+        let mut registry = slab();
+        let key = allocate(&mut registry, 0x1);
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        registry.push(key.slot, gen_low16, 0, NO_BUFFER, false);
+        registry.free(key);
+        assert_eq!(
+            registry.take_terminal(key),
+            None,
+            "a freed slot yields no stashed terminal",
         );
     }
 
@@ -663,6 +845,7 @@ mod tests {
         assert!(!registry.is_live(key));
         assert!(!registry.is_terminated(key));
         assert_eq!(registry.pop(key), None);
+        assert_eq!(registry.take_terminal(key), None);
     }
 
     #[test]
