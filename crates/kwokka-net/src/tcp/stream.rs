@@ -482,12 +482,11 @@ impl AsRawFd for TcpStream {
 ///
 /// The socket is returned alongside the future so the caller keeps it alive for
 /// the op, then hands it to the stream on success or drops it on error. Closing
-/// it after submission is sound: the kernel resolves the fd to a file reference
-/// when the connect op is submitted and holds that reference for the op's
-/// lifetime (`io_uring_prep_connect.3`), independent of the userspace fd table.
-/// On
-/// a mid-flight drop the future drops before the socket (reverse declaration
-/// order), so the connect future queues its cancel before the fd closes.
+/// it after submission is sound whatever the close-versus-cancel order: the
+/// kernel resolves the fd to a file reference when the connect op is submitted
+/// and holds that reference for the op's lifetime (`io_uring_prep_connect.3`),
+/// independent of the userspace fd table, so a mid-flight drop never races an
+/// in-flight connect.
 fn prepare_connect(
     socket_addr: SocketAddr,
     deadline_ns: Option<u64>,
