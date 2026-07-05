@@ -2271,11 +2271,13 @@ pub fn submit_multishot_cancel(
 /// Mirrors [`submit_multishot_cancel`] for the recv registry: it recycles any
 /// buffers already queued for the gone stream (a dropped recv never takes them,
 /// and each is a provided buffer that must return to the ring) -- both the FIFO
-/// data completions and a terminal completion already stashed in the slot (#230)
-/// -- marks the slot cancel-pending, then submits an `ASYNC_CANCEL` targeting the
-/// op by its sentinel `user_data`. The op's terminal completion frees the slot
-/// through [`push_recv_multishot_completion`]; buffers arriving after the mark
-/// are recycled there.
+/// data completions and a terminal completion already stashed in the slot (#230).
+/// If the op has already terminated, no further CQE will arrive to free the slot,
+/// so this frees it at once; otherwise it marks the slot cancel-pending and
+/// submits an `ASYNC_CANCEL` targeting the op by its sentinel `user_data`, and
+/// the op's terminal completion frees the slot through
+/// [`push_recv_multishot_completion`], recycling any buffers arriving after the
+/// mark.
 pub fn submit_recv_multishot_cancel(
     driver: &DriverType,
     slab: &mut RecvMultishotSlab,
@@ -2295,6 +2297,13 @@ pub fn submit_recv_multishot_cancel(
         if buf_id != NO_BUFFER {
             recycle_provided(driver, Some(buf_id));
         }
+    }
+    // A terminated op has posted its final CQE, so no completion remains to free
+    // the slot. Marking it cancel-pending would strand it on a best-effort cancel
+    // that the ring can refuse; free it here instead.
+    if slab.is_terminated(key) {
+        slab.free(key);
+        return;
     }
     slab.mark_cancel_pending(key);
     let sentinel = encode_recv_multishot_sentinel(key);
@@ -4278,7 +4287,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn recv_cancel_drains_stashed_terminal() {
+    fn recv_cancel_frees_terminated_slot() {
         let driver = DriverType::Epoll(());
         let Ok(mut slab) = RecvMultishotSlab::new(36, 4) else {
             panic!("the registry mmap must succeed");
@@ -4288,20 +4297,21 @@ mod tests {
         };
         let gen_low16 = (key.generation & 0xFFFF) as u16;
         // A terminal completion that already arrived carries a real provided
-        // buffer and sits stashed when the stream drops; the cancel must drain
-        // it too, not just the FIFO, or that buffer leaks out of the ring (#230).
+        // buffer and sits stashed when the stream drops. The cancel drains that
+        // buffer, and, since the op has already terminated, frees the slot at once
+        // rather than stranding it on a best-effort cancel the ring can refuse.
         slab.push(key.slot, gen_low16, 4, 6, true);
         slab.push(key.slot, gen_low16, 0, 7, false);
         submit_recv_multishot_cancel(&driver, &mut slab, key);
-        assert_eq!(slab.pop(key), None, "the cancel drained the queued buffer");
+        assert!(!slab.is_live(key), "the terminated slot is freed at once");
+        let Some(reused) = slab.allocate(0x2) else {
+            panic!("the freed slot is available for reuse");
+        };
+        assert_eq!(reused.slot, key.slot);
         assert_eq!(
-            slab.take_terminal(key),
-            None,
-            "the cancel drained the stashed terminal buffer too",
-        );
-        assert!(
-            slab.is_cancel_pending(key.slot, gen_low16),
-            "the slot is marked cancel-pending",
+            reused.generation,
+            key.generation + 1,
+            "the freed slot is reused with a bumped generation",
         );
     }
 
