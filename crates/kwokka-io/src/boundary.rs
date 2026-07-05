@@ -2591,7 +2591,10 @@ mod tests {
         assert_eq!(IoSeam::with_current(200, IoSeam::worker_id), None);
     }
 
-    #[cfg(target_os = "linux")]
+    // A real `socket()` syscall is unsupported under miri's isolation, so this
+    // runs off-miri; the Unix-rejection test below returns before any syscall
+    // and stays miri-safe.
+    #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
     fn create_stream_socket_makes_an_ipv6_socket() {
         let Ok(_socket) = create_stream_socket(crate::addr::AddressFamily::Inet6) else {
