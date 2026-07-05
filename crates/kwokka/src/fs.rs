@@ -20,4 +20,4 @@
 //! # Ok::<(), std::io::Error>(())
 //! ```
 
-pub use kwokka_fs::file::{File, FileReadFuture, FileWriteFuture};
+pub use kwokka_fs::file::File;

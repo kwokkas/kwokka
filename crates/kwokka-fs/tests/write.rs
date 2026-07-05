@@ -9,7 +9,7 @@
 
 use std::os::fd::AsRawFd;
 
-use kwokka_fs::file::{FileWriteFuture, FixedBuf};
+use kwokka_io::operation::{FileWriteFuture, FixedBuf};
 use kwokka_runtime::Runtime;
 
 #[test]
