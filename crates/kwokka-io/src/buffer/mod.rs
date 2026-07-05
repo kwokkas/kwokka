@@ -2,6 +2,8 @@
 
 pub mod inflight;
 pub(crate) mod mmap;
+
+pub use inflight::MAX_INLINE_CAP;
 pub mod multishot;
 pub(crate) mod registration;
 pub(crate) mod ring;

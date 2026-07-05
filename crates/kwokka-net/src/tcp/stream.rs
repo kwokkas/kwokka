@@ -7,11 +7,34 @@ use std::{
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
-use kwokka_io::operation::{
-    FixedBuf, ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture, SendZcFuture,
+use kwokka_io::{
+    MAX_INLINE_CAP,
+    operation::{
+        FixedBuf, IoBuf, IoBufMut, ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture,
+        SendZcFuture,
+    },
 };
 
 use crate::tcp::RecvStream;
+
+/// Fails to compile when `CAP` exceeds [`MAX_INLINE_CAP`].
+///
+/// The buffered socket futures keep their kernel-facing bytes in the worker's
+/// in-flight slot registry, [`MAX_INLINE_CAP`] bytes wide per slot, so a `CAP`
+/// past that stride cannot be satisfied at submit time. Each `CAP`-generic
+/// convenience method calls this in a `const` block, turning an oversized `CAP`
+/// into a compile error instead of the registry's runtime `-EINVAL`.
+///
+/// # Panics
+///
+/// Panics during `const` evaluation -- a compile error at the call site -- when
+/// `CAP` exceeds [`MAX_INLINE_CAP`]; it has no runtime effect.
+const fn assert_cap_fits<const CAP: usize>() {
+    assert!(
+        CAP <= MAX_INLINE_CAP,
+        "CAP exceeds kwokka_io::MAX_INLINE_CAP -- the in-flight slot stride",
+    );
+}
 
 /// A connected TCP socket.
 ///
@@ -72,6 +95,7 @@ impl TcpStream {
     pub fn recv<const CAP: usize>(
         &self,
     ) -> impl Future<Output = (io::Result<usize>, [u8; CAP])> + use<CAP> {
+        const { assert_cap_fits::<CAP>() };
         RecvFuture::new(self.inner.as_raw_fd(), [0u8; CAP])
     }
 
@@ -200,6 +224,7 @@ impl TcpStream {
         data: [u8; CAP],
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
+        const { assert_cap_fits::<CAP>() };
         SendFuture::new(self.inner.as_raw_fd(), FixedBuf::new(data, len))
     }
 
@@ -237,7 +262,102 @@ impl TcpStream {
         data: [u8; CAP],
         len: usize,
     ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
+        const { assert_cap_fits::<CAP>() };
         SendZcFuture::new(self.inner.as_raw_fd(), FixedBuf::new(data, len))
+    }
+
+    /// Hands out the future receiving into the caller-owned buffer `buf`.
+    ///
+    /// The buffer-generic sibling of [`recv`](Self::recv): the caller supplies
+    /// any [`IoBufMut`] buffer (today an `[u8; N]` array) and awaiting the
+    /// future resolves to an [`io::Result`] byte count paired with that buffer
+    /// handed back -- the bytes received (a short count on a partial read, or
+    /// `0` at end of stream), or the mapped error. The bytes live in a
+    /// worker-owned registry for the op lifetime, so dropping the future
+    /// mid-flight is safe. Await it directly on a runtime task: polling it
+    /// through a waker the runtime did not build panics.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: needs a connected peer and io_uring at runtime.
+    /// use kwokka_net::tcp::TcpListener;
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let stream = runtime.block_on(listener.accept())?;
+    /// let (result, _buf) = runtime.block_on(stream.recv_buf([0u8; 64]));
+    /// let _read = result?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn recv_buf<B: IoBufMut>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (io::Result<usize>, B)> + use<B> {
+        RecvFuture::new(self.inner.as_raw_fd(), buf)
+    }
+
+    /// Hands out the future sending the initialized bytes of the caller-owned
+    /// buffer `buf`.
+    ///
+    /// The buffer-generic sibling of [`send`](Self::send): the caller supplies
+    /// any [`IoBuf`] source -- an `[u8; N]` array (all `N` bytes) or a
+    /// [`FixedBuf`] carrying a partial length. Awaiting it resolves to an
+    /// [`io::Result`] byte count (a short count when the socket send buffer
+    /// fills); `buf` is a pre-submit source the future drops on resolve, not
+    /// handed back. The kernel reads a worker-owned copy of the bytes, so
+    /// dropping the future mid-flight is safe. Await it directly on a runtime
+    /// task: polling it through a waker the runtime did not build panics.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: needs a connected peer and io_uring at runtime.
+    /// use kwokka_net::tcp::{FixedBuf, TcpListener};
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let stream = runtime.block_on(listener.accept())?;
+    /// let _sent = runtime.block_on(stream.send_buf(FixedBuf::new(*b"hello!", 5)))?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn send_buf<B: IoBuf>(&self, buf: B) -> impl Future<Output = io::Result<usize>> + use<B> {
+        SendFuture::new(self.inner.as_raw_fd(), buf)
+    }
+
+    /// Hands out the future sending the initialized bytes of the caller-owned
+    /// buffer `buf`, zero-copy when the kernel supports it.
+    ///
+    /// The buffer-generic sibling of [`send_zc`](Self::send_zc): like
+    /// [`send_buf`](Self::send_buf), but a supporting kernel (6.0 and up) sends
+    /// the bytes without copying them into kernel space and resolves on the
+    /// buffer-release notification, so the awaited byte count arrives when the
+    /// buffer is free to reuse. A kernel without zero-copy send falls back to a
+    /// plain copying send. The caller supplies any [`IoBuf`] source; the kernel
+    /// reads a worker-owned copy of the bytes, so dropping the future
+    /// mid-flight is safe. Await it directly on a runtime task: polling it
+    /// through a waker the runtime did not build panics.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: needs a connected peer and io_uring 6.0+ at runtime.
+    /// use kwokka_net::tcp::{FixedBuf, TcpListener};
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let listener = TcpListener::bind("127.0.0.1:0")?;
+    /// let stream = runtime.block_on(listener.accept())?;
+    /// let _sent = runtime.block_on(stream.send_zc_buf(FixedBuf::new(*b"hello!", 5)))?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn send_zc_buf<B: IoBuf>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = io::Result<usize>> + use<B> {
+        SendZcFuture::new(self.inner.as_raw_fd(), buf)
     }
 }
 
