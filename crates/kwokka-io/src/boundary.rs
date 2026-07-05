@@ -30,6 +30,7 @@ use std::{
 
 use crate::{
     DriverType, IoDriver,
+    addr::AddressFamily,
     buffer::{
         inflight::{INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
         mmap::MmapRegion,
@@ -170,6 +171,49 @@ pub fn adopt_accepted_fd(result: i32) -> Option<OwnedFd> {
     // concern (incorrect close), not a memory-safety concern: no pointer
     // dereference occurs.
     Some(unsafe { OwnedFd::from_raw_fd(result) })
+}
+
+/// Creates an unconnected, close-on-exec stream socket for `family`.
+///
+/// The client counterpart of adopting an accepted descriptor: a connect needs
+/// an owned socket of the peer's address family before the `io_uring` connect
+/// op runs, and the standard library exposes no unconnected-stream-socket
+/// constructor. The descriptor is left blocking; the connect is submitted as an
+/// `io_uring` completion op rather than a blocking syscall on this fd.
+///
+/// # Errors
+///
+/// Returns the OS error when the `socket` syscall fails, or
+/// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix`, which names a
+/// stream this entry does not create (only IPv4 and IPv6 are supported).
+pub fn create_stream_socket(family: AddressFamily) -> io::Result<OwnedFd> {
+    let domain = match family {
+        AddressFamily::Inet => libc::AF_INET,
+        AddressFamily::Inet6 => libc::AF_INET6,
+        AddressFamily::Unix => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "connect creates only IPv4 and IPv6 stream sockets",
+            ));
+        }
+    };
+    // SAFETY: Invariant -- `libc::socket` (socket.2) is an FFI call that takes
+    // three integers and returns a fresh descriptor or -1; it has no pointer or
+    // memory precondition. Precondition: `domain` is a valid `AF_*` constant
+    // (matched above) and `SOCK_STREAM | SOCK_CLOEXEC` is a valid type per
+    // socket.2. Failure mode: an unsupported argument yields -1 plus `errno`,
+    // handled just below; the call itself cannot corrupt memory.
+    let raw = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    if raw < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: Invariant -- `socket` just returned a fresh descriptor owned by
+    // this process alone, exactly like an accept result. Precondition: `raw` is
+    // nonnegative (checked above), so it names a real descriptor with no other
+    // owner. Failure mode: adopting a negative value would claim a descriptor
+    // owned elsewhere and close it on drop; the sign check excludes that. No
+    // pointer dereference occurs (IO-safety, not memory-safety).
+    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
 }
 
 /// Resolves a provided-buffer recv completion into the buffer view it names.

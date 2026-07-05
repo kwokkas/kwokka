@@ -1,6 +1,6 @@
 //! Socket address type covering IPv4, IPv6, and Unix domain sockets.
 
-use std::net::{SocketAddrV4, SocketAddrV6};
+use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 
 use crate::addr::unix::UnixAddr;
 
@@ -52,6 +52,16 @@ impl SockAddr {
             Self::V4(_) => AddressFamily::Inet,
             Self::V6(_) => AddressFamily::Inet6,
             Self::Unix(_) => AddressFamily::Unix,
+        }
+    }
+}
+
+impl From<SocketAddr> for SockAddr {
+    /// Wraps a standard-library IP socket address, preserving its family.
+    fn from(addr: SocketAddr) -> Self {
+        match addr {
+            SocketAddr::V4(v4) => Self::V4(v4),
+            SocketAddr::V6(v6) => Self::V6(v6),
         }
     }
 }

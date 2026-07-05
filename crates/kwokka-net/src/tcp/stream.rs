@@ -1,21 +1,23 @@
 //! Connected TCP socket -- the owned endpoint an accept or connect lands.
 
-use core::future::Future;
+use core::{future::Future, time::Duration};
 use std::{
     io,
-    net::{self, SocketAddr},
+    net::{self, SocketAddr, ToSocketAddrs},
     os::fd::{AsRawFd, OwnedFd, RawFd},
 };
 
 use kwokka_io::{
     MAX_INLINE_CAP,
+    addr::SockAddr,
+    boundary::create_stream_socket,
     operation::{
         FixedBuf, IoBuf, IoBufMut, ProvidedBuf, ProvidedRecvFuture, RecvFuture, SendFuture,
         SendZcFuture,
     },
 };
 
-use crate::tcp::RecvStream;
+use crate::tcp::{RecvStream, connect::ConnectFuture};
 
 /// Fails to compile when `CAP` exceeds [`MAX_INLINE_CAP`].
 ///
@@ -48,6 +50,103 @@ pub struct TcpStream {
 }
 
 impl TcpStream {
+    /// Connects to `addr`, resolving to the connected stream.
+    ///
+    /// Resolves `addr` through the standard library, then drives a connect op
+    /// per resolved address through the runtime's completion backend until one
+    /// succeeds. A fresh socket of the peer's family is created for each
+    /// attempt; the connected socket lands owned, so dropping the stream closes
+    /// it. Address resolution is synchronous, matching
+    /// [`TcpListener::bind`](crate::tcp::TcpListener::bind).
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: opens a real connection through io_uring at runtime.
+    /// use kwokka_net::tcp::TcpStream;
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let stream = runtime.block_on(TcpStream::connect("127.0.0.1:8080"))?;
+    /// let _peer = stream.peer_addr()?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when awaited outside a runtime task or through a combinator that
+    /// wraps the waker, per the connect future's contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error the kernel reported for the last connect attempt, or
+    /// an [`io::ErrorKind::InvalidInput`] error when `addr` resolves to no
+    /// address. A refused peer surfaces the connect error rather than hanging.
+    pub async fn connect(addr: impl ToSocketAddrs) -> io::Result<Self> {
+        let mut last_error = None;
+        for socket_addr in addr.to_socket_addrs()? {
+            let (socket, future) = match prepare_connect(socket_addr, None) {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    last_error = Some(error);
+                    continue;
+                }
+            };
+            let result = future.await;
+            if result >= 0 {
+                return Ok(Self::from(socket));
+            }
+            last_error = Some(io::Error::from_raw_os_error(-result));
+        }
+        Err(last_error.unwrap_or_else(no_address_error))
+    }
+
+    /// Connects to `addr`, bounding the attempt by `timeout`.
+    ///
+    /// Mirrors [`connect`](Self::connect) for a single address, arming the
+    /// connect with a native per-op deadline: when `timeout` elapses first the
+    /// kernel cancels the connect and the attempt returns a cancellation error.
+    /// A backend without a native deadline rejects the timeout rather than
+    /// dropping the bound.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// # // no_run: opens a real connection through io_uring at runtime.
+    /// use core::time::Duration;
+    /// use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+    ///
+    /// use kwokka_net::tcp::TcpStream;
+    /// use kwokka_runtime::Runtime;
+    ///
+    /// let mut runtime = Runtime::affine()?;
+    /// let addr = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080));
+    /// let timeout = Duration::from_secs(5);
+    /// let stream = runtime.block_on(TcpStream::connect_timeout(&addr, timeout))?;
+    /// let _peer = stream.peer_addr()?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    ///
+    /// # Panics
+    ///
+    /// Panics when awaited outside a runtime task or through a combinator that
+    /// wraps the waker, per the connect future's contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the OS error the kernel reported for the connect, including the
+    /// cancellation error when the deadline elapses before the connection is
+    /// established.
+    pub async fn connect_timeout(addr: &SocketAddr, timeout: Duration) -> io::Result<Self> {
+        let deadline_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
+        let (socket, future) = prepare_connect(*addr, Some(deadline_ns))?;
+        let result = future.await;
+        if result < 0 {
+            return Err(io::Error::from_raw_os_error(-result));
+        }
+        Ok(Self::from(socket))
+    }
+
     /// Returns the local address this end of the connection is bound to.
     ///
     /// # Errors
@@ -374,6 +473,43 @@ impl AsRawFd for TcpStream {
     }
 }
 
+/// Creates a fresh socket for `socket_addr` and builds its connect future.
+///
+/// Synchronous so the address never lands in the awaiting frame twice: the
+/// `SockAddr` moves into the returned [`ConnectFuture`], leaving the caller to
+/// hold only the owned socket and the future across the await. A `deadline_ns`
+/// of `Some` arms a native per-op timeout; `None` submits a plain connect.
+///
+/// The socket is returned alongside the future so the caller keeps it alive for
+/// the op, then hands it to the stream on success or drops it on error. Closing
+/// it after submission is sound: the kernel resolves the fd to a file reference
+/// when the connect op is submitted and holds that reference for the op's
+/// lifetime (`io_uring_prep_connect.3`), independent of the userspace fd table.
+/// On
+/// a mid-flight drop the future drops before the socket (reverse declaration
+/// order), so the connect future queues its cancel before the fd closes.
+fn prepare_connect(
+    socket_addr: SocketAddr,
+    deadline_ns: Option<u64>,
+) -> io::Result<(OwnedFd, ConnectFuture)> {
+    let addr = SockAddr::from(socket_addr);
+    let socket = create_stream_socket(addr.family())?;
+    let raw = socket.as_raw_fd();
+    let future = match deadline_ns {
+        Some(deadline_ns) => ConnectFuture::with_deadline(raw, addr, deadline_ns),
+        None => ConnectFuture::new(raw, addr),
+    };
+    Ok((socket, future))
+}
+
+/// The error a `connect` returns when its address resolution yields nothing.
+fn no_address_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "could not resolve an address to connect to",
+    )
+}
+
 impl From<OwnedFd> for TcpStream {
     /// Adopts an owned connected-socket descriptor as a stream.
     fn from(fd: OwnedFd) -> Self {
@@ -387,5 +523,62 @@ impl From<net::TcpStream> for TcpStream {
     /// Adopts an already-connected std stream, taking ownership of its fd.
     fn from(inner: net::TcpStream) -> Self {
         Self { inner }
+    }
+}
+
+#[cfg(all(target_os = "linux", not(any(miri, loom))))]
+#[cfg(test)]
+mod tests {
+    use core::{
+        pin::Pin,
+        task::{Context, Poll},
+    };
+
+    use kwokka_runtime::Runtime;
+
+    use super::*;
+    use crate::tcp::TcpListener;
+
+    // Polls the coupled socket and connect future once to submit the connect,
+    // then drops both in flight -- firing the future's cancel and the socket's
+    // close together, the drop path the public `connect` entry introduces.
+    struct DropCoupledConnect(Option<(OwnedFd, ConnectFuture)>);
+
+    impl Future for DropCoupledConnect {
+        type Output = ();
+
+        fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+            if let Some((_socket, future)) = self.0.as_mut() {
+                assert!(
+                    Pin::new(future).poll(cx).is_pending(),
+                    "the first poll submits the connect and leaves it in flight",
+                );
+            }
+            self.0 = None;
+            Poll::Ready(())
+        }
+    }
+
+    #[test]
+    fn dropped_coupled_connect_keeps_serving() {
+        let Ok(listener) = TcpListener::bind("127.0.0.1:0") else {
+            panic!("binding a loopback listener must succeed");
+        };
+        let Ok(addr) = listener.local_addr() else {
+            panic!("the listener must report its local address");
+        };
+        let Ok(mut runtime) = Runtime::affine() else {
+            panic!("the affine runtime must build on this host");
+        };
+        let Ok(pair) = prepare_connect(addr, None) else {
+            panic!("prepare_connect must create the client socket");
+        };
+        // Submit then drop the connect in flight: the socket closes and the
+        // future queues its cancel on the owning worker.
+        runtime.block_on(DropCoupledConnect(Some(pair)));
+        // The worker survived the coupled drop -- a fresh connect still resolves.
+        let Ok(_client) = runtime.block_on(TcpStream::connect(addr)) else {
+            panic!("the runtime keeps serving after a dropped coupled connect");
+        };
     }
 }

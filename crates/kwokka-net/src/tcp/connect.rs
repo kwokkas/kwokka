@@ -60,10 +60,6 @@ struct ConnectOp {
 
 impl ConnectFuture {
     /// Constructs a connect future for socket `fd` toward `addr`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pending the public client-connect entry")
-    )]
     pub(crate) const fn new(fd: i32, addr: SockAddr) -> Self {
         Self {
             fd,
@@ -79,10 +75,6 @@ impl ConnectFuture {
     /// elapses first the kernel cancels the connect, which surfaces as
     /// `-ECANCELED` (or `-EINTR` if it was already in flight). A backend without
     /// `link_timeout` rejects the deadline path rather than dropping the bound.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "pending the public client-connect entry")
-    )]
     pub(crate) const fn with_deadline(fd: i32, addr: SockAddr, deadline_ns: u64) -> Self {
         Self {
             fd,
