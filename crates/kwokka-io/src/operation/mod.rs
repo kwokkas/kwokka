@@ -5,7 +5,7 @@ pub(crate) mod core;
 pub(crate) mod future;
 pub(crate) mod request;
 
-pub use core::{InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, SubmitResult, SubmitToken};
+pub use core::{FixedBuf, InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, SubmitResult, SubmitToken};
 
 pub use completion::{Completion, CqeFlags};
 pub use future::{
