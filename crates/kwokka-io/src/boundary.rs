@@ -928,11 +928,16 @@ impl IoSeam {
 
     /// Advances `key`'s multishot recv stream by one completion.
     ///
-    /// Returns the next queued `(result, buf_id)`, `Pending` while the op is in
-    /// flight with an empty FIFO, or `Ended` once the op posted its terminal CQE
-    /// and the FIFO is drained -- freeing the slot. A seam with no recv slab
-    /// yields `Ended`. A [`NO_BUFFER`](crate::buffer::multishot::recv) entry
+    /// Returns the next queued data `(result, buf_id)`; then, once the FIFO is
+    /// drained, the stashed terminal completion as the stream's final item;
+    /// `Pending` while the op is in flight with an empty FIFO; or `Ended` once
+    /// the terminal has been handed back and the slot freed. A seam with no recv
+    /// slab yields `Ended`. A [`NO_BUFFER`](crate::buffer::multishot::recv) entry
     /// (end of stream or a negative result) reports `buf_id: None`.
+    ///
+    /// The terminal completion lives in the slot rather than the FIFO, so it is
+    /// delivered intact even when a deep consumer backlog overflowed the FIFO,
+    /// keeping a clean close distinct from an error end (#230).
     ///
     /// Buffer-recycle contract: a `Some(buf_id)` handed back in an
     /// [`RecvMultishotNext::Item`] names a kernel-selected provided buffer the
@@ -952,6 +957,18 @@ impl IoSeam {
         // each slab-forming path running to completion before the next.
         let slab = unsafe { slab.as_mut() };
         if let Some((result, buf_id)) = slab.pop(key) {
+            let buf_id = if buf_id == NO_BUFFER {
+                None
+            } else {
+                Some(buf_id)
+            };
+            return RecvMultishotNext::Item { result, buf_id };
+        }
+        // The FIFO is drained; the terminal completion is stashed separately, so
+        // it survives even a backlog that overflowed the FIFO (#230). Deliver it
+        // as the stream's final item -- a clean close (result 0) or an error end
+        // (negative errno) -- before ending the stream on the next poll.
+        if let Some((result, buf_id)) = slab.take_terminal(key) {
             let buf_id = if buf_id == NO_BUFFER {
                 None
             } else {
@@ -2098,11 +2115,14 @@ fn recycle_provided(driver: &DriverType, buf_id: Option<u16>) {
 /// Routes a multishot recv op's completion CQE into the worker's registry.
 ///
 /// The completion drain calls this on a CQE whose `user_data` is a
-/// multishot-recv sentinel (see [`is_recv_multishot_sentinel`]). It queues the
-/// `(result, buf_id)` for the owning stream and returns the
+/// multishot-recv sentinel (see [`is_recv_multishot_sentinel`]). It queues a
+/// data completion's `(result, buf_id)` in the owning stream's FIFO, or stashes
+/// the terminal completion in the slot; either way it wakes the owning task and
+/// leaves the buffer for the consumer to recycle, and returns the
 /// [`MultishotCompletion`] targets, the same wake and retire contract the accept
-/// path uses. Nothing is queued when the slot is stale, the FIFO overflowed, or
-/// the stream dropped; in each of those cases the completion's provided buffer is
+/// path uses. Nothing is kept when the slot is stale, the FIFO overflowed (a
+/// data completion only -- the terminal is stashed, never overflowed), or the
+/// stream dropped; in each of those cases the completion's provided buffer is
 /// recycled here so it returns to the ring exactly once.
 ///
 /// Unlike the accept path, the buffer id is read and recycled on every CQE
@@ -2138,7 +2158,10 @@ pub fn push_recv_multishot_completion(
         buf_id.unwrap_or(NO_BUFFER),
         is_more,
     ) {
-        RecvMultishotPush::Queued => owner,
+        // A queued data completion and a stashed terminal are both owned by the
+        // consumer, which recycles their buffer on drain; wake the owner, recycle
+        // nothing here.
+        RecvMultishotPush::Queued | RecvMultishotPush::Terminal => owner,
         RecvMultishotPush::Overflowed | RecvMultishotPush::Stale => {
             recycle_provided(driver, buf_id);
             None
@@ -2247,11 +2270,14 @@ pub fn submit_multishot_cancel(
 ///
 /// Mirrors [`submit_multishot_cancel`] for the recv registry: it recycles any
 /// buffers already queued for the gone stream (a dropped recv never takes them,
-/// and each is a provided buffer that must return to the ring), marks the slot
-/// cancel-pending, then submits an `ASYNC_CANCEL` targeting the op by its
-/// sentinel `user_data`. The op's terminal completion frees the slot through
-/// [`push_recv_multishot_completion`]; buffers arriving after the mark are
-/// recycled there.
+/// and each is a provided buffer that must return to the ring) -- both the FIFO
+/// data completions and a terminal completion already stashed in the slot (#230).
+/// If the op has already terminated, no further CQE will arrive to free the slot,
+/// so this frees it at once; otherwise it marks the slot cancel-pending and
+/// submits an `ASYNC_CANCEL` targeting the op by its sentinel `user_data`, and
+/// the op's terminal completion frees the slot through
+/// [`push_recv_multishot_completion`], recycling any buffers arriving after the
+/// mark.
 pub fn submit_recv_multishot_cancel(
     driver: &DriverType,
     slab: &mut RecvMultishotSlab,
@@ -2263,6 +2289,21 @@ pub fn submit_recv_multishot_cancel(
         if buf_id != NO_BUFFER {
             recycle_provided(driver, Some(buf_id));
         }
+    }
+    // The terminal completion lives in the slot's stash, not the FIFO (#230), so
+    // it needs the same drain: a terminal CQE that already arrived can carry a
+    // real provided buffer the dropped stream will never take.
+    if let Some((_, buf_id)) = slab.take_terminal(key) {
+        if buf_id != NO_BUFFER {
+            recycle_provided(driver, Some(buf_id));
+        }
+    }
+    // A terminated op has posted its final CQE, so no completion remains to free
+    // the slot. Marking it cancel-pending would strand it on a best-effort cancel
+    // that the ring can refuse; free it here instead.
+    if slab.is_terminated(key) {
+        slab.free(key);
+        return;
     }
     slab.mark_cancel_pending(key);
     let sentinel = encode_recv_multishot_sentinel(key);
@@ -3674,6 +3715,50 @@ mod tests {
     }
 
     #[test]
+    fn recv_multishot_seam_surfaces_error_end_behind_a_full_fifo() {
+        use crate::buffer::multishot::MULTISHOT_FIFO_DEPTH;
+
+        // #230: a consumer far enough behind to fill the FIFO must still see the
+        // terminal error, not a bare `Ended` that reads like a clean close.
+        let Ok(mut slab) = RecvMultishotSlab::new(48, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x5) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        for value in 0..i32::from(MULTISHOT_FIFO_DEPTH) {
+            slab.push(key.slot, gen_low16, value, 0, true);
+        }
+        // The terminal error arrives on a saturated FIFO.
+        slab.push(key.slot, gen_low16, -104, NO_BUFFER, false);
+        let seam = IoSeam::new(48, None, None, None)
+            .with_recv_multishot_slab(Some(NonNull::from(&mut slab)));
+        for value in 0..i32::from(MULTISHOT_FIFO_DEPTH) {
+            assert_eq!(
+                seam.recv_multishot_next(key),
+                RecvMultishotNext::Item {
+                    result: value,
+                    buf_id: Some(0),
+                },
+            );
+        }
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Item {
+                result: -104,
+                buf_id: None,
+            },
+            "the terminal error is delivered as the final item, not swallowed",
+        );
+        assert_eq!(
+            seam.recv_multishot_next(key),
+            RecvMultishotNext::Ended,
+            "the stream ends only after the terminal error is handed back",
+        );
+    }
+
+    #[test]
     fn recv_multishot_seam_free_returns_the_slot() {
         let Ok(mut slab) = RecvMultishotSlab::new(46, 4) else {
             panic!("the registry mmap must succeed");
@@ -4040,8 +4125,13 @@ mod tests {
         );
         assert_eq!(
             slab.pop(key),
+            None,
+            "the terminal stashes in the slot rather than the FIFO",
+        );
+        assert_eq!(
+            slab.take_terminal(key),
             Some((0, NO_BUFFER)),
-            "an end-of-stream terminal queues the no-buffer sentinel",
+            "the end-of-stream terminal is taken from the slot's stash",
         );
     }
 
@@ -4130,7 +4220,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn recv_overflow_wakes_nothing() {
+    fn recv_overflow_keeps_terminal() {
         use crate::buffer::multishot::MULTISHOT_FIFO_DEPTH;
 
         let driver = DriverType::Epoll(());
@@ -4158,15 +4248,17 @@ mod tests {
                 wake: None,
                 retire: None,
             },
-            "an overflowing completion recycles its buffer and routes to nothing",
+            "an overflowing data completion recycles its buffer and routes to nothing",
         );
+        // #230: the terminal stashes past the full FIFO, so it wakes the owner to
+        // deliver the end signal rather than being dropped as an overflow.
         assert_eq!(
             push_recv_multishot_completion(&mut slab, &driver, sentinel, 0, CqeFlags::EMPTY, None),
             MultishotCompletion {
-                wake: None,
+                wake: Some(0x1),
                 retire: Some(0x1),
             },
-            "a terminal CQE still retires the owner when the FIFO is full",
+            "a terminal CQE wakes and retires the owner even when the FIFO is full",
         );
     }
 
@@ -4190,6 +4282,36 @@ mod tests {
         assert!(
             slab.is_cancel_pending(key.slot, gen_low16),
             "the slot is marked cancel-pending",
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn recv_cancel_frees_terminated_slot() {
+        let driver = DriverType::Epoll(());
+        let Ok(mut slab) = RecvMultishotSlab::new(36, 4) else {
+            panic!("the registry mmap must succeed");
+        };
+        let Some(key) = slab.allocate(0x1) else {
+            panic!("the empty registry allocates a slot");
+        };
+        let gen_low16 = (key.generation & 0xFFFF) as u16;
+        // A terminal completion that already arrived carries a real provided
+        // buffer and sits stashed when the stream drops. The cancel drains that
+        // buffer, and, since the op has already terminated, frees the slot at once
+        // rather than stranding it on a best-effort cancel the ring can refuse.
+        slab.push(key.slot, gen_low16, 4, 6, true);
+        slab.push(key.slot, gen_low16, 0, 7, false);
+        submit_recv_multishot_cancel(&driver, &mut slab, key);
+        assert!(!slab.is_live(key), "the terminated slot is freed at once");
+        let Some(reused) = slab.allocate(0x2) else {
+            panic!("the freed slot is available for reuse");
+        };
+        assert_eq!(reused.slot, key.slot);
+        assert_eq!(
+            reused.generation,
+            key.generation + 1,
+            "the freed slot is reused with a bumped generation",
         );
     }
 
