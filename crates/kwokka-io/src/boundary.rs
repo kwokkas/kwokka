@@ -31,7 +31,7 @@ use std::{
 use crate::{
     DriverType, IoDriver,
     buffer::{
-        inflight::{InflightBufSlab, InflightSlotKey},
+        inflight::{INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
         mmap::MmapRegion,
         multishot::{
             MultishotPush, MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotPush,
@@ -629,6 +629,58 @@ impl IoSeam {
         Some((key, ptr))
     }
 
+    /// Copies `src`'s initialized bytes into `key`'s slot.
+    ///
+    /// Generalizes the `ptr.copy_from_nonoverlapping` step every write-class
+    /// buffered future repeats today: `src` supplies its bytes through the
+    /// [`IoBuf`] contract (`as_ptr` / `bytes_init`) instead of a future's own
+    /// inline array field, so a caller built over any `IoBuf` source populates
+    /// its slot through one path. The caller still builds its own `InlineBuf`
+    /// over the slot pointer and still calls `set_init`, unchanged from today;
+    /// this method only replaces the raw copy step.
+    ///
+    /// Returns `false` without copying when `key` is stale, or when `src`'s
+    /// initialized length exceeds the slot stride -- the caller then frees the
+    /// slot and fails the submit rather than copy out of bounds. A seam with no
+    /// slab reports `false`.
+    #[must_use]
+    pub fn copy_into_slot<B: IoBuf>(&self, key: InflightSlotKey, src: &B) -> bool {
+        let Some(mut slab) = self.inflight_slab else {
+            return false;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot` / `harvest_into`. Precondition: reached via
+        // `with_current` during a poll on this worker; the `SeamGuard` bracket
+        // keeps the referent live, and the `slot_ptr` shared read ends before
+        // this call returns. Failure mode: a second `&mut` into the slab within
+        // the poll window (excluded by the non-reentrant poll structure) aliases
+        // this one (double-mutable-aliasing UB); a call after `SeamGuard` drops
+        // derefs a dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let Some(ptr) = slab.slot_ptr(key) else {
+            return false;
+        };
+        let len = src.bytes_init();
+        if len > INFLIGHT_BUF_STRIDE as usize {
+            return false;
+        }
+        // SAFETY: Invariant -- `ptr` addresses `key`'s live slot, valid for
+        // INFLIGHT_BUF_STRIDE writes; `src.as_ptr()` is valid for `len` reads per
+        // the `IoBuf` contract (`src` is a shared borrow outliving this call);
+        // the length check above keeps the write inside the slot, and the slot
+        // and `src`'s own storage are always distinct allocations, so the copy
+        // never overlaps. Precondition: `len <= INFLIGHT_BUF_STRIDE` is checked
+        // immediately above. Failure mode: a source whose `bytes_init`
+        // overstates its own backing storage is unsound in `src`'s own `IoBuf`
+        // impl, not here; this call's own failure mode (a length past the slot)
+        // is excluded by the check above.
+        unsafe {
+            ptr.copy_from_nonoverlapping(src.as_ptr(), len);
+        }
+        true
+    }
+
     /// Copies `key`'s completed slot bytes into `dst` and frees the slot.
     ///
     /// Called on the completion poll of a read-class buffered future, once its
@@ -655,6 +707,52 @@ impl IoSeam {
             let count = src.len().min(dst.len());
             dst[..count].copy_from_slice(&src[..count]);
         }
+        slab.free(key);
+    }
+
+    /// Copies `key`'s completed slot bytes into `dst` and frees the slot,
+    /// generalizing [`harvest_into`](Self::harvest_into) to any [`IoBufMut`]
+    /// sink.
+    ///
+    /// Same calling contract as `harvest_into`: called on the completion poll of
+    /// a read-class buffered future once its CQE has arrived, with `len` the
+    /// kernel-confirmed byte count. The copy clamps to both the slot stride and
+    /// `dst.capacity()`, and `dst.set_init(n)` records the copied length in place
+    /// of the caller threading the count through its own return value. A no-op
+    /// when the seam carries no slab.
+    pub fn harvest_into_buf<B: IoBufMut>(&self, key: InflightSlotKey, len: usize, dst: &mut B) {
+        let Some(mut slab) = self.inflight_slab else {
+            return;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot` / `harvest_into`. Precondition: reached via
+        // `with_current` during a poll on this worker; the `SeamGuard` bracket
+        // keeps the referent live, and the `slot_slice` shared reborrow ends
+        // before `free` takes the `&mut` again. Failure mode: a second `&mut`
+        // into the slab within the poll window (excluded by the non-reentrant
+        // poll structure) aliases this one (double-mutable-aliasing UB); a call
+        // after `SeamGuard` drops derefs a dangling pointer (the bracket
+        // excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let mut count = 0;
+        if let Some(src) = slab.slot_slice(key, len) {
+            count = src.len().min(dst.capacity());
+            // SAFETY: Invariant -- `dst.as_mut_ptr()` is valid for
+            // `dst.capacity()` writes per the `IoBufMut` contract, and `count <=
+            // dst.capacity()` by the `min` above; `src` is a `count`-byte shared
+            // slice into the in-flight slot, a region distinct from `dst`'s own
+            // storage, so the copy never overlaps. Precondition: `dst` is
+            // exclusively borrowed for this call (the `&mut B` parameter), so no
+            // other writer aliases the destination while this runs. Failure mode:
+            // writing past `dst.capacity()` -- excluded by the `min` clamp above
+            // -- would corrupt memory `dst` does not own.
+            unsafe {
+                dst.as_mut_ptr()
+                    .copy_from_nonoverlapping(src.as_ptr(), count);
+            }
+        }
+        dst.set_init(count);
         slab.free(key);
     }
 
@@ -2846,6 +2944,202 @@ mod tests {
         // A seam with no slab is a no-op for both, never a panic.
         seam.harvest_into(key, 4, &mut [0u8; 4]);
         seam.free_slot(key);
+    }
+
+    struct MockBuf {
+        data: [u8; 8],
+        len: usize,
+        cap: usize,
+    }
+
+    impl MockBuf {
+        fn seeded(bytes: &[u8]) -> Self {
+            let mut data = [0u8; 8];
+            let len = bytes.len().min(8);
+            data[..len].copy_from_slice(&bytes[..len]);
+            Self { data, len, cap: 8 }
+        }
+
+        fn with_capacity(cap: usize) -> Self {
+            Self {
+                data: [0u8; 8],
+                len: 0,
+                cap: cap.min(8),
+            }
+        }
+
+        fn oversized() -> Self {
+            Self {
+                data: [0u8; 8],
+                len: INFLIGHT_BUF_STRIDE as usize + 1,
+                cap: 8,
+            }
+        }
+    }
+
+    impl IoBuf for MockBuf {
+        fn as_ptr(&self) -> *const u8 {
+            self.data.as_ptr()
+        }
+
+        fn bytes_init(&self) -> usize {
+            self.len
+        }
+    }
+
+    impl IoBufMut for MockBuf {
+        fn as_mut_ptr(&mut self) -> *mut u8 {
+            self.data.as_mut_ptr()
+        }
+
+        fn capacity(&self) -> usize {
+            self.cap
+        }
+
+        fn set_init(&mut self, count: usize) {
+            self.len = count;
+        }
+    }
+
+    #[test]
+    fn copy_into_slot_writes_the_source_bytes() {
+        let Ok(mut slab) = InflightBufSlab::new(20, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(20, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _)) = seam.allocate_slot(0x1234) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        let src = MockBuf::seeded(b"ping");
+        assert!(
+            seam.copy_into_slot(key, &src),
+            "the source copies into the live slot",
+        );
+        let mut out = [0u8; 8];
+        seam.harvest_into(key, 4, &mut out);
+        assert_eq!(&out[..4], b"ping", "the slot carries the copied bytes");
+    }
+
+    #[test]
+    fn copy_into_slot_needs_a_slab() {
+        let seam = IoSeam::new(21, None, None, None);
+        let key = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 21,
+            op_token: 0,
+        };
+        let src = MockBuf::seeded(b"x");
+        assert!(
+            !seam.copy_into_slot(key, &src),
+            "a seam with no slab cannot copy",
+        );
+    }
+
+    #[test]
+    fn copy_into_slot_rejects_a_stale_key() {
+        let Ok(mut slab) = InflightBufSlab::new(22, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(22, None, Some(NonNull::from(&mut slab)), None);
+        // A key the slab never issued: the slot is unoccupied, so `slot_ptr`
+        // rejects it and no copy runs.
+        let stale = InflightSlotKey {
+            slot: 0,
+            generation: 7,
+            worker_id: 22,
+            op_token: 0,
+        };
+        let src = MockBuf::seeded(b"ping");
+        assert!(
+            !seam.copy_into_slot(stale, &src),
+            "a stale key copies nothing",
+        );
+    }
+
+    #[test]
+    fn copy_into_slot_rejects_oversized_source() {
+        let Ok(mut slab) = InflightBufSlab::new(23, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(23, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _)) = seam.allocate_slot(0) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        let src = MockBuf::oversized();
+        assert!(
+            !seam.copy_into_slot(key, &src),
+            "a source past the slot stride copies nothing",
+        );
+    }
+
+    #[test]
+    fn harvest_into_buf_copies_then_frees() {
+        let Ok(mut slab) = InflightBufSlab::new(24, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(24, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, ptr)) = seam.allocate_slot(0x5678) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        // SAFETY: `ptr` addresses the slot's stride-wide region for the slot's
+        // lifetime; this test writes 4 bytes well within the stride, exclusively
+        // owned for the test. Failure mode: a write past the stride would corrupt
+        // an adjacent slot or mmap page.
+        unsafe {
+            ptr.copy_from(b"pong".as_ptr(), 4);
+        }
+        let mut dst = MockBuf::with_capacity(8);
+        seam.harvest_into_buf(key, 4, &mut dst);
+        assert_eq!(dst.bytes_init(), 4, "set_init records the copied length");
+        assert_eq!(&dst.data[..4], b"pong", "the slot bytes land in the sink");
+        assert!(
+            seam.allocate_slot(0)
+                .is_some_and(|(reused, _)| reused.slot == key.slot
+                    && reused.generation == key.generation + 1),
+            "the harvest freed the slot for reuse with a bumped generation",
+        );
+    }
+
+    #[test]
+    fn harvest_into_buf_clamps_to_dst_capacity() {
+        let Ok(mut slab) = InflightBufSlab::new(25, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(25, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, ptr)) = seam.allocate_slot(0) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        // SAFETY: `ptr` addresses the slot's stride-wide region; this test writes
+        // 8 bytes within the stride, exclusively owned for the test. Failure mode:
+        // a write past the stride would corrupt an adjacent slot or mmap page.
+        unsafe {
+            ptr.copy_from(b"overflow".as_ptr(), 8);
+        }
+        let mut dst = MockBuf::with_capacity(4);
+        seam.harvest_into_buf(key, 8, &mut dst);
+        assert_eq!(dst.bytes_init(), 4, "the copy clamps to dst capacity");
+        assert_eq!(&dst.data[..4], b"over", "only the clamped prefix lands");
+    }
+
+    #[test]
+    fn harvest_into_buf_needs_no_slab() {
+        let seam = IoSeam::new(26, None, None, None);
+        let key = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 26,
+            op_token: 0,
+        };
+        // Seed a non-zero init to prove a true no-op: with no slab the method
+        // returns before touching `set_init`, so `bytes_init` stays untouched.
+        let mut dst = MockBuf::seeded(b"stale");
+        seam.harvest_into_buf(key, 4, &mut dst);
+        assert_eq!(
+            dst.bytes_init(),
+            5,
+            "a seam with no slab leaves the sink untouched",
+        );
     }
 
     #[test]
