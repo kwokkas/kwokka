@@ -10,7 +10,7 @@
 
 use std::os::fd::AsRawFd;
 
-use kwokka_fs::file::FileReadFuture;
+use kwokka_io::operation::FileReadFuture;
 use kwokka_runtime::Runtime;
 
 #[test]

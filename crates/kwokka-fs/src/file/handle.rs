@@ -7,6 +7,7 @@
 //! with no caller-visible change; the path-buffer ownership design that
 //! lowering needs is tracked separately.
 
+use core::future::Future;
 use std::{
     fs, io,
     os::fd::{AsRawFd, OwnedFd, RawFd},
@@ -67,8 +68,8 @@ impl File {
     /// Hands out the future reading up to `CAP` bytes at byte `offset`.
     ///
     /// Awaiting it resolves to an [`io::Result`] byte count paired with the
-    /// filled buffer. See [`FileReadFuture`] for the await-to-completion
-    /// contract.
+    /// filled buffer. Await it directly on a runtime task; polling it through a
+    /// waker the runtime did not build panics.
     ///
     /// # Examples
     ///
@@ -83,7 +84,10 @@ impl File {
     /// let _read = result?;
     /// # Ok::<(), std::io::Error>(())
     /// ```
-    pub fn read<const CAP: usize>(&self, offset: u64) -> FileReadFuture<[u8; CAP]> {
+    pub fn read<const CAP: usize>(
+        &self,
+        offset: u64,
+    ) -> impl Future<Output = (io::Result<usize>, [u8; CAP])> + use<CAP> {
         FileReadFuture::new(self.inner.as_raw_fd(), offset, [0u8; CAP])
     }
 
@@ -91,8 +95,8 @@ impl File {
     ///
     /// `data` is a `CAP`-byte array and `len` marks how many of its leading
     /// bytes to write (clamped to `CAP`); the rest is ignored. Awaiting it
-    /// resolves to an [`io::Result`] byte count. See [`FileWriteFuture`] for
-    /// the await-to-completion contract.
+    /// resolves to an [`io::Result`] byte count. Await it directly on a runtime
+    /// task; polling it through a waker the runtime did not build panics.
     ///
     /// # Examples
     ///
@@ -113,7 +117,7 @@ impl File {
         offset: u64,
         data: [u8; CAP],
         len: usize,
-    ) -> FileWriteFuture<FixedBuf<CAP>> {
+    ) -> impl Future<Output = io::Result<usize>> + use<CAP> {
         FileWriteFuture::new(self.inner.as_raw_fd(), offset, FixedBuf::new(data, len))
     }
 }
