@@ -84,7 +84,7 @@ pub enum AddressFamily {
     reason = "AF_* constants and test path lengths are small, truncation impossible in tests"
 )]
 mod tests {
-    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
     use super::*;
     use crate::addr::unix::UnixAddr;
@@ -160,6 +160,21 @@ mod tests {
         let v6 = SockAddr::V6(SocketAddrV6::new(Ipv6Addr::LOCALHOST, 80, 0, 0));
         assert_eq!(v4.family(), AddressFamily::Inet);
         assert_eq!(v6.family(), AddressFamily::Inet6);
+    }
+
+    #[test]
+    fn from_std_socket_addr_preserves_family() {
+        let v4 = SockAddr::from(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80)));
+        let v6 = SockAddr::from(SocketAddr::V6(SocketAddrV6::new(
+            Ipv6Addr::LOCALHOST,
+            443,
+            0,
+            0,
+        )));
+        assert_eq!(v4.family(), AddressFamily::Inet);
+        assert!(matches!(v4, SockAddr::V4(_)));
+        assert_eq!(v6.family(), AddressFamily::Inet6);
+        assert!(matches!(v6, SockAddr::V6(_)));
     }
 
     #[cfg(target_os = "linux")]

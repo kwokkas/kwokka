@@ -2591,6 +2591,22 @@ mod tests {
         assert_eq!(IoSeam::with_current(200, IoSeam::worker_id), None);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_stream_socket_makes_an_ipv6_socket() {
+        let Ok(_socket) = create_stream_socket(crate::addr::AddressFamily::Inet6) else {
+            panic!("an IPv6 stream socket must be created");
+        };
+    }
+
+    #[test]
+    fn create_stream_socket_rejects_unix() {
+        let Err(error) = create_stream_socket(crate::addr::AddressFamily::Unix) else {
+            panic!("a Unix family is rejected for a TCP stream socket");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
     #[test]
     fn guard_brackets_install_and_clear() {
         let seam = IoSeam::new(201, None, None, None);
