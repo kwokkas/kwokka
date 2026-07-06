@@ -340,6 +340,43 @@ impl InflightBufSlab {
         Some(&self.storage.as_slice()[offset..end])
     }
 
+    /// Returns `key`'s slot as a fixed-size mutable array, or `None` if stale.
+    ///
+    /// The `sendmsg`/`recvmsg` seam lays the msghdr/iovec/addr/payload structure
+    /// over the whole slot, which needs a sized `&mut [u8; INFLIGHT_BUF_STRIDE]`
+    /// rather than the raw pointer or length-truncated slice the plain buffered
+    /// ops use. The slot is exactly `INFLIGHT_BUF_STRIDE` bytes wide, so the
+    /// conversion never fails on a live key.
+    pub(crate) fn slot_array_mut(
+        &mut self,
+        key: InflightSlotKey,
+    ) -> Option<&mut [u8; INFLIGHT_BUF_STRIDE as usize]> {
+        if !self.is_live(key) {
+            return None;
+        }
+        let offset = key.slot as usize * self.stride as usize;
+        let end = offset + self.stride as usize;
+        let slot = &mut self.storage.as_mut_slice()[offset..end];
+        slot.try_into().ok()
+    }
+
+    /// Returns `key`'s slot as a fixed-size shared array, or `None` if stale.
+    ///
+    /// The read side of [`slot_array_mut`](Self::slot_array_mut): the `recvmsg`
+    /// seam reads the kernel-written sender address out of the slot. Call only
+    /// after the CQE for this slot's op arrives.
+    pub(crate) fn slot_array(
+        &self,
+        key: InflightSlotKey,
+    ) -> Option<&[u8; INFLIGHT_BUF_STRIDE as usize]> {
+        if !self.is_live(key) {
+            return None;
+        }
+        let offset = key.slot as usize * self.stride as usize;
+        let end = offset + self.stride as usize;
+        self.storage.as_slice()[offset..end].try_into().ok()
+    }
+
     /// First free slot within `cap`, by inverted-bitmap scan.
     fn first_free(&self) -> Option<u16> {
         let limit = self.cap as usize;
@@ -511,6 +548,40 @@ mod tests {
         };
         assert_eq!(bytes.len(), 4);
         assert!(bytes.iter().all(|&byte| byte == 0), "mmap is zero-filled");
+    }
+
+    #[test]
+    fn slot_array_spans_the_stride_and_round_trips() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0) else {
+            panic!("allocate must succeed");
+        };
+        let Some(slot) = registry.slot_array_mut(key) else {
+            panic!("a live handle yields the mutable slot array");
+        };
+        assert_eq!(slot.len(), INFLIGHT_BUF_STRIDE as usize);
+        slot[0] = 0xAB;
+        slot[INFLIGHT_BUF_STRIDE as usize - 1] = 0xCD;
+        let Some(read) = registry.slot_array(key) else {
+            panic!("a live handle yields the shared slot array");
+        };
+        assert_eq!(read[0], 0xAB);
+        assert_eq!(read[INFLIGHT_BUF_STRIDE as usize - 1], 0xCD);
+    }
+
+    #[test]
+    fn slot_array_rejects_a_stale_key() {
+        let registry = slab(8);
+        let stale = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 0,
+            op_token: 0,
+        };
+        assert!(
+            registry.slot_array(stale).is_none(),
+            "a fabricated generation-0 key is not live",
+        );
     }
 
     #[test]

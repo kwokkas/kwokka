@@ -1,7 +1,7 @@
 //! Raw `sockaddr_storage` packing -- unix-only, used by SQE submission.
 
 #[cfg(unix)]
-use std::net::{SocketAddrV4, SocketAddrV6};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6};
 
 #[cfg(unix)]
 use crate::addr::unix::UnixAddr;
@@ -43,6 +43,43 @@ pub(super) fn pack_v6(addr: SocketAddrV6, out: &mut [u8; 128]) -> u32 {
     out[8..24].copy_from_slice(&addr.ip().octets());
     out[24..28].copy_from_slice(&addr.scope_id().to_ne_bytes());
     28
+}
+
+/// Reads the `sa_family` discriminant a `pack_*` call wrote at `buf[0..2]`.
+#[cfg(unix)]
+pub(super) const fn packed_family(buf: &[u8; 128]) -> u16 {
+    u16::from_ne_bytes([buf[0], buf[1]])
+}
+
+/// Whether `family` is the `AF_INET` (IPv4) discriminant.
+#[cfg(unix)]
+pub(super) const fn is_inet(family: u16) -> bool {
+    family == AF_INET
+}
+
+/// Whether `family` is the `AF_INET6` (IPv6) discriminant.
+#[cfg(unix)]
+pub(super) const fn is_inet6(family: u16) -> bool {
+    family == AF_INET6
+}
+
+/// Reconstructs an IPv4 address from a [`pack_v4`]-packed buffer.
+#[cfg(unix)]
+pub(super) fn unpack_v4(buf: &[u8; 128]) -> SocketAddrV4 {
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    let octets = [buf[4], buf[5], buf[6], buf[7]];
+    SocketAddrV4::new(Ipv4Addr::from(octets), port)
+}
+
+/// Reconstructs an IPv6 address from a [`pack_v6`]-packed buffer.
+#[cfg(unix)]
+pub(super) fn unpack_v6(buf: &[u8; 128]) -> SocketAddrV6 {
+    let port = u16::from_be_bytes([buf[2], buf[3]]);
+    let flowinfo = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
+    let mut octets = [0u8; 16];
+    octets.copy_from_slice(&buf[8..24]);
+    let scope_id = u32::from_ne_bytes([buf[24], buf[25], buf[26], buf[27]]);
+    SocketAddrV6::new(Ipv6Addr::from(octets), port, flowinfo, scope_id)
 }
 
 /// Packs a Unix domain socket address into a `sockaddr_storage`-compatible buffer.

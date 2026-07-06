@@ -66,6 +66,28 @@ impl From<SocketAddr> for SockAddr {
     }
 }
 
+impl SockAddr {
+    /// Reconstructs an address from bytes a completion wrote in
+    /// [`pack_into`](Self::pack_into)'s layout, dispatching on the `sa_family`
+    /// discriminant at `buf[0..2]`.
+    ///
+    /// Returns `None` for `AF_UNIX` (variable-length, not round-tripped by this
+    /// parse) or an unrecognized family. The `recvmsg` completion path calls
+    /// this to recover a datagram's sender address, so it never trusts a
+    /// kernel-written length: the family discriminant selects a fixed layout.
+    #[cfg(unix)]
+    pub(crate) fn unpack(buf: &[u8; 128]) -> Option<Self> {
+        let family = crate::addr::pack::packed_family(buf);
+        if crate::addr::pack::is_inet(family) {
+            Some(Self::V4(crate::addr::pack::unpack_v4(buf)))
+        } else if crate::addr::pack::is_inet6(family) {
+            Some(Self::V6(crate::addr::pack::unpack_v6(buf)))
+        } else {
+            None
+        }
+    }
+}
+
 /// Address family discriminant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -175,6 +197,30 @@ mod tests {
         assert!(matches!(v4, SockAddr::V4(_)));
         assert_eq!(v6.family(), AddressFamily::Inet6);
         assert!(matches!(v6, SockAddr::V6(_)));
+    }
+
+    #[test]
+    fn v4_round_trips_through_unpack() {
+        let addr = SockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 5), 8080));
+        let (buf, _) = packed(&addr);
+        assert_eq!(SockAddr::unpack(&buf), Some(addr));
+    }
+
+    #[test]
+    fn v6_round_trips_through_unpack() {
+        let ip = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let addr = SockAddr::V6(SocketAddrV6::new(ip, 443, 7, 2));
+        let (buf, _) = packed(&addr);
+        assert_eq!(SockAddr::unpack(&buf), Some(addr));
+    }
+
+    #[test]
+    fn unix_family_unpacks_to_none() {
+        let Ok(unix) = UnixAddr::path("/tmp/kwokka.sock") else {
+            panic!("expected Ok");
+        };
+        let (buf, _) = packed(&SockAddr::Unix(unix));
+        assert_eq!(SockAddr::unpack(&buf), None);
     }
 
     #[cfg(target_os = "linux")]

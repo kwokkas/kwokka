@@ -218,7 +218,11 @@ impl UringDriver {
         // The SQE entry was built from a valid IoRequest via
         // build_entry/build_entry_write/build_entry_read. All pointer
         // fields (buffer, timespec, sockaddr) are owned by the IoRequest
-        // or SubmitScratch and remain valid until the CQE arrives.
+        // or SubmitScratch and remain valid until the CQE arrives. A
+        // sendmsg/recvmsg msghdr pointer instead references the caller's
+        // future-pinned in-flight slot; the io_bound worker pin holds
+        // that slot on this worker until the op's own CQE, so it stays
+        // valid for the kernel's whole read/write of the message.
         // Precondition: submission queue accessed exclusively by this
         // worker thread (SINGLE_ISSUER).
         // Failure mode: invalid pointer in SQE causes kernel to read/write
@@ -450,7 +454,7 @@ fn register_provided_recv_pool(ring: &IoUring) -> Result<BufRingPool, RegisterEr
 impl IoDriver for UringDriver {
     fn submit<B: IoBuf>(&self, request: IoRequest<B>) -> SubmitResult {
         let entry = match request.opcode {
-            OpCode::Read | OpCode::Recv | OpCode::Recvmsg | OpCode::Sendmsg => {
+            OpCode::Read | OpCode::Recv => {
                 return SubmitResult::Unsupported;
             }
             OpCode::Write | OpCode::Send => build_entry_write(&request),

@@ -42,6 +42,8 @@ use crate::{
     },
     operation::{CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
+#[cfg(unix)]
+use crate::{addr::SockAddr, operation::core::msghdr};
 
 /// One seam slot per possible worker id byte.
 ///
@@ -173,37 +175,37 @@ pub fn adopt_accepted_fd(result: i32) -> Option<OwnedFd> {
     Some(unsafe { OwnedFd::from_raw_fd(result) })
 }
 
-/// Creates an unconnected, close-on-exec stream socket for `family`.
+/// Creates an unconnected, close-on-exec socket of `socket_type` for `family`.
 ///
-/// The client counterpart of adopting an accepted descriptor: a connect needs
-/// an owned socket of the peer's address family before the `io_uring` connect
-/// op runs, and the standard library exposes no unconnected-stream-socket
-/// constructor. The descriptor is left blocking; the connect is submitted as an
-/// `io_uring` completion op rather than a blocking syscall on this fd.
+/// Shared by the stream and datagram constructors: a client-side op (connect,
+/// sendmsg) needs an owned socket of the peer's address family before the
+/// `io_uring` op runs, and the standard library exposes no such constructor.
+/// The descriptor is left blocking; the op is submitted as an `io_uring`
+/// completion rather than a blocking syscall on this fd.
 ///
 /// # Errors
 ///
 /// Returns the OS error when the `socket` syscall fails, or
-/// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix`, which names a
-/// stream this entry does not create (only IPv4 and IPv6 are supported).
-pub fn create_stream_socket(family: AddressFamily) -> io::Result<OwnedFd> {
+/// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix` (only IPv4 and IPv6
+/// are supported here).
+fn create_socket(family: AddressFamily, socket_type: i32) -> io::Result<OwnedFd> {
     let domain = match family {
         AddressFamily::Inet => libc::AF_INET,
         AddressFamily::Inet6 => libc::AF_INET6,
         AddressFamily::Unix => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "connect creates only IPv4 and IPv6 stream sockets",
+                "only IPv4 and IPv6 sockets are supported",
             ));
         }
     };
     // SAFETY: Invariant -- `libc::socket` (socket.2) is an FFI call that takes
     // three integers and returns a fresh descriptor or -1; it has no pointer or
     // memory precondition. Precondition: `domain` is a valid `AF_*` constant
-    // (matched above) and `SOCK_STREAM | SOCK_CLOEXEC` is a valid type per
+    // (matched above) and `socket_type | SOCK_CLOEXEC` is a valid type per
     // socket.2. Failure mode: an unsupported argument yields -1 plus `errno`,
     // handled just below; the call itself cannot corrupt memory.
-    let raw = unsafe { libc::socket(domain, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0) };
+    let raw = unsafe { libc::socket(domain, socket_type | libc::SOCK_CLOEXEC, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -214,6 +216,36 @@ pub fn create_stream_socket(family: AddressFamily) -> io::Result<OwnedFd> {
     // owned elsewhere and close it on drop; the sign check excludes that. No
     // pointer dereference occurs (IO-safety, not memory-safety).
     Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+}
+
+/// Creates an unconnected, close-on-exec stream socket for `family`.
+///
+/// The client counterpart of adopting an accepted descriptor: a connect needs
+/// an owned socket of the peer's address family before the `io_uring` connect
+/// op runs. The shared syscall path lives in `create_socket`.
+///
+/// # Errors
+///
+/// Returns the OS error when the `socket` syscall fails, or
+/// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix` (only IPv4 and IPv6
+/// stream sockets are created).
+pub fn create_stream_socket(family: AddressFamily) -> io::Result<OwnedFd> {
+    create_socket(family, libc::SOCK_STREAM)
+}
+
+/// Creates an unconnected, close-on-exec datagram socket for `family`.
+///
+/// The UDP counterpart of [`create_stream_socket`]: a `sendmsg` / `recvmsg`
+/// needs an owned datagram socket of the peer's address family before the
+/// `io_uring` op runs. The shared syscall path lives in `create_socket`.
+///
+/// # Errors
+///
+/// Returns the OS error when the `socket` syscall fails, or
+/// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix` (only IPv4 and IPv6
+/// datagram sockets are created).
+pub fn create_datagram_socket(family: AddressFamily) -> io::Result<OwnedFd> {
+    create_socket(family, libc::SOCK_DGRAM)
 }
 
 /// Resolves a provided-buffer recv completion into the buffer view it names.
@@ -820,6 +852,157 @@ impl IoSeam {
         // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
         // dangling pointer (the bracket excludes it).
         let slab = unsafe { slab.as_mut() };
+        slab.free(key);
+    }
+
+    /// Lays out a `sendmsg` header for `key`'s slot and returns the `msghdr`
+    /// pointer for the SQE.
+    ///
+    /// Copies `src`'s initialized bytes into the slot payload region and packs
+    /// `addr` into its address region, both under the slot's own lifetime.
+    /// Returns `None` when the seam carries no slab, `key` is stale, or `src`'s
+    /// initialized length exceeds the payload capacity -- the caller then frees
+    /// the slot and fails the submit rather than truncate the datagram.
+    #[cfg(unix)]
+    pub fn build_send_msg<B: IoBuf>(
+        &self,
+        key: InflightSlotKey,
+        src: &B,
+        addr: &SockAddr,
+    ) -> Option<NonNull<libc::msghdr>> {
+        let mut slab = self.inflight_slab?;
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot`. Precondition: reached via `with_current` during a
+        // poll on this worker; the `SeamGuard` bracket keeps the referent live,
+        // and the `slot_array_mut` reborrow ends before this call returns.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // (excluded by the non-reentrant poll structure) aliases this one
+        // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let slot = slab.slot_array_mut(key)?;
+        let len = src.bytes_init();
+        if len > msghdr::MAX_MSG_INLINE_CAP {
+            return None;
+        }
+        let payload = msghdr::payload_ptr(slot);
+        // SAFETY: Invariant -- `payload` addresses `key`'s slot payload region
+        // (`msghdr::payload_ptr`), valid for `MAX_MSG_INLINE_CAP` writes while
+        // the slab lives and the slot stays occupied; `src.as_ptr()` is valid
+        // for `len` reads per the `IoBuf` contract (`src` is a shared borrow
+        // outliving this call); the length check above keeps the write inside
+        // the payload region, and the slot and `src`'s own storage are always
+        // distinct allocations, so the copy never overlaps. Precondition: `len
+        // <= MAX_MSG_INLINE_CAP` is checked immediately above. Failure mode: a
+        // source whose `bytes_init` overstates its backing storage is unsound
+        // in `src`'s own `IoBuf` impl, not here; a length past the payload
+        // region is excluded by the check above.
+        unsafe {
+            payload.copy_from_nonoverlapping(src.as_ptr(), len);
+        }
+        Some(msghdr::write_send_header(slot, len, addr))
+    }
+
+    /// Lays out a `recvmsg` header for `key`'s slot and returns the `msghdr`
+    /// pointer for the SQE.
+    ///
+    /// Offers the kernel `cap` payload bytes (clamped to the slot's payload
+    /// capacity) and the full address region as an out-parameter. Returns
+    /// `None` when the seam carries no slab or `key` is stale.
+    #[cfg(unix)]
+    pub fn build_recv_msg(
+        &self,
+        key: InflightSlotKey,
+        cap: usize,
+    ) -> Option<NonNull<libc::msghdr>> {
+        let mut slab = self.inflight_slab?;
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot`. Precondition: reached via `with_current` during a
+        // poll on this worker; the `SeamGuard` bracket keeps the referent live,
+        // and the `slot_array_mut` reborrow ends before this call returns.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // (excluded by the non-reentrant poll structure) aliases this one
+        // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let slot = slab.slot_array_mut(key)?;
+        let cap = cap.min(msghdr::MAX_MSG_INLINE_CAP);
+        Some(msghdr::write_recv_header(slot, cap))
+    }
+
+    /// Reads the sender address the kernel wrote into `key`'s slot after a
+    /// `recvmsg`, or `None` for a slab-less seam, a stale key, or a family the
+    /// parse does not handle.
+    ///
+    /// Call on the completion poll once the CQE has arrived and BEFORE
+    /// [`harvest_msg_payload`](Self::harvest_msg_payload) frees the slot.
+    #[cfg(unix)]
+    pub fn read_msg_sender(&self, key: InflightSlotKey) -> Option<SockAddr> {
+        let slab = self.inflight_slab?;
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field,
+        // reached via `with_current` during a poll on this worker; the
+        // `SeamGuard` bracket keeps the referent live. This forms a SHARED
+        // reference (`slot_array` reads only), weaker than the `&mut` the build
+        // / harvest / free paths take. Precondition: single-poll-writer
+        // discipline -- `poll_one` and `SeamGuard` are non-reentrant, so no
+        // `&mut InflightBufSlab` is live while this shared reference exists.
+        // Failure mode: a `&mut` into the slab overlapping this shared reborrow
+        // would be aliasing UB (the non-reentrant poll excludes it); a call
+        // after `SeamGuard` drops derefs a dangling pointer (the bracket
+        // excludes it).
+        let slab = unsafe { slab.as_ref() };
+        msghdr::read_sender(slab.slot_array(key)?)
+    }
+
+    /// Copies `key`'s received datagram payload into `dst` and frees the slot.
+    ///
+    /// Called on the completion poll of a `recvmsg` future once its CQE has
+    /// arrived, with `len` the kernel-confirmed byte count. The copy clamps to
+    /// both the slot payload capacity and `dst.capacity()`, and `dst.set_init`
+    /// records the copied length. Freeing the slot bumps its generation, so the
+    /// future's later drop pushes a cancel the slab rejects as stale. A no-op
+    /// when the seam carries no slab. Call AFTER
+    /// [`read_msg_sender`](Self::read_msg_sender), which this frees out from
+    /// under.
+    #[cfg(unix)]
+    pub fn harvest_msg_payload<B: IoBufMut>(&self, key: InflightSlotKey, len: usize, dst: &mut B) {
+        let Some(mut slab) = self.inflight_slab else {
+            return;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `allocate_slot` / `harvest_into_buf`. Precondition: reached via
+        // `with_current` during a poll on this worker; the `SeamGuard` bracket
+        // keeps the referent live, and the `slot_array_mut` reborrow ends
+        // before `free` takes the `&mut` again. Failure mode: a second `&mut`
+        // into the slab within the poll window (excluded by the non-reentrant
+        // poll structure) aliases this one (double-mutable-aliasing UB); a call
+        // after `SeamGuard` drops derefs a dangling pointer (the bracket
+        // excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let mut count = 0;
+        if let Some(slot) = slab.slot_array_mut(key) {
+            let payload = msghdr::payload_ptr(slot);
+            count = len.min(msghdr::MAX_MSG_INLINE_CAP).min(dst.capacity());
+            // SAFETY: Invariant -- `payload` addresses `key`'s slot payload
+            // region, readable once this op's CQE has arrived (the caller's
+            // contract); `dst.as_mut_ptr()` is valid for `dst.capacity()`
+            // writes per the `IoBufMut` contract, and `count <= dst.capacity()`
+            // by the `min` clamp above; the payload region and `dst`'s own
+            // storage are always distinct allocations, so the copy never
+            // overlaps. Precondition: `dst` is exclusively borrowed for this
+            // call, so no other writer aliases the destination. Failure mode:
+            // writing past `dst.capacity()` -- excluded by the clamp -- would
+            // corrupt memory `dst` does not own; reading before the CQE arrives
+            // would race the kernel write -- excluded by the caller polling
+            // only a completed op.
+            unsafe {
+                dst.as_mut_ptr().copy_from_nonoverlapping(payload, count);
+            }
+        }
+        dst.set_init(count);
         slab.free(key);
     }
 
@@ -2610,6 +2793,24 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     }
 
+    // A real `socket()` syscall is unsupported under miri's isolation, so this
+    // runs off-miri; the Unix-rejection test below returns before any syscall.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn create_datagram_socket_makes_an_ipv4_socket() {
+        let Ok(_socket) = create_datagram_socket(crate::addr::AddressFamily::Inet) else {
+            panic!("an IPv4 datagram socket must be created");
+        };
+    }
+
+    #[test]
+    fn create_datagram_socket_rejects_unix() {
+        let Err(error) = create_datagram_socket(crate::addr::AddressFamily::Unix) else {
+            panic!("a Unix family is rejected for a UDP datagram socket");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
     #[test]
     fn guard_brackets_install_and_clear() {
         let seam = IoSeam::new(201, None, None, None);
@@ -3203,6 +3404,101 @@ mod tests {
                     && reused.generation == key.generation + 1),
             "the harvest freed the slot for reuse with a bumped generation",
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_send_msg_round_trips_sender_and_payload() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let Ok(mut slab) = InflightBufSlab::new(30, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(30, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _ptr)) = seam.allocate_slot(0x9abc) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        let addr = SockAddr::V4(SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 7), 9000));
+        let src = MockBuf::seeded(b"ping");
+        assert!(
+            seam.build_send_msg(key, &src, &addr).is_some(),
+            "a live slot lays out the send header",
+        );
+        assert_eq!(
+            seam.read_msg_sender(key),
+            Some(addr),
+            "the send packed the peer address into the slot",
+        );
+        let mut dst = MockBuf::with_capacity(8);
+        seam.harvest_msg_payload(key, 4, &mut dst);
+        assert_eq!(
+            &dst.data[..4],
+            b"ping",
+            "the payload copies out of the slot"
+        );
+        assert_eq!(dst.bytes_init(), 4);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_recv_msg_lays_out_the_header() {
+        let Ok(mut slab) = InflightBufSlab::new(31, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(31, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _ptr)) = seam.allocate_slot(0xdef0) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        assert!(
+            seam.build_recv_msg(key, 512).is_some(),
+            "a live slot lays out the recv header",
+        );
+        assert_eq!(
+            seam.read_msg_sender(key),
+            None,
+            "no sender is present before the kernel writes one",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_send_msg_rejects_an_oversized_payload() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let Ok(mut slab) = InflightBufSlab::new(32, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(32, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _ptr)) = seam.allocate_slot(0x1357) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        let addr = SockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80));
+        assert!(
+            seam.build_send_msg(key, &MockBuf::oversized(), &addr)
+                .is_none(),
+            "a payload past the slot capacity is refused, not truncated",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn msg_seam_needs_a_slab() {
+        use std::net::{Ipv4Addr, SocketAddrV4};
+        let seam = IoSeam::new(33, None, None, None);
+        let key = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 33,
+            op_token: 0,
+        };
+        let addr = SockAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 80));
+        assert!(
+            seam.build_send_msg(key, &MockBuf::seeded(b"x"), &addr)
+                .is_none(),
+        );
+        assert!(seam.build_recv_msg(key, 128).is_none());
+        assert_eq!(seam.read_msg_sender(key), None);
+        let mut dst = MockBuf::seeded(b"stale");
+        seam.harvest_msg_payload(key, 4, &mut dst);
+        assert_eq!(dst.bytes_init(), 5, "no slab leaves the sink untouched");
     }
 
     #[test]

@@ -7,6 +7,8 @@
 use std::io;
 
 pub(crate) mod file;
+#[cfg(unix)]
+pub(crate) mod msg;
 pub(crate) mod provided;
 pub(crate) mod socket;
 pub(crate) mod zerocopy;

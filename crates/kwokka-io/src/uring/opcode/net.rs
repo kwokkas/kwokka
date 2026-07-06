@@ -9,6 +9,8 @@
     reason = "fd-to-registered-index casts (i32 -> u32) are inherent to the Fixed(fd) io_uring ABI"
 )]
 
+use std::ptr::NonNull;
+
 use io_uring::{
     opcode,
     squeue::Entry,
@@ -129,6 +131,32 @@ pub(crate) fn build_connect(
         opcode::Connect::new(Fixed(fd as u32), ptr, len).build()
     } else {
         opcode::Connect::new(Fd(fd), ptr, len).build()
+    }
+}
+
+/// Build a sendmsg SQE (`io_uring_prep_sendmsg.3`).
+///
+/// The `msghdr` (with its `iovec` and packed address) lives in the caller's
+/// future-pinned in-flight slot and stays valid until the op's CQE.
+pub(crate) fn build_sendmsg(fd: i32, msghdr: NonNull<libc::msghdr>, flags: OpFlags) -> Entry {
+    let ptr = msghdr.as_ptr().cast_const();
+    if flags.fixed_fd {
+        opcode::SendMsg::new(Fixed(fd as u32), ptr).build()
+    } else {
+        opcode::SendMsg::new(Fd(fd), ptr).build()
+    }
+}
+
+/// Build a recvmsg SQE (`io_uring_prep_recvmsg.3`).
+///
+/// The `msghdr` lives in the caller's future-pinned in-flight slot; the kernel
+/// writes the received address and control data into it, valid until the CQE.
+pub(crate) fn build_recvmsg(fd: i32, msghdr: NonNull<libc::msghdr>, flags: OpFlags) -> Entry {
+    let ptr = msghdr.as_ptr();
+    if flags.fixed_fd {
+        opcode::RecvMsg::new(Fixed(fd as u32), ptr).build()
+    } else {
+        opcode::RecvMsg::new(Fd(fd), ptr).build()
     }
 }
 
