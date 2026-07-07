@@ -35,13 +35,15 @@ const IOVEC_OFFSET: usize = size_of::<libc::msghdr>();
 /// Byte offset of the address region within the slot.
 const ADDR_OFFSET: usize = IOVEC_OFFSET + size_of::<libc::iovec>();
 
-/// Bytes reserved for the address region: a `sockaddr_storage`-compatible span
-/// matching [`SockAddr::pack_into`](crate::addr::SockAddr::pack_into)'s buffer.
-const ADDR_LEN: usize = 128;
-
 /// The `msg_namelen` a recv submits: the full address capacity offered to the
-/// kernel as an out-parameter.
+/// kernel as an out-parameter, and the single source for the address-region
+/// width (a `u32` because the widening to `ADDR_LEN`'s `usize` cannot truncate).
 const RECV_NAMELEN: u32 = 128;
+
+/// Bytes reserved for the address region: a `sockaddr_storage`-compatible span
+/// matching [`SockAddr::pack_into`](crate::addr::SockAddr::pack_into)'s buffer,
+/// derived from `RECV_NAMELEN` so the two cannot drift.
+const ADDR_LEN: usize = RECV_NAMELEN as usize;
 
 /// Byte offset of the payload within the slot.
 const PAYLOAD_OFFSET: usize = ADDR_OFFSET + ADDR_LEN;

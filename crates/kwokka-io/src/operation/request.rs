@@ -64,8 +64,6 @@ pub enum OpPayload<B> {
     Socket {
         /// Remote address to connect to.
         addr: SockAddr,
-        /// Unused by connect; kept for the shared payload shape.
-        buf: Option<B>,
     },
     /// Send or receive a datagram via a pre-built `libc::msghdr`.
     ///
@@ -271,7 +269,7 @@ impl IoRequest<()> {
 
     /// Connect `fd` to `addr`.
     pub fn connect(fd: i32, addr: SockAddr) -> Self {
-        Self::build(fd, OpCode::Connect, OpPayload::Socket { addr, buf: None })
+        Self::build(fd, OpCode::Connect, OpPayload::Socket { addr })
     }
 
     /// Send a pre-built message over `fd` (`sendmsg`).

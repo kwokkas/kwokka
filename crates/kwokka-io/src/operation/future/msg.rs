@@ -136,6 +136,9 @@ impl<B: IoBuf> Future for SendMsgFuture<B> {
         } else {
             // No seam, no slab, oversized, or the submit failed; resolve with
             // -EINVAL rather than hang on the test-seam / unsupported path.
+            // Clear the buffer so a repeat poll hits the documented panic
+            // instead of re-attempting the submit and double-sending.
+            this.buf = None;
             Poll::Ready(bytes_from_cqe(-22))
         }
     }
@@ -360,6 +363,28 @@ mod tests {
             panic!("the freed slot reallocates");
         };
         assert_eq!(key.slot, 0, "the first poll returned the slot it allocated");
+    }
+
+    #[test]
+    #[should_panic(expected = "SendMsgFuture polled after resolving")]
+    fn send_msg_fuses_after_a_failed_submit() {
+        let binding = poll_binding();
+        let seam = IoSeam::new(binding.worker_id, None, None, None);
+        let _guard = SeamGuard::install(&seam);
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        let mut future = pin!(SendMsgFuture::new(
+            5,
+            peer(),
+            FixedBuf::new(*b"payload!", 4)
+        ));
+        let Poll::Ready(result) = future.as_mut().poll(&mut cx) else {
+            panic!("a driverless seam resolves the send immediately");
+        };
+        assert!(result.is_err(), "the refused submit maps to an error");
+        // The failed submit fused the future; a repeat poll panics instead of
+        // silently re-submitting and double-sending the datagram.
+        drop(future.as_mut().poll(&mut cx));
     }
 
     #[test]

@@ -70,7 +70,7 @@ pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) 
         (OpCode::RecvProvided, OpPayload::Fd) => {
             net::build_recv_provided(request.fd, request.common.buf_group, request.flags)
         }
-        (OpCode::Connect, OpPayload::Socket { addr, .. }) => {
+        (OpCode::Connect, OpPayload::Socket { addr }) => {
             net::build_connect(request.fd, addr, &mut scratch.addr, request.flags)
         }
         (OpCode::Close, OpPayload::Fd) => sync::build_close(request.fd),
