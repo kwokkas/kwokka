@@ -8,6 +8,9 @@
     reason = "pub(crate) satisfies unreachable_pub on this private module"
 )]
 
+#[cfg(unix)]
+use std::ptr::NonNull;
+
 use crate::{
     addr::SockAddr,
     buffer::slot::BufGroupId,
@@ -57,12 +60,20 @@ pub enum OpPayload<B> {
         /// File offset for read/write; 0 for socket ops.
         offset: u64,
     },
-    /// Socket operation with an address (connect, sendmsg, recvmsg, accept).
+    /// Socket operation with an address (connect).
     Socket {
-        /// Remote address for connect/sendmsg; local for accept.
+        /// Remote address to connect to.
         addr: SockAddr,
-        /// Optional buffer for sendmsg/recvmsg; `None` for accept/connect.
-        buf: Option<B>,
+    },
+    /// Send or receive a datagram via a pre-built `libc::msghdr`.
+    ///
+    /// The `msghdr`, its `iovec`, and the packed address all live in one
+    /// worker in-flight slot (`operation::core::msghdr`); this variant
+    /// carries only the pointer into that slot, never owned bytes.
+    #[cfg(unix)]
+    Msg {
+        /// Pointer to the `msghdr` staged in the worker's in-flight slot.
+        msghdr: NonNull<libc::msghdr>,
     },
     /// Splice/tee data transfer between file descriptors.
     Splice {
@@ -188,11 +199,6 @@ impl<B: IoBufMut> IoRequest<B> {
         Self::recv(fd, buf).with_multishot()
     }
 
-    /// Receive a message with ancillary data from `fd` into `buf`.
-    pub fn recvmsg(fd: i32, buf: B) -> Self {
-        Self::build(fd, OpCode::Recvmsg, OpPayload::Buffer { buf, offset: 0 })
-    }
-
     /// Vectored read from `fd` into `buf` at `offset`.
     pub fn readv(fd: i32, buf: B, offset: u64) -> Self {
         let mut request = Self::build(fd, OpCode::Read, OpPayload::Buffer { buf, offset });
@@ -219,18 +225,6 @@ impl<B: IoBuf> IoRequest<B> {
     /// posts a notification completion once the kernel has released it.
     pub fn send_zc(fd: i32, buf: B) -> Self {
         Self::build(fd, OpCode::SendZc, OpPayload::Buffer { buf, offset: 0 })
-    }
-
-    /// Send `buf` to `addr` over `fd`.
-    pub fn sendmsg(fd: i32, addr: SockAddr, buf: B) -> Self {
-        Self::build(
-            fd,
-            OpCode::Sendmsg,
-            OpPayload::Socket {
-                addr,
-                buf: Some(buf),
-            },
-        )
     }
 
     /// Vectored write of `buf` to `fd` at `offset`.
@@ -275,7 +269,25 @@ impl IoRequest<()> {
 
     /// Connect `fd` to `addr`.
     pub fn connect(fd: i32, addr: SockAddr) -> Self {
-        Self::build(fd, OpCode::Connect, OpPayload::Socket { addr, buf: None })
+        Self::build(fd, OpCode::Connect, OpPayload::Socket { addr })
+    }
+
+    /// Send a pre-built message over `fd` (`sendmsg`).
+    ///
+    /// The `msghdr` and its backing bytes live in the caller's future-pinned
+    /// in-flight slot, so this carries only the pointer.
+    #[cfg(unix)]
+    pub(crate) fn sendmsg_prepared(fd: i32, msghdr: NonNull<libc::msghdr>) -> Self {
+        Self::build(fd, OpCode::Sendmsg, OpPayload::Msg { msghdr })
+    }
+
+    /// Receive a message on `fd` into a pre-built `msghdr` (`recvmsg`).
+    ///
+    /// The `msghdr` and its backing bytes live in the caller's future-pinned
+    /// in-flight slot, so this carries only the pointer.
+    #[cfg(unix)]
+    pub(crate) fn recvmsg_prepared(fd: i32, msghdr: NonNull<libc::msghdr>) -> Self {
+        Self::build(fd, OpCode::Recvmsg, OpPayload::Msg { msghdr })
     }
 
     /// Close `fd`.
@@ -534,6 +546,32 @@ mod tests {
         let request = IoRequest::<()>::connect(3, addr);
         assert_eq!(request.opcode, OpCode::Connect);
         assert_eq!(request.fd, 3);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sendmsg_prepared_sets_msg_payload() {
+        let msghdr = NonNull::dangling();
+        let request = IoRequest::sendmsg_prepared(5, msghdr);
+        assert_eq!(request.opcode, OpCode::Sendmsg);
+        assert_eq!(request.fd, 5);
+        assert!(matches!(
+            request.payload,
+            OpPayload::Msg { msghdr: ptr } if ptr == msghdr
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recvmsg_prepared_sets_msg_payload() {
+        let msghdr = NonNull::dangling();
+        let request = IoRequest::recvmsg_prepared(6, msghdr);
+        assert_eq!(request.opcode, OpCode::Recvmsg);
+        assert_eq!(request.fd, 6);
+        assert!(matches!(
+            request.payload,
+            OpPayload::Msg { msghdr: ptr } if ptr == msghdr
+        ));
     }
 
     #[test]

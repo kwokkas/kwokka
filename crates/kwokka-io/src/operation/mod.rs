@@ -8,6 +8,8 @@ pub(crate) mod request;
 pub use core::{FixedBuf, InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, SubmitResult, SubmitToken};
 
 pub use completion::{Completion, CqeFlags};
+#[cfg(unix)]
+pub use future::msg::{RecvMsgFuture, SendMsgFuture};
 pub use future::{
     file::{FileReadFuture, FileWriteFuture},
     provided::ProvidedRecvFuture,

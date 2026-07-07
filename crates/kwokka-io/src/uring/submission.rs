@@ -56,10 +56,10 @@ impl SubmitScratch {
 
 /// Build an `io_uring` SQE from an [`IoRequest`] with no buffer.
 ///
-/// Handles accept, connect, close, Group B socket ops, and all
-/// driver-internal ops (timeout, cancel, `msg_ring`, poll). The
-/// caller must keep `scratch` alive until the SQE is submitted
-/// to the ring.
+/// Handles accept, connect, sendmsg, recvmsg, close, Group B socket
+/// ops, and all driver-internal ops (timeout, cancel, `msg_ring`,
+/// poll). The caller must keep `scratch` alive until the SQE is
+/// submitted to the ring.
 ///
 /// # Panics
 ///
@@ -70,7 +70,7 @@ pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) 
         (OpCode::RecvProvided, OpPayload::Fd) => {
             net::build_recv_provided(request.fd, request.common.buf_group, request.flags)
         }
-        (OpCode::Connect, OpPayload::Socket { addr, .. }) => {
+        (OpCode::Connect, OpPayload::Socket { addr }) => {
             net::build_connect(request.fd, addr, &mut scratch.addr, request.flags)
         }
         (OpCode::Close, OpPayload::Fd) => sync::build_close(request.fd),
@@ -126,6 +126,12 @@ pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) 
                 protocol,
             },
         ) => net::build_socket(*domain, *socket_type, *protocol),
+        (OpCode::Sendmsg, OpPayload::Msg { msghdr }) => {
+            net::build_sendmsg(request.fd, *msghdr, request.flags)
+        }
+        (OpCode::Recvmsg, OpPayload::Msg { msghdr }) => {
+            net::build_recvmsg(request.fd, *msghdr, request.flags)
+        }
         (opcode, _) => panic!("unsupported opcode {opcode:?} in build_entry"),
     };
     apply_common(entry, &request.common, request.flags)
@@ -264,6 +270,20 @@ mod tests {
     #[test]
     fn accept_builds_without_panic() {
         let request = IoRequest::<()>::accept(3).with_user_data(42);
+        let _entry = build_entry(&request, &mut scratch());
+    }
+
+    #[test]
+    fn sendmsg_builds_without_panic() {
+        let msghdr = std::ptr::NonNull::dangling();
+        let request = IoRequest::sendmsg_prepared(3, msghdr);
+        let _entry = build_entry(&request, &mut scratch());
+    }
+
+    #[test]
+    fn recvmsg_builds_without_panic() {
+        let msghdr = std::ptr::NonNull::dangling();
+        let request = IoRequest::recvmsg_prepared(3, msghdr);
         let _entry = build_entry(&request, &mut scratch());
     }
 
