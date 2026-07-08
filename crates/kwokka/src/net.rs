@@ -31,3 +31,5 @@
 pub use kwokka_net::tcp::{FixedBuf, ProvidedBuf, TcpListener, TcpStream};
 #[cfg(unix)]
 pub use kwokka_net::udp::UdpSocket;
+#[cfg(unix)]
+pub use kwokka_net::unix::{UnixListener, UnixStream};

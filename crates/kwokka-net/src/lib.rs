@@ -9,9 +9,13 @@
 //!
 //! [`tcp::TcpListener`] binds a stream endpoint whose raw fd feeds the accept
 //! op; [`udp::UdpSocket`] binds a datagram endpoint driving `sendmsg` /
-//! `recvmsg`.
+//! `recvmsg`; [`unix::UnixListener`] binds a stream endpoint at a filesystem
+//! path, reusing the accept / recv / send ops over the Unix fd.
 
 pub mod tcp;
 
 #[cfg(unix)]
 pub mod udp;
+
+#[cfg(unix)]
+pub mod unix;

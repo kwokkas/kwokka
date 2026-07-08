@@ -7,12 +7,13 @@
 //! resolves into, and [`FixedBuf`], the owned partial-length source the
 //! buffer-generic `send_buf` accepts.
 
-mod accept;
+pub mod accept;
 mod connect;
 mod listener;
 mod recv;
 mod stream;
 
+pub(crate) use accept::AcceptFuture;
 pub use accept::AcceptStream;
 pub use kwokka_io::operation::{FixedBuf, ProvidedBuf};
 pub use listener::TcpListener;
