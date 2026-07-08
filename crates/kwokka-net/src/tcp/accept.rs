@@ -42,7 +42,7 @@ use crate::tcp::TcpStream;
 /// `user_data` round trip decodes the polling task from the waker, so
 /// await it directly.
 #[must_use = "futures do nothing unless polled"]
-pub(super) struct AcceptFuture {
+pub(crate) struct AcceptFuture {
     /// Listening socket file descriptor.
     fd: i32,
     /// The worker and token the accept submitted under, once in flight. `Some`
