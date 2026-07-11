@@ -6,6 +6,7 @@ resolver = "3"
 members = [
     "crates/kwokka",
     "crates/kwokka-core",
+    "crates/kwokka-ensemble",
     "crates/kwokka-fs",
     "crates/kwokka-io",
     "crates/kwokka-ir",
@@ -34,6 +35,7 @@ homepage = "https://kwokka.dev"
 # from the registry (which would deadlock the publish order).
 kwokka = { path = "crates/kwokka" }
 kwokka-core = { path = "crates/kwokka-core", version = "0.0.1" }
+kwokka-ensemble = { path = "crates/kwokka-ensemble", version = "0.0.1" }
 kwokka-fs = { path = "crates/kwokka-fs", version = "0.0.2" }
 kwokka-io = { path = "crates/kwokka-io", version = "0.0.1" }
 kwokka-ir = { path = "crates/kwokka-ir", version = "0.0.1" }
