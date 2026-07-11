@@ -22,5 +22,4 @@ pub mod uring;
 pub use addr::{AddrError, AddressFamily, SockAddr, UnixAddr};
 pub use buffer::MAX_INLINE_CAP;
 pub use capability::{CapabilityMatrix, KernelVersion};
-pub use driver::wake;
-pub use driver::{CancelError, DriverType, IoDriver, RegisterError};
+pub use driver::{CancelError, DriverType, IoDriver, RegisterError, wake};
