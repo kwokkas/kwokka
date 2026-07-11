@@ -115,6 +115,10 @@ name = "kwokka-core"
 version = "0.0.1"
 
 [[package]]
+name = "kwokka-ensemble"
+version = "0.0.1"
+
+[[package]]
 name = "kwokka-fs"
 version = "0.0.2"
 dependencies = [

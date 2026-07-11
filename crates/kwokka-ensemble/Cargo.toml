@@ -1,0 +1,15 @@
+[package]
+name = "kwokka-ensemble"
+version = "0.0.1"
+description = "orchestration layer for kwokka"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords = ["async", "runtime", "orchestration", "kwokka"]
+categories = ["asynchronous", "concurrency"]
+
+[lints]
+workspace = true
