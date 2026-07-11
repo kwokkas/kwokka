@@ -6,7 +6,3 @@
 //! decorates execution with retry, breaker, limiter, and timeout policies. The
 //! crate consumes the typed IR from `kwokka-ir` and drives it on the kwokka
 //! runtime.
-
-pub mod error;
-
-pub use error::EnsembleError;
