@@ -1,6 +1,7 @@
 //! The conductor DAG: read-side views over a validated blob, and the
 //! write-side description a caller hands the encoder.
 
+mod check;
 mod draft;
 mod edge;
 mod spec;
