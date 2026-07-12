@@ -44,7 +44,7 @@ use crate::{
         park::wake::wake_local,
         queue::reap,
         registry,
-        shard::WorkerShard,
+        shard::state::WorkerShard,
     },
 };
 #[cfg(feature = "steal")]

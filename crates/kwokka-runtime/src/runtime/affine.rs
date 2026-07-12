@@ -30,7 +30,7 @@ use crate::{
         handle::Runtime,
     },
     task::Affine,
-    worker::{WorkerId, cycle::Tick, park::wake::wake_local, registry, shard::WorkerShard},
+    worker::{WorkerId, cycle::Tick, park::wake::wake_local, registry, shard::state::WorkerShard},
 };
 
 /// One multi-worker affine runtime per process: the crew shares the

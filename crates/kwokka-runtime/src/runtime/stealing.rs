@@ -47,7 +47,7 @@ use crate::{
         handle::Runtime,
     },
     task::Stealing,
-    worker::{WorkerId, cycle::Tick, registry, shard::WorkerShard},
+    worker::{WorkerId, cycle::Tick, registry, shard::state::WorkerShard},
 };
 #[cfg(feature = "steal")]
 use crate::{scheduler::stealing::handoff, worker::park::wake::wake_or_forward};
