@@ -10,7 +10,7 @@ use kwokka_core::slab::{Slab, SlabKey};
 use kwokka_io::DriverType;
 
 use crate::{
-    scheduler::queue::LocalRunQueue,
+    scheduler::runnable::queue::LocalRunQueue,
     task::{TaskRef, cell::slot::TaskSlot},
 };
 #[cfg(feature = "steal")]
@@ -95,8 +95,11 @@ mod tests {
 
     use super::wake_local;
     use crate::{
-        scheduler::{dispatch::spawn_insert, queue::LocalRunQueue},
-        task::{cell::slot::TaskSlot, state::TaskState},
+        scheduler::runnable::queue::LocalRunQueue,
+        task::{
+            cell::{lifecycle::spawn_insert, slot::TaskSlot},
+            state::TaskState,
+        },
     };
 
     struct Pending;

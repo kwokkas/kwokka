@@ -1,4 +1,5 @@
-//! Task spawn-insert and poll dispatch over the per-worker slab.
+//! The life of a task cell: insertion into the per-worker slab, then each poll
+//! that drives its state machine forward.
 
 #![allow(
     clippy::redundant_pub_crate,

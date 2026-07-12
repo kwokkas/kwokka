@@ -12,7 +12,7 @@ use kwokka_core::slab::{Slab, SlabKey};
 
 use crate::{
     scheduler::{
-        queue::LocalRunQueue,
+        runnable::queue::LocalRunQueue,
         stealing::relocate::{
             ForwardTable, HandoffMsg, StealRequest, move_in, move_out, move_out_woken,
         },

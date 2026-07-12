@@ -1,4 +1,4 @@
-//! Scheduler primitives -- local run queue and dispatch.
+//! Scheduler primitives -- where a runnable task waits and who may run it.
 
 #![allow(
     clippy::redundant_pub_crate,
@@ -7,7 +7,6 @@
 
 #[cfg(target_os = "linux")]
 pub(crate) mod affine;
-pub(crate) mod dispatch;
-pub(crate) mod queue;
+pub(crate) mod runnable;
 #[cfg(feature = "steal")]
 pub(crate) mod stealing;

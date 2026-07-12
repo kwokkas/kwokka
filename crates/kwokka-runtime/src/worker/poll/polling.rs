@@ -33,10 +33,13 @@ use kwokka_io::{
 };
 
 use crate::{
-    scheduler::dispatch::{PollOutcome, poll_task},
     task::{
         TaskRef,
-        cell::{header::WakeData, slot::TaskSlot},
+        cell::{
+            header::WakeData,
+            lifecycle::{PollOutcome, poll_task},
+            slot::TaskSlot,
+        },
         waker::waker_from_task_ref,
     },
     worker::{
