@@ -1,4 +1,4 @@
-//! Queueing a cancel from a dropped future onto its owning worker.
+//! Queues a cancel from a dropped future onto its owning worker.
 
 use crate::{
     boundary::cancel::{
