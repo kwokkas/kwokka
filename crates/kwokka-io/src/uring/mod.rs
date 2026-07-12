@@ -1,14 +1,8 @@
 //! `io_uring` backend for Linux 6.0+.
 
-pub(crate) mod cancel;
-pub(crate) mod completion;
-pub(crate) mod driver;
-pub(crate) mod fixed;
-pub(crate) mod linked;
-pub(crate) mod multishot;
+pub(crate) mod backend;
+pub(crate) mod cqe;
 pub(crate) mod opcode;
 pub(crate) mod setup;
-pub(crate) mod submission;
-pub(crate) mod wake;
 
-pub use driver::UringDriver;
+pub use backend::UringDriver;

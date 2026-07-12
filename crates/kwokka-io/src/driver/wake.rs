@@ -7,7 +7,9 @@
 //! native wake primitive lands with the backend.
 
 #[cfg(target_os = "linux")]
-pub use crate::uring::wake::{WAKE_FD_USER_DATA, close_wake_fd, create_wake_fd, signal_wake_fd};
+pub use crate::uring::backend::wake::{
+    WAKE_FD_USER_DATA, close_wake_fd, create_wake_fd, signal_wake_fd,
+};
 
 #[cfg(not(target_os = "linux"))]
 mod inert {

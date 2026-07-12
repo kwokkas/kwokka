@@ -8,7 +8,7 @@
 use std::{io, time::Duration};
 
 #[cfg(target_os = "linux")]
-use crate::uring::driver::UringDriver;
+use crate::uring::backend::UringDriver;
 use crate::{
     CancelError, IoDriver, RegisterError,
     buffer::{
