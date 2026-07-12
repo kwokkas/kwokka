@@ -4,9 +4,13 @@
 mod affine;
 mod bootstrap;
 mod builder;
+mod completion;
 mod crew;
 mod handle;
 mod probe;
+mod root;
+#[cfg(feature = "steal")]
+mod steal;
 mod stealing;
 
 pub use builder::RuntimeBuilder;
