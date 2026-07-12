@@ -25,8 +25,12 @@ use crate::scheduler::stealing::relocate::ForwardTable;
 #[cfg(feature = "steal")]
 use crate::worker::park::wake::wake_or_forward;
 use crate::{
-    scheduler::{dispatch::PollOutcome, queue::LocalRunQueue},
-    task::{TaskRef, cell::slot::TaskSlot, join::children::push_child},
+    scheduler::runnable::queue::LocalRunQueue,
+    task::{
+        TaskRef,
+        cell::{lifecycle::PollOutcome, slot::TaskSlot},
+        join::children::push_child,
+    },
     timer::wheel::{TimerWheel, clock::Clock},
     worker::{
         WorkerId,
@@ -212,9 +216,9 @@ mod tests {
 
     use super::{Tick, drain_spawns, tick};
     use crate::{
-        scheduler::{dispatch::spawn_insert, queue::LocalRunQueue},
+        scheduler::runnable::queue::LocalRunQueue,
         task::{
-            cell::{header::Slot, slot::TaskSlot},
+            cell::{header::Slot, lifecycle::spawn_insert, slot::TaskSlot},
             join::children::iter_children,
             state::TaskState,
         },
