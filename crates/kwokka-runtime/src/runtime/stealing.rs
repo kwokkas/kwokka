@@ -45,6 +45,7 @@ use crate::{
         bootstrap,
         crew::{Crew, CrewKind, MAX_WORKERS, sibling_id},
         handle::Runtime,
+        root,
     },
     task::Stealing,
     worker::{WorkerId, cycle::Tick, registry, shard::state::WorkerShard},
@@ -412,18 +413,18 @@ impl Runtime<Stealing> {
         // The pool outlives this run (it is driver-owned); the guard scopes
         // handle access to the run-loop, clearing the slot on exit.
         let _pool_guard = ProvidedPoolGuard::install(worker_id, &self.shard.driver);
-        let root_key = bootstrap::spawn_root(&mut self.shard, future);
+        let root_key = root::spawn_root(&mut self.shard, future);
         bootstrap::arm_wake(&self.shard, self.wake_fd);
         loop {
             let outcome = bootstrap::run_pass(&mut self.shard, self.wake_fd);
-            if bootstrap::root_settled(&self.shard, root_key) {
+            if root::root_settled(&self.shard, root_key) {
                 break;
             }
             if outcome == Tick::Idle {
                 park_bracketed(&mut self.shard);
             }
         }
-        bootstrap::take_root_output::<F::Output>(&mut self.shard, root_key)
+        root::take_root_output::<F::Output>(&mut self.shard, root_key)
     }
 }
 
