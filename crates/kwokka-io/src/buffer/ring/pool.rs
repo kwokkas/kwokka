@@ -231,7 +231,7 @@ impl ProvidedBuf {
         let Some(buf_id) = self.buf_id else {
             return &[];
         };
-        let Some(pool) = boundary::seam::provided_pool(self.worker_id, self.epoch) else {
+        let Some(pool) = boundary::seam::pool::provided_pool(self.worker_id, self.epoch) else {
             panic!("ProvidedBuf accessed outside its runtime's run-loop");
         };
         // SAFETY: Invariant -- a `Some` from `provided_pool` names the live
@@ -267,7 +267,7 @@ impl Drop for ProvidedBuf {
         // The run-loop exited or a later registration owns the slot: the pool
         // unmaps (or already did) with the id checked out -- a bounded loss of
         // one entry, never a push into a reclaimed ring.
-        let Some(pool) = boundary::seam::provided_pool(self.worker_id, self.epoch) else {
+        let Some(pool) = boundary::seam::pool::provided_pool(self.worker_id, self.epoch) else {
             return;
         };
         // SAFETY: Invariant -- a `Some` from `provided_pool` names the live
@@ -428,7 +428,7 @@ mod tests {
             panic!("pool creation must succeed");
         };
         let _guard = boundary::ProvidedPoolGuard::install_pool(worker_id, Some(&pool));
-        let epoch = boundary::seam::provided_pool_epoch(worker_id);
+        let epoch = boundary::seam::pool::provided_pool_epoch(worker_id);
         let view = ProvidedBuf::new(worker_id, epoch, 2, 16);
         assert_eq!(view.len(), 16, "the view spans the kernel-confirmed count");
         assert_eq!(
@@ -452,7 +452,7 @@ mod tests {
         let worker_id = 221;
         let view = ProvidedBuf::new(
             worker_id,
-            boundary::seam::provided_pool_epoch(worker_id),
+            boundary::seam::pool::provided_pool_epoch(worker_id),
             0,
             8,
         );
@@ -469,7 +469,7 @@ mod tests {
             panic!("pool creation must succeed");
         };
         let _guard = boundary::ProvidedPoolGuard::install_pool(worker_id, Some(&pool));
-        let stale = boundary::seam::provided_pool_epoch(worker_id).wrapping_sub(1);
+        let stale = boundary::seam::pool::provided_pool_epoch(worker_id).wrapping_sub(1);
         let view = ProvidedBuf::new(worker_id, stale, 0, 8);
         // The slot is installed, but the handle predates this registration;
         // reading through the wrong pool must be refused.
@@ -481,7 +481,7 @@ mod tests {
         let worker_id = 223;
         let view = ProvidedBuf::new(
             worker_id,
-            boundary::seam::provided_pool_epoch(worker_id),
+            boundary::seam::pool::provided_pool_epoch(worker_id),
             1,
             8,
         );

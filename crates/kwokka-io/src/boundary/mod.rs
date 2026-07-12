@@ -32,15 +32,24 @@ pub use cancel::{
     is_msg_ring_wake, is_multishot_sentinel, is_recv_multishot_sentinel,
 };
 pub use seam::{
-    IoSeam, MultishotAlloc, MultishotCompletion, MultishotNext, ProvidedPoolGuard,
-    RecvMultishotAlloc, RecvMultishotNext, SeamGuard, WakeSlot, WakerBinding, WakerDecoder,
-    adopt_accepted_fd, create_datagram_socket, create_stream_socket, decode_waker,
-    dispose_cancelled_accept, dispose_cancelled_connect, dispose_cancelled_op, mark_notif_expected,
-    push_accept_cancel_for_worker, push_cancel_for_worker, push_connect_cancel_for_worker,
-    push_multishot_cancel_for_worker, push_multishot_completion,
-    push_provided_recv_cancel_for_worker, push_recv_multishot_cancel_for_worker,
-    push_recv_multishot_completion, reclaim_cancel_completion, reclaim_dropped_slot, reclaim_notif,
-    register_decoder, resolve_provided_recv, submit_accept_cancel, submit_cancel,
-    submit_cancel_for, submit_connect_cancel, submit_multishot_cancel, submit_provided_recv_cancel,
-    submit_recv_multishot_cancel,
+    cancel::{
+        push_accept_cancel_for_worker, push_cancel_for_worker, push_connect_cancel_for_worker,
+        push_multishot_cancel_for_worker, push_provided_recv_cancel_for_worker,
+        push_recv_multishot_cancel_for_worker,
+    },
+    drain::{
+        MultishotCompletion, dispose_cancelled_accept, dispose_cancelled_connect,
+        dispose_cancelled_op, mark_notif_expected, push_multishot_completion,
+        push_recv_multishot_completion, reclaim_cancel_completion, reclaim_dropped_slot,
+        reclaim_notif, submit_accept_cancel, submit_cancel, submit_cancel_for,
+        submit_connect_cancel, submit_multishot_cancel, submit_provided_recv_cancel,
+        submit_recv_multishot_cancel,
+    },
+    pool::{ProvidedPoolGuard, resolve_provided_recv},
+    socket::{adopt_accepted_fd, create_datagram_socket, create_stream_socket},
+    state::{
+        IoSeam, MultishotAlloc, MultishotNext, RecvMultishotAlloc, RecvMultishotNext, SeamGuard,
+        WakeSlot,
+    },
+    waker::{WakerBinding, WakerDecoder, decode_waker, register_decoder},
 };
