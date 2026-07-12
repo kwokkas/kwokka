@@ -12,8 +12,8 @@ use crate::uring::driver::UringDriver;
 use crate::{
     CancelError, IoDriver, RegisterError,
     buffer::{
+        registration::slot::{BufGroupId, FdSlot},
         ring::pool::BufRingPool,
-        slot::{BufGroupId, FdSlot},
     },
     capability::CapabilityMatrix,
     operation::{Completion, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},

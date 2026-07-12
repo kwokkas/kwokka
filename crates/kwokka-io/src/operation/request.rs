@@ -13,7 +13,7 @@ use std::ptr::NonNull;
 
 use crate::{
     addr::SockAddr,
-    buffer::slot::BufGroupId,
+    buffer::registration::slot::BufGroupId,
     operation::{IoBuf, IoBufMut, OpCode, OpFlags, SubmitToken},
 };
 
@@ -502,8 +502,10 @@ mod tests {
 
     #[test]
     fn recv_multishot_provided_sets_flags() {
-        let request =
-            IoRequest::<()>::recv_multishot_provided(3, crate::buffer::slot::BufGroupId::new(0));
+        let request = IoRequest::<()>::recv_multishot_provided(
+            3,
+            crate::buffer::registration::slot::BufGroupId::new(0),
+        );
         assert!(request.flags.multishot, "the multishot flag is set");
         assert!(request.flags.buffer_select, "the buffer-select flag is set");
         assert_eq!(

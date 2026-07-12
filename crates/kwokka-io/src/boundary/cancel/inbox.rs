@@ -12,7 +12,9 @@
 
 use std::io;
 
-use crate::buffer::{inflight::InflightSlotKey, mmap::MmapRegion, multishot::RecvMultishotSlotKey};
+use crate::buffer::{
+    multishot::RecvMultishotSlotKey, oneshot::inflight::InflightSlotKey, storage::mmap::MmapRegion,
+};
 
 /// Per-worker cancel-inbox capacity.
 ///
@@ -27,7 +29,8 @@ use crate::buffer::{inflight::InflightSlotKey, mmap::MmapRegion, multishot::Recv
 /// structural drop bound lossless. Overflow keeps its established meaning --
 /// the cancel record is lost, a bounded leak (a slot held to teardown, a
 /// descriptor, or a pool buffer id), never a free under a live kernel access.
-pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
+pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::oneshot::inflight::DEFAULT_INFLIGHT_CAP
+    as usize
     + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
 
 /// Fixed-capacity ring of pending cancels for dropped buffered futures.
@@ -341,7 +344,7 @@ impl<const N: usize> Default for AcceptCancelSet<N> {
 /// provided-buffer ring itself -- at most every pool entry can be awaiting
 /// disposal at once -- at 8 bytes per slot on the shard.
 pub const PROVIDED_RECV_CANCEL_CAPACITY: usize =
-    crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize;
+    crate::buffer::oneshot::inflight::DEFAULT_INFLIGHT_CAP as usize;
 
 /// [`InflightSlotKey`] `slot` marker for a slotless provided-recv cancel.
 ///
@@ -542,7 +545,7 @@ mod tests {
 
     #[test]
     fn cancel_inbox_capacity_covers_both_slabs() {
-        let droppable = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
+        let droppable = crate::buffer::oneshot::inflight::DEFAULT_INFLIGHT_CAP as usize
             + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
         assert!(
             CANCEL_INBOX_CAPACITY >= droppable,

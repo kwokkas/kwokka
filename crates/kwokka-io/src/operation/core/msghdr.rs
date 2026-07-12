@@ -24,7 +24,7 @@
 
 use std::ptr::NonNull;
 
-use crate::{addr::SockAddr, buffer::inflight::INFLIGHT_BUF_STRIDE};
+use crate::{addr::SockAddr, buffer::oneshot::inflight::INFLIGHT_BUF_STRIDE};
 
 /// Slot width in bytes, as a `usize` for the array types below.
 const SLOT_LEN: usize = INFLIGHT_BUF_STRIDE as usize;

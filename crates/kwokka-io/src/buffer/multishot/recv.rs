@@ -30,7 +30,7 @@
 
 use std::io;
 
-use crate::buffer::{mmap::MmapRegion, multishot::MULTISHOT_FIFO_DEPTH};
+use crate::buffer::{multishot::MULTISHOT_FIFO_DEPTH, storage::mmap::MmapRegion};
 
 /// Default multishot recv slots per worker.
 ///

@@ -13,6 +13,7 @@ mod buffer;
 pub(crate) mod msghdr;
 mod op;
 mod token;
+pub(crate) mod vectored;
 
 pub use buffer::{FixedBuf, InlineBuf, IoBuf, IoBufMut};
 pub use op::{OpCode, OpFlags};

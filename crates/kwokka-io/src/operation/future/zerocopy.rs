@@ -20,7 +20,7 @@ use std::io;
 
 use crate::{
     boundary::{self, IoSeam},
-    buffer::inflight::InflightSlotKey,
+    buffer::oneshot::inflight::InflightSlotKey,
     operation::{
         CqeFlags, InlineBuf, IoBuf, IoBufMut, IoRequest, SubmitResult, future::bytes_from_cqe,
     },
@@ -325,7 +325,7 @@ mod tests {
             CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, SeamGuard, WakeSlot,
             WakerBinding, WakerDecoder, decode_waker, register_decoder,
         },
-        buffer::inflight::InflightBufSlab,
+        buffer::oneshot::inflight::InflightBufSlab,
         operation::FixedBuf,
     };
 

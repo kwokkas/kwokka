@@ -40,11 +40,11 @@ use crate::{
         is_multishot_sentinel, multishot_sentinel_generation, multishot_sentinel_slot,
     },
     buffer::{
-        inflight::{INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
         multishot::{
             MultishotPush, MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotPush,
             RecvMultishotSlab, RecvMultishotSlotKey,
         },
+        oneshot::inflight::{INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
         ring::pool::{BufRingPool, ProvidedBuf},
     },
     operation::{CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
@@ -3906,7 +3906,7 @@ mod tests {
         let Ok(pool) = crate::buffer::ring::pool::BufRingPool::new(
             4,
             64,
-            crate::buffer::slot::BufGroupId::new(0),
+            crate::buffer::registration::slot::BufGroupId::new(0),
         ) else {
             panic!("pool creation must succeed");
         };

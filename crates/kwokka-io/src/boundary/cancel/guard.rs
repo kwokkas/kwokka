@@ -145,7 +145,7 @@ mod tests {
     use super::*;
     use crate::{
         boundary::{push_cancel_for_worker, push_recv_multishot_cancel_for_worker},
-        buffer::{inflight::InflightSlotKey, multishot::RecvMultishotSlotKey},
+        buffer::{multishot::RecvMultishotSlotKey, oneshot::inflight::InflightSlotKey},
     };
 
     #[test]

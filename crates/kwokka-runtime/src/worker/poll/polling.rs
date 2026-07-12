@@ -27,8 +27,8 @@ use kwokka_io::{
     DriverType,
     boundary::{IoSeam, SeamGuard, WakeSlot},
     buffer::{
-        inflight::InflightBufSlab,
         multishot::{MultishotSlab, RecvMultishotSlab},
+        oneshot::inflight::InflightBufSlab,
     },
 };
 

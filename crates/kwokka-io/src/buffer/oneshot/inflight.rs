@@ -22,7 +22,7 @@
 
 use std::io;
 
-use crate::buffer::mmap::MmapRegion;
+use crate::buffer::storage::mmap::MmapRegion;
 
 /// Per-slot byte capacity; a buffered future's `CAP` must not exceed this.
 pub(crate) const INFLIGHT_BUF_STRIDE: u32 = 4096;
