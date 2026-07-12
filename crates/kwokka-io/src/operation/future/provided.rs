@@ -161,7 +161,7 @@ mod tests {
             SeamGuard, WakeSlot, WakerBinding, WakerDecoder, cancel::PROVIDED_RECV_CANCEL_SLOT,
             decode_waker, register_decoder,
         },
-        buffer::{ring::pool::BufRingPool, slot::BufGroupId},
+        buffer::{registration::slot::BufGroupId, ring::pool::BufRingPool},
         operation::future::provided::ProvidedRecvFuture,
     };
 

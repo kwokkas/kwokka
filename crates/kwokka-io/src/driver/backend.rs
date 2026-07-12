@@ -1,7 +1,7 @@
 //! `IoDriver` trait - uniform completion I/O abstraction over all backends.
 
 use crate::{
-    buffer::slot::{BufGroupId, FdSlot},
+    buffer::registration::slot::{BufGroupId, FdSlot},
     capability::CapabilityMatrix,
     operation::{Completion, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };

@@ -6,6 +6,7 @@
 
 pub(crate) mod buffers;
 pub(crate) mod fds;
+pub(crate) mod slot;
 
 pub(crate) use buffers::RegisteredBuffers;
 pub(crate) use fds::RegisteredFds;

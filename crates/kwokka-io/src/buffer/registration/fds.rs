@@ -13,7 +13,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use crate::{RegisterError, buffer::slot::FdSlot};
+use crate::{RegisterError, buffer::registration::slot::FdSlot};
 
 /// Maximum registered fd slots.
 pub(crate) const MAX_REGISTERED_FDS: usize = 65536;

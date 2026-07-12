@@ -289,15 +289,20 @@ mod tests {
 
     #[test]
     fn recv_provided_builds_without_panic() {
-        let request = IoRequest::<()>::recv_provided(3, crate::buffer::slot::BufGroupId::new(0));
+        let request = IoRequest::<()>::recv_provided(
+            3,
+            crate::buffer::registration::slot::BufGroupId::new(0),
+        );
         assert!(request.flags.buffer_select);
         let _entry = build_entry(&request, &mut scratch());
     }
 
     #[test]
     fn recv_multishot_provided_builds_without_panic() {
-        let request =
-            IoRequest::<()>::recv_multishot_provided(3, crate::buffer::slot::BufGroupId::new(0));
+        let request = IoRequest::<()>::recv_multishot_provided(
+            3,
+            crate::buffer::registration::slot::BufGroupId::new(0),
+        );
         assert!(request.flags.multishot);
         assert!(request.flags.buffer_select);
         let _entry = build_entry(&request, &mut scratch());

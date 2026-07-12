@@ -11,8 +11,8 @@
 //! aliases one, and the predicates below stay disjoint from each other.
 
 use crate::buffer::{
-    inflight::InflightSlotKey,
     multishot::{MultishotSlotKey, RecvMultishotSlotKey},
+    oneshot::inflight::InflightSlotKey,
 };
 
 /// `user_data` marker for a buffered-op cancel completion.

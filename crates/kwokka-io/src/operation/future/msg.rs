@@ -21,7 +21,7 @@ use std::io;
 use crate::{
     addr::SockAddr,
     boundary::{self, IoSeam},
-    buffer::inflight::InflightSlotKey,
+    buffer::oneshot::inflight::InflightSlotKey,
     operation::{
         IoBuf, IoBufMut, IoRequest, SubmitResult, core::msghdr::MAX_MSG_INLINE_CAP,
         future::bytes_from_cqe,
@@ -310,7 +310,7 @@ mod tests {
             CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, SeamGuard, WakeSlot,
             WakerBinding, WakerDecoder, decode_waker, register_decoder,
         },
-        buffer::inflight::InflightBufSlab,
+        buffer::oneshot::inflight::InflightBufSlab,
         operation::FixedBuf,
     };
 

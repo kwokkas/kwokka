@@ -18,10 +18,10 @@ use kwokka_io::{
         RECV_CANCEL_INBOX_CAPACITY, RecvCancelInbox,
     },
     buffer::{
-        inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
         multishot::{
             DEFAULT_MULTISHOT_CAP, DEFAULT_RECV_MULTISHOT_CAP, MultishotSlab, RecvMultishotSlab,
         },
+        oneshot::inflight::{DEFAULT_INFLIGHT_CAP, InflightBufSlab},
     },
 };
 

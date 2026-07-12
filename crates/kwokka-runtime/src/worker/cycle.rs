@@ -15,8 +15,8 @@ use kwokka_core::{
 use kwokka_io::{
     DriverType,
     buffer::{
-        inflight::InflightBufSlab,
         multishot::{MultishotSlab, RecvMultishotSlab},
+        oneshot::inflight::InflightBufSlab,
     },
 };
 

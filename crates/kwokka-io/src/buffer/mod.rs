@@ -1,11 +1,9 @@
-//! Buffer types: mmap regions, slot handles, vectored I/O, provided rings, and registries.
+//! Buffer storage, and the per-op-category registries built over it.
 
-pub mod inflight;
-pub(crate) mod mmap;
-
-pub use inflight::MAX_INLINE_CAP;
 pub mod multishot;
+pub mod oneshot;
 pub(crate) mod registration;
 pub(crate) mod ring;
-pub(crate) mod slot;
-pub(crate) mod vectored;
+pub(crate) mod storage;
+
+pub use oneshot::MAX_INLINE_CAP;

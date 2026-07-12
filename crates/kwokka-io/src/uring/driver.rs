@@ -39,9 +39,11 @@ use crate::{
     CancelError, IoDriver, RegisterError,
     boundary::cancel::LINK_TIMEOUT_DISCARD_USER_DATA,
     buffer::{
-        registration::{RegisteredBuffers, RegisteredFds},
+        registration::{
+            RegisteredBuffers, RegisteredFds,
+            slot::{BufGroupId, FdSlot},
+        },
         ring::pool::BufRingPool,
-        slot::{BufGroupId, FdSlot},
     },
     capability::CapabilityMatrix,
     operation::{

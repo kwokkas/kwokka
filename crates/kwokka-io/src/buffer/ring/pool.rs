@@ -17,9 +17,9 @@ use std::io;
 use crate::{
     boundary,
     buffer::{
-        mmap::MmapRegion,
+        registration::slot::BufGroupId,
         ring::{BufRing, BufRingEntry},
-        slot::BufGroupId,
+        storage::mmap::MmapRegion,
     },
 };
 
