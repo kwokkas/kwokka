@@ -26,7 +26,7 @@ use kwokka_io::{
 };
 
 #[cfg(feature = "steal")]
-use crate::scheduler::stealing::{forward::ForwardTable, handoff::ForwardOrigin};
+use crate::scheduler::stealing::{forward::ForwardTable, origin::ForwardOrigin};
 use crate::{
     scheduler::runnable::queue::LocalRunQueue,
     task::cell::slot::TaskSlot,

@@ -12,7 +12,7 @@
 )]
 
 use crate::{
-    scheduler::stealing::{handoff, relocate::SettledNote},
+    scheduler::stealing::{relocate::SettledNote, thief, victim},
     task::cell::state::TaskState,
     worker::{park::wake::wake_local, registry, shard::state::WorkerShard},
 };
@@ -30,7 +30,7 @@ pub(crate) fn serve_steals(shard: &mut WorkerShard) {
         return;
     };
     let thief_id = request.thief_id;
-    let reply = handoff::serve_steal(
+    let reply = victim::serve_steal(
         &mut shard.tasks,
         &mut shard.forward,
         &shard.origins,
@@ -55,11 +55,11 @@ pub(crate) fn serve_steals(shard: &mut WorkerShard) {
 /// runnable in the same pass that received it.
 pub(crate) fn receive_handoffs(shard: &mut WorkerShard) {
     while let Some(reply) = registry::pop_handoff(shard.id) {
-        match handoff::receive_handoff(&mut shard.tasks, &mut shard.origins, reply) {
-            handoff::Received::Installed(task_ref) => {
+        match thief::receive_handoff(&mut shard.tasks, &mut shard.origins, reply) {
+            thief::Received::Installed(task_ref) => {
                 wake_local(&mut shard.tasks, &mut shard.run_queue, task_ref);
             }
-            handoff::Received::Withdrawn => {}
+            thief::Received::Withdrawn => {}
         }
         shard.pending_steal = None;
     }
@@ -74,7 +74,7 @@ pub(crate) fn report_settled_relocations(shard: &mut WorkerShard) {
     // Bind the driver before the disjoint `&mut tasks`/`&mut origins` borrows so
     // the closure captures only `&shard.driver`, not the whole shard.
     let driver = &shard.driver;
-    handoff::report_settled(&mut shard.tasks, &mut shard.origins, |origin| {
+    thief::report_settled(&mut shard.tasks, &mut shard.origins, |origin| {
         let note = SettledNote {
             victim_key: origin.victim_key,
         };
