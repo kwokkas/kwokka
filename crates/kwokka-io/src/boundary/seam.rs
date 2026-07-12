@@ -1,5 +1,5 @@
-//! Cross-crate I/O seam -- the boundary that lets sibling crates host
-//! completion futures.
+//! The seam itself -- submission, completion readback, and the registries the
+//! two ends share.
 //!
 //! The runtime installs an [`IoSeam`] for the exact window of each task poll
 //! (mirroring its poll-frame discipline) and registers a [`WakerDecoder`] once
@@ -15,8 +15,9 @@
 //! own submit paths use, so in-flight accounting -- the predicate that pins a
 //! task to the worker whose ring holds its op -- is preserved by construction.
 //!
-//! The poll boundary is internal infrastructure for the kwokka workspace crates; it is
-//! not re-exported by the `kwokka` facade and carries no stability promise.
+//! The cancel side lives in [`cancel`](crate::boundary::cancel): a dropped
+//! future queues its record there, and the submit and disposal paths below
+//! drain it.
 
 use core::{
     ptr::{self, NonNull},
@@ -31,9 +32,15 @@ use std::{
 use crate::{
     DriverType, IoDriver,
     addr::AddressFamily,
+    boundary::cancel::{
+        ACCEPT_CANCEL_SLOT, AcceptCancelSet, CONNECT_CANCEL_SLOT, ConnectCancelSet,
+        PROVIDED_RECV_CANCEL_SLOT, ProvidedRecvCancelSet, encode_cancel_sentinel,
+        encode_multishot_sentinel, encode_recv_multishot_sentinel,
+        guard::{cancel_inbox, recv_cancel_inbox},
+        is_multishot_sentinel, multishot_sentinel_generation, multishot_sentinel_slot,
+    },
     buffer::{
         inflight::{INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
-        mmap::MmapRegion,
         multishot::{
             MultishotPush, MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotPush,
             RecvMultishotSlab, RecvMultishotSlotKey,
@@ -597,7 +604,9 @@ impl IoSeam {
     /// `token` must be the recv-multishot sentinel the registry issues for this
     /// stream, not a bare task token: the completion drain routes a CQE into the
     /// recv-multishot slab only when its `user_data` is a recv-multishot
-    /// sentinel (see [`is_recv_multishot_sentinel`]), so a task token would
+    /// sentinel (see
+    /// [`is_recv_multishot_sentinel`](crate::boundary::is_recv_multishot_sentinel)),
+    /// so a task token would
     /// misroute the stream's completions onto the single-shot wake path. The
     /// slab allocation that issues the sentinel lands with the drain-wiring
     /// slice; this entry is the submit half of that pair.
@@ -1257,583 +1266,6 @@ impl Drop for SeamGuard {
     }
 }
 
-/// Per-worker cancel-inbox capacity.
-///
-/// Sized to hold one cancel per droppable op across the slab-backed
-/// per-worker registries -- the buffered-op inflight slab and the multishot
-/// slab -- so a worker can queue a cancel for every occupied slot in the same
-/// tick. No slab-backed op can drop twice before a drain (its slot stays
-/// occupied until the drain reclaims it), so the sum of the two capacities
-/// bounds their pending cancels. Slotless ops (dropped accepts and provided
-/// recvs) share this window without a reserved share: the worker shard sits
-/// at its stack-frame budget, and no ring growth can make an op class with no
-/// structural drop bound lossless. Overflow keeps its established meaning --
-/// the cancel record is lost, a bounded leak (a slot held to teardown, a
-/// descriptor, or a pool buffer id), never a free under a live kernel access.
-pub const CANCEL_INBOX_CAPACITY: usize = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
-    + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
-
-/// Fixed-capacity ring of pending cancels for dropped buffered futures.
-///
-/// A buffered future whose op is still in flight cannot free its bytes on
-/// drop -- the kernel still holds the pointer. It instead pushes its
-/// [`InflightSlotKey`] here; the owning worker drains the ring each tick,
-/// submits a cancel SQE, and marks the slot retire-pending, and the completion
-/// drain frees the slot once the kernel signals the op is done.
-///
-/// The caller keeps an in-flight buffered op pinned to its worker, so every
-/// push runs on the owning worker thread. The ring is therefore single-writer
-/// and needs no atomics.
-///
-/// At [`CANCEL_INBOX_CAPACITY`] there is one slot per op that can drop between
-/// drains -- across the inflight and multishot slabs -- so overflow is a safety
-/// backstop rather than a steady-state case: a full ring drops the cancel, a
-/// bounded leak, and the op's own completion still reclaims the slot, so no byte
-/// storage leaks permanently.
-pub struct CancelInbox<const N: usize> {
-    /// Pending cancels, oldest at `head`. `InflightSlotKey` is `Copy`, so a
-    /// dropped entry leaks only the cancel request, never owned storage. A
-    /// multishot cancel rides the same key with its `op_token` set to the
-    /// multishot sentinel, which the drain routes to the multishot registry.
-    slots: [Option<InflightSlotKey>; N],
-    /// Ring read cursor, always in `[0, N)`.
-    head: usize,
-    /// Count of queued cancels; `(head + len) % N` is the next write slot.
-    len: usize,
-}
-
-impl<const N: usize> CancelInbox<N> {
-    /// Creates an empty cancel inbox.
-    ///
-    /// # Panics
-    ///
-    /// Compile-time panic if `N` is zero.
-    #[must_use]
-    pub const fn new() -> Self {
-        const {
-            assert!(N > 0, "N must be positive");
-        }
-        Self {
-            slots: [const { None }; N],
-            head: 0,
-            len: 0,
-        }
-    }
-
-    /// Queues a cancel for a dropped buffered future's in-flight op.
-    ///
-    /// A full ring drops the cancel -- a bounded leak: the op's own completion
-    /// still reclaims the slot, so no byte storage leaks. The caller does not
-    /// retry; the original CQE frees the slot either way. At
-    /// [`CANCEL_INBOX_CAPACITY`] the ring holds every op that can drop between
-    /// drains, so the full case is a backstop, not a steady state.
-    pub const fn push_cancel(&mut self, key: InflightSlotKey) {
-        if self.len >= N {
-            return;
-        }
-        self.slots[(self.head + self.len) % N] = Some(key);
-        self.len += 1;
-    }
-
-    /// Pops the oldest pending cancel, or `None` when the inbox is empty.
-    pub const fn pop(&mut self) -> Option<InflightSlotKey> {
-        if self.len == 0 {
-            return None;
-        }
-        let key = self.slots[self.head].take();
-        self.head = (self.head + 1) % N;
-        self.len -= 1;
-        key
-    }
-
-    /// Number of pending cancels.
-    #[cfg(test)]
-    pub(crate) const fn len(&self) -> usize {
-        self.len
-    }
-
-    /// `true` when no cancels are pending.
-    #[cfg(test)]
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl<const N: usize> Default for CancelInbox<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Per-worker capacity for pending multishot recv cancels.
-///
-/// Sized to the multishot recv registry itself
-/// ([`DEFAULT_RECV_MULTISHOT_CAP`](crate::buffer::multishot::DEFAULT_RECV_MULTISHOT_CAP)),
-/// so a worker can queue a cancel for every occupied recv slot in one tick. A
-/// recv slot stays occupied until its terminal completion frees it, so no slot
-/// drops twice before a drain and this window bounds the pending cancels. Kept
-/// off the shared [`CancelInbox`] ring -- which sits at the shard's stack-frame
-/// budget -- and backed by an `mmap` region so its slots do not inflate the
-/// shard's inline frame. Overflow keeps the established meaning: the cancel
-/// record is lost, a bounded leak of pool buffer ids reclaimed at pool teardown,
-/// never a free under a live kernel access.
-pub const RECV_CANCEL_INBOX_CAPACITY: usize =
-    crate::buffer::multishot::DEFAULT_RECV_MULTISHOT_CAP as usize;
-
-/// Bytes per queued recv cancel: a `u64` generation, a `u16` slot, and a `u8`
-/// worker id, little-endian packed.
-const RECV_CANCEL_ENTRY_LEN: usize = 11;
-
-/// Fixed-capacity mmap-backed ring of pending cancels for dropped multishot recv
-/// streams.
-///
-/// A recv stream whose op is still in flight cannot recycle its provided buffers
-/// on drop -- the kernel still owns the buffer choice. It instead pushes its
-/// [`RecvMultishotSlotKey`] here; the owning worker drains the ring each tick,
-/// recycles any queued buffers, marks the slot cancel-pending, and submits a
-/// cancel SQE, and the op's terminal completion frees the slot.
-///
-/// The caller keeps an in-flight recv op pinned to its worker (`io_bound`), so
-/// every push runs on the owning worker thread. The ring is therefore
-/// single-writer and needs no atomics. Unlike the inline [`CancelInbox`], the
-/// slot payload lives in an `mmap` region so the ring's
-/// [`RECV_CANCEL_INBOX_CAPACITY`] entries do not inflate the shard's stack frame;
-/// only the head/len cursor is inline.
-///
-/// At [`RECV_CANCEL_INBOX_CAPACITY`] there is one slot per recv op that can drop
-/// between drains, so overflow is a safety backstop, not a steady state: a full
-/// ring drops the cancel, a bounded leak of pool buffer ids, and the op's own
-/// terminal completion still recycles its buffers and frees the slot, so no
-/// buffer is freed under a live kernel write.
-pub struct RecvCancelInbox<const N: usize> {
-    /// mmap-backed ring of `RECV_CANCEL_ENTRY_LEN`-byte packed slot keys, oldest
-    /// at `head`.
-    storage: MmapRegion,
-    /// Ring read cursor, always in `[0, N)`.
-    head: usize,
-    /// Count of queued cancels; `(head + len) % N` is the next write slot.
-    len: usize,
-}
-
-impl<const N: usize> RecvCancelInbox<N> {
-    /// Creates an empty recv cancel inbox.
-    ///
-    /// # Errors
-    ///
-    /// Returns the `mmap` error when backing allocation fails.
-    ///
-    /// # Panics
-    ///
-    /// Compile-time panic if `N` is zero.
-    pub fn new() -> io::Result<Self> {
-        const {
-            assert!(N > 0, "N must be positive");
-        }
-        let storage = MmapRegion::new(N * RECV_CANCEL_ENTRY_LEN)?;
-        Ok(Self {
-            storage,
-            head: 0,
-            len: 0,
-        })
-    }
-
-    /// Queues a cancel for a dropped recv stream's in-flight op.
-    ///
-    /// A full ring drops the cancel -- a bounded leak: the op's own terminal
-    /// completion still recycles its buffers and frees its slot. The caller does
-    /// not retry. At [`RECV_CANCEL_INBOX_CAPACITY`] the ring holds every recv op
-    /// that can drop between drains, so the full case is a backstop.
-    pub fn push_cancel(&mut self, key: RecvMultishotSlotKey) {
-        if self.len >= N {
-            return;
-        }
-        let index = (self.head + self.len) % N;
-        let offset = index * RECV_CANCEL_ENTRY_LEN;
-        let bytes = self.storage.as_mut_slice();
-        // Bounds-checked once through `get_mut`; a `None` never occurs (the region
-        // is sized `N * RECV_CANCEL_ENTRY_LEN` and `index < N`), but gating here
-        // keeps the write panic-free like the recv slab's byte accessors.
-        let Some(record) = bytes.get_mut(offset..offset + RECV_CANCEL_ENTRY_LEN) else {
-            return;
-        };
-        record[0..8].copy_from_slice(&key.generation.to_le_bytes());
-        record[8..10].copy_from_slice(&key.slot.to_le_bytes());
-        record[10] = key.worker_id;
-        self.len += 1;
-    }
-
-    /// Pops the oldest pending cancel, or `None` when the inbox is empty.
-    pub fn pop(&mut self) -> Option<RecvMultishotSlotKey> {
-        if self.len == 0 {
-            return None;
-        }
-        let offset = self.head * RECV_CANCEL_ENTRY_LEN;
-        let bytes = self.storage.as_slice();
-        let record = bytes.get(offset..offset + RECV_CANCEL_ENTRY_LEN)?;
-        let Ok(generation) = <[u8; 8]>::try_from(&record[0..8]) else {
-            return None;
-        };
-        let Ok(slot) = <[u8; 2]>::try_from(&record[8..10]) else {
-            return None;
-        };
-        let worker_id = record[10];
-        self.head = (self.head + 1) % N;
-        self.len -= 1;
-        Some(RecvMultishotSlotKey {
-            slot: u16::from_le_bytes(slot),
-            generation: u64::from_le_bytes(generation),
-            worker_id,
-        })
-    }
-
-    /// Number of pending cancels.
-    #[cfg(test)]
-    pub(crate) const fn len(&self) -> usize {
-        self.len
-    }
-
-    /// `true` when no cancels are pending.
-    #[cfg(test)]
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-/// Per-worker capacity for pending single-shot accept cancels.
-///
-/// Holds a token from a dropped `accept()` between its cancel submission and the
-/// op's completion. The window is short (usually one drain), so a small ring
-/// suffices; a full ring drops the record, a bounded leak of one descriptor.
-pub const ACCEPT_CANCEL_CAPACITY: usize = 32;
-
-/// [`InflightSlotKey`] `slot` marker for a slotless single-shot accept cancel.
-///
-/// A single-shot accept carries no inflight slab slot -- it submits under the
-/// polling task's token. This reserved slot routes its cancel to
-/// [`submit_accept_cancel`] rather than the buffered-op path; no real slab slot
-/// reaches `u16::MAX` (the inflight cap is far smaller).
-const ACCEPT_CANCEL_SLOT: u16 = u16::MAX;
-
-/// Per-worker set of dropped single-shot accepts awaiting their completion.
-///
-/// A dropped `accept()` cancels its op and records the op's token here; the
-/// completion drain closes the accepted fd if the op still produced one, rather
-/// than orphaning it in the task wake slot.
-pub struct AcceptCancelSet<const N: usize> {
-    /// Pending tokens packed in `[0, len)`; order does not matter.
-    tokens: [u64; N],
-    /// Count of pending tokens.
-    len: usize,
-}
-
-impl<const N: usize> AcceptCancelSet<N> {
-    /// Creates an empty set.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            tokens: [0; N],
-            len: 0,
-        }
-    }
-
-    /// Records `token` as a cancelled accept awaiting disposal.
-    ///
-    /// A full set drops the record: the op's fd is a bounded leak, never
-    /// corruption, and the caller does not retry.
-    pub(crate) const fn insert(&mut self, token: u64) {
-        if self.len < N {
-            self.tokens[self.len] = token;
-            self.len += 1;
-        }
-    }
-
-    /// Removes `token` if pending, reporting whether it was.
-    pub(crate) const fn take(&mut self, token: u64) -> bool {
-        let mut index = 0;
-        while index < self.len {
-            if self.tokens[index] == token {
-                self.tokens[index] = self.tokens[self.len - 1];
-                self.len -= 1;
-                return true;
-            }
-            index += 1;
-        }
-        false
-    }
-
-    /// `true` when no cancelled accept is pending.
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl<const N: usize> Default for AcceptCancelSet<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Per-worker capacity for pending provided-recv cancels.
-///
-/// A provided-buffer recv holds no registry slot -- the kernel picks its
-/// buffer at completion time -- so nothing structural bounds how many can be
-/// dropped between drains. This window tracks the first N pending drops;
-/// past it (or past the shared [`CANCEL_INBOX_CAPACITY`] ring feeding it) a
-/// drop's cancel record is lost and the op's buffer id is never recycled, a
-/// bounded loss of pool entries reclaimed only at pool teardown. Sized to the
-/// provided-buffer ring itself -- at most every pool entry can be awaiting
-/// disposal at once -- at 8 bytes per slot on the shard.
-pub const PROVIDED_RECV_CANCEL_CAPACITY: usize =
-    crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize;
-
-/// [`InflightSlotKey`] `slot` marker for a slotless provided-recv cancel.
-///
-/// A provided-buffer recv carries no inflight slab slot -- it submits under
-/// the polling task's token and the kernel owns the buffer choice. This
-/// reserved slot routes its cancel to [`submit_provided_recv_cancel`] rather
-/// than the buffered-op path; it sits one below [`ACCEPT_CANCEL_SLOT`], and no
-/// real slab slot reaches either (the inflight cap is far smaller).
-pub(crate) const PROVIDED_RECV_CANCEL_SLOT: u16 = u16::MAX - 1;
-
-/// Per-worker set of dropped provided-buffer recvs awaiting their completion.
-///
-/// A dropped provided recv cancels its op and records the op's token here; the
-/// completion drain recycles the kernel-selected buffer if the op still
-/// consumed one, rather than orphaning the buffer id in the task wake slot.
-pub struct ProvidedRecvCancelSet<const N: usize> {
-    /// Pending tokens packed in `[0, len)`; order does not matter.
-    tokens: [u64; N],
-    /// Count of pending tokens.
-    len: usize,
-}
-
-impl<const N: usize> ProvidedRecvCancelSet<N> {
-    /// Creates an empty set.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            tokens: [0; N],
-            len: 0,
-        }
-    }
-
-    /// Records `token` as a cancelled provided recv awaiting disposal.
-    ///
-    /// A full set drops the record: the op's buffer id is a bounded pool-entry
-    /// loss, never corruption, and the caller does not retry.
-    pub(crate) const fn insert(&mut self, token: u64) {
-        if self.len < N {
-            self.tokens[self.len] = token;
-            self.len += 1;
-        }
-    }
-
-    /// Removes `token` if pending, reporting whether it was.
-    pub(crate) const fn take(&mut self, token: u64) -> bool {
-        let mut index = 0;
-        while index < self.len {
-            if self.tokens[index] == token {
-                self.tokens[index] = self.tokens[self.len - 1];
-                self.len -= 1;
-                return true;
-            }
-            index += 1;
-        }
-        false
-    }
-
-    /// `true` when no cancelled provided recv is pending.
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl<const N: usize> Default for ProvidedRecvCancelSet<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Per-worker capacity for pending single-shot connect cancels.
-///
-/// Holds a token from a dropped `connect()` between its cancel submission and
-/// the op's completion. A connect submits at most once per worker (the driver
-/// packs the address into its single submission scratch), so the window holds
-/// few tokens; a full set drops the record, at worst re-exposing the stray-wake
-/// window for that one token, never corruption.
-pub const CONNECT_CANCEL_CAPACITY: usize = 8;
-
-/// [`InflightSlotKey`] `slot` marker for a slotless single-shot connect cancel.
-///
-/// A single-shot connect carries no inflight slab slot -- it submits under the
-/// polling task's token. This reserved slot routes its cancel to
-/// [`submit_connect_cancel`] rather than the buffered-op path; it sits one below
-/// [`PROVIDED_RECV_CANCEL_SLOT`], and no real slab slot reaches any of them (the
-/// inflight cap is far smaller).
-const CONNECT_CANCEL_SLOT: u16 = u16::MAX - 2;
-
-/// Per-worker set of dropped single-shot connects awaiting their completion.
-///
-/// A dropped `connect()` cancels its op and records the op's token here. Unlike
-/// accept, a connect produces no descriptor (success is result `0`, not an fd),
-/// so the completion drain disposes nothing -- the set exists to divert the
-/// belated CQE out of the generic task-token path, so a stray result never
-/// overwrites a live task's wake slot.
-pub struct ConnectCancelSet<const N: usize> {
-    /// Pending tokens packed in `[0, len)`; order does not matter.
-    tokens: [u64; N],
-    /// Count of pending tokens.
-    len: usize,
-}
-
-impl<const N: usize> ConnectCancelSet<N> {
-    /// Creates an empty set.
-    #[must_use]
-    pub const fn new() -> Self {
-        Self {
-            tokens: [0; N],
-            len: 0,
-        }
-    }
-
-    /// Records `token` as a cancelled connect awaiting disposal.
-    ///
-    /// A full set drops the record: the belated CQE then re-enters the generic
-    /// path for that one token, never corruption, and the caller does not retry.
-    pub(crate) const fn insert(&mut self, token: u64) {
-        if self.len < N {
-            self.tokens[self.len] = token;
-            self.len += 1;
-        }
-    }
-
-    /// Removes `token` if pending, reporting whether it was.
-    pub(crate) const fn take(&mut self, token: u64) -> bool {
-        let mut index = 0;
-        while index < self.len {
-            if self.tokens[index] == token {
-                self.tokens[index] = self.tokens[self.len - 1];
-                self.len -= 1;
-                return true;
-            }
-            index += 1;
-        }
-        false
-    }
-
-    /// `true` when no cancelled connect is pending.
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-impl<const N: usize> Default for ConnectCancelSet<N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// One cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
-const CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
-
-/// The installed cancel inbox for each worker, or null outside a run-loop,
-/// indexed by worker id.
-///
-/// Unlike [`SEAMS`], which is poll-window scoped, this is installed for the
-/// worker's whole run-loop: a buffered future's `Drop` runs outside the poll
-/// window (task reap, or an early cancel-drop) yet still on the owning worker
-/// thread, so the cancel must reach the inbox without the poll bracket.
-/// `AtomicPtr<CancelInbox>` is `Sync` regardless of `CancelInbox`, so the array
-/// is a sound `static` with no `unsafe impl`.
-static CANCEL_INBOXES: [AtomicPtr<CancelInbox<CANCEL_INBOX_CAPACITY>>; CANCEL_INBOX_SLOTS] =
-    [const { AtomicPtr::new(ptr::null_mut()) }; CANCEL_INBOX_SLOTS];
-
-/// RAII bracket that installs a worker's cancel inbox for its whole run-loop
-/// and clears it on drop.
-///
-/// Declared after the `WorkerShard` local in each run-loop entry, so Rust LIFO
-/// drop clears the static before the shard -- and its `cancel_inbox` field --
-/// is reclaimed. A buffered future dropped during shard teardown then finds a
-/// null slot and its [`push_cancel_for_worker`] is a no-op, an accepted bounded
-/// leak the same as an overflowed ring.
-///
-/// Not re-entrant: one run-loop per worker installs one guard.
-pub struct CancelInboxGuard {
-    /// Worker slot to clear on drop.
-    worker_id: u8,
-}
-
-impl CancelInboxGuard {
-    /// Installs `inbox` for `worker_id` for the run-loop, returning the guard
-    /// that clears it.
-    ///
-    /// Takes `&mut` only to form the pointer; the guard stores no reference, so
-    /// the caller's borrow of the inbox ends when this returns and the run-loop
-    /// can borrow the owning shard again.
-    #[must_use]
-    pub fn install(worker_id: u8, inbox: &mut CancelInbox<CANCEL_INBOX_CAPACITY>) -> Self {
-        CANCEL_INBOXES[worker_id as usize].store(ptr::from_mut(inbox), Ordering::Release);
-        Self { worker_id }
-    }
-}
-
-impl Drop for CancelInboxGuard {
-    fn drop(&mut self) {
-        CANCEL_INBOXES[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
-    }
-}
-
-/// One recv-cancel-inbox slot per possible worker id byte, like [`SEAM_SLOTS`].
-const RECV_CANCEL_INBOX_SLOTS: usize = u8::MAX as usize + 1;
-
-/// The installed recv cancel inbox for each worker, or null outside a run-loop,
-/// indexed by worker id.
-///
-/// Run-loop scoped like [`CANCEL_INBOXES`]: a recv stream's `Drop` runs outside
-/// the poll window (task reap, or an early cancel-drop) yet still on the owning
-/// worker thread, so the cancel must reach the inbox without the poll bracket. A
-/// dedicated static keeps recv cancels off the shared [`CancelInbox`] ring, whose
-/// inline capacity sits at the shard's stack-frame budget.
-/// `AtomicPtr<RecvCancelInbox>` is `Sync` regardless of `RecvCancelInbox`, so the
-/// array is a sound `static` with no `unsafe impl`.
-static RECV_CANCEL_INBOXES: [AtomicPtr<RecvCancelInbox<RECV_CANCEL_INBOX_CAPACITY>>;
-    RECV_CANCEL_INBOX_SLOTS] = [const { AtomicPtr::new(ptr::null_mut()) }; RECV_CANCEL_INBOX_SLOTS];
-
-/// RAII bracket that installs a worker's recv cancel inbox for its whole run-loop
-/// and clears it on drop.
-///
-/// Declared after the `WorkerShard` local in each run-loop entry, so Rust LIFO
-/// drop clears the static before the shard -- and its `recv_cancel_inbox` field
-/// -- is reclaimed. A recv stream dropped during shard teardown then finds a null
-/// slot and its [`push_recv_multishot_cancel_for_worker`] is a no-op, an accepted
-/// bounded leak the same as an overflowed ring.
-///
-/// Not re-entrant: one run-loop per worker installs one guard.
-pub struct RecvCancelInboxGuard {
-    /// Worker slot to clear on drop.
-    worker_id: u8,
-}
-
-impl RecvCancelInboxGuard {
-    /// Installs `inbox` for `worker_id` for the run-loop, returning the guard
-    /// that clears it.
-    ///
-    /// Takes `&mut` only to form the pointer; the guard stores no reference, so
-    /// the caller's borrow of the inbox ends when this returns and the run-loop
-    /// can borrow the owning shard again.
-    #[must_use]
-    pub fn install(worker_id: u8, inbox: &mut RecvCancelInbox<RECV_CANCEL_INBOX_CAPACITY>) -> Self {
-        RECV_CANCEL_INBOXES[worker_id as usize].store(ptr::from_mut(inbox), Ordering::Release);
-        Self { worker_id }
-    }
-}
-
-impl Drop for RecvCancelInboxGuard {
-    fn drop(&mut self) {
-        RECV_CANCEL_INBOXES[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
-    }
-}
-
 /// One provided-pool slot per possible worker id byte, like [`SEAM_SLOTS`].
 const PROVIDED_POOL_SLOTS: usize = u8::MAX as usize + 1;
 
@@ -1940,11 +1372,10 @@ pub(crate) fn provided_pool_epoch(worker_id: u8) -> u64 {
 /// run-loop already tore down, so the op's own completion frees the slot during
 /// shutdown, a bounded leak like an overflowed ring.
 pub fn push_cancel_for_worker(key: InflightSlotKey) {
-    let inbox = CANCEL_INBOXES[key.worker_id as usize].load(Ordering::Acquire);
-    if inbox.is_null() {
+    let Some(mut inbox) = cancel_inbox(key.worker_id) else {
         return;
-    }
-    // SAFETY: Invariant -- a non-null pointer in `CANCEL_INBOXES[key.worker_id]`
+    };
+    // SAFETY: Invariant -- a non-null pointer from `cancel_inbox(key.worker_id)`
     // was stored by `CancelInboxGuard::install` over the owning `WorkerShard`'s
     // `cancel_inbox` field. The guard is declared after the shard in the
     // run-loop entry, so Rust LIFO drop nulls this slot before the shard, and
@@ -1960,7 +1391,7 @@ pub fn push_cancel_for_worker(key: InflightSlotKey) {
     // Failure mode: null is the early return above. A cross-thread push (a task
     // with `io_bound = false`) races the single writer; the call-site invariant
     // excludes it. A dangling pointer cannot arise -- LIFO drop order excludes it.
-    let inbox = unsafe { &mut *inbox };
+    let inbox = unsafe { inbox.as_mut() };
     inbox.push_cancel(key);
 }
 
@@ -2036,18 +1467,18 @@ pub fn push_multishot_cancel_for_worker(key: MultishotSlotKey) {
 /// The dropped stream's op is `io_bound`, so the drop runs on the owning worker
 /// and the push is single-writer, the same contract [`push_cancel_for_worker`]
 /// holds. Unlike a buffered-op cancel, this pushes into the dedicated
-/// [`RecvCancelInbox`] rather than the shared [`CancelInbox`] ring: a recv slot
+/// [`RecvCancelInbox`](crate::boundary::RecvCancelInbox) rather than the shared
+/// [`CancelInbox`](crate::boundary::CancelInbox) ring: a recv slot
 /// is per-connection, so the worker drains it separately through
 /// [`submit_recv_multishot_cancel`]. A no-op when no inbox is installed for
 /// `key.worker_id` (a bounded leak at worker teardown, reclaimed by the op's
 /// terminal completion).
 pub fn push_recv_multishot_cancel_for_worker(key: RecvMultishotSlotKey) {
-    let inbox = RECV_CANCEL_INBOXES[key.worker_id as usize].load(Ordering::Acquire);
-    if inbox.is_null() {
+    let Some(mut inbox) = recv_cancel_inbox(key.worker_id) else {
         return;
-    }
-    // SAFETY: Invariant -- a non-null pointer in
-    // `RECV_CANCEL_INBOXES[key.worker_id]` was stored by
+    };
+    // SAFETY: Invariant -- a non-null pointer from
+    // `recv_cancel_inbox(key.worker_id)` was stored by
     // `RecvCancelInboxGuard::install` over the owning `WorkerShard`'s
     // `recv_cancel_inbox` field. The guard is declared after the shard in the
     // run-loop entry, so Rust LIFO drop nulls this slot before the shard, and its
@@ -2061,194 +1492,8 @@ pub fn push_recv_multishot_cancel_for_worker(key: RecvMultishotSlotKey) {
     // Failure mode: null is the early return above. A cross-thread push races the
     // single writer; the call-site invariant excludes it. A dangling pointer
     // cannot arise -- LIFO drop order excludes it.
-    let inbox = unsafe { &mut *inbox };
+    let inbox = unsafe { inbox.as_mut() };
     inbox.push_cancel(key);
-}
-
-/// `user_data` marker for a buffered-op cancel completion.
-///
-/// Tags every cancel SQE the worker's cancel-drain submits so the completion
-/// drain recognizes the cancel op's own CQE and routes it to
-/// [`reclaim_cancel_completion`]. The slot is usually freed on the original
-/// op's completion (see [`reclaim_dropped_slot`]); the cancel CQE frees it only
-/// on `-ENOENT`, where the target already completed and no op completion is
-/// coming. `io_uring` async cancel is best-effort, so a `0` or `-EALREADY`
-/// result leaves the target still completing and never drives a free. The
-/// upper 32 bits are all set: the arena tag bit, a worker id of 127, and a
-/// maximal generation. That is the arena address space's exhaustion corner,
-/// reached only when both the worker id and the generation are maxed out, so a
-/// real completion never aliases the marker in practice. The low 32 bits carry
-/// the slot and its low 16 generation bits.
-///
-/// This gives the marker the same narrow window as the wake fd's `u64::MAX`,
-/// which sits in that corner at a maximal offset. The two stay disjoint: the
-/// marker never encodes an all-ones low half, and [`is_cancel_sentinel`]
-/// excludes the wake value. A slab-path handle clears the arena tag bit, so it
-/// never aliases either.
-const CANCEL_TOKEN_BASE: u64 = 0xFFFF_FFFF_0000_0000;
-
-/// Upper-32-bit mask isolating the [`CANCEL_TOKEN_BASE`] marker.
-const CANCEL_TOKEN_HIGH_MASK: u64 = 0xFFFF_FFFF_0000_0000;
-
-/// Encodes the cancel-completion `user_data` for `key`: the marker, the slot at
-/// bits 0..16, and the low 16 bits of the slot's generation at bits 16..32.
-///
-/// The slot and generation are read back only on a cancel completion that
-/// reports `-ENOENT` (see [`reclaim_cancel_completion`]): the target op already
-/// completed, so no op-token completion will free the slot, and the generation
-/// guards a stale cancel from freeing a slot the same op token has since reused.
-const fn encode_cancel_sentinel(key: InflightSlotKey) -> u64 {
-    CANCEL_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
-}
-
-/// Whether `user_data` is a cancel-completion sentinel.
-///
-/// The completion drain calls this to recognize the cancel op's own CQE and
-/// route it to [`reclaim_cancel_completion`] instead of the task-wake path. The
-/// slot is normally reclaimed on the original op's completion (see
-/// [`reclaim_dropped_slot`]); the cancel CQE frees it only on a `-ENOENT`
-/// result.
-///
-/// The marker fills the upper 32 bits, which the wake fd's `u64::MAX` also
-/// does, so the wake value is excluded here to keep the two predicates disjoint
-/// on their own. The drain tests the wake fd first regardless.
-pub const fn is_cancel_sentinel(user_data: u64) -> bool {
-    user_data & CANCEL_TOKEN_HIGH_MASK == CANCEL_TOKEN_BASE
-        && user_data != crate::wake::WAKE_FD_USER_DATA
-}
-
-/// `user_data` marker base for a multishot completion.
-///
-/// A multishot op posts many CQEs sharing one `user_data`, so its completions
-/// route to the [`MultishotSlab`]
-/// rather than the per-task wake slot. The upper 32 bits read `0xFFFF_FFFE`:
-/// the arena tag bit, worker id 127, and generation `MAX - 1`, one corner below
-/// the cancel base. That keeps the three completion sentinels disjoint -- the
-/// wake fd is `u64::MAX` and the cancel base is `0xFFFF_FFFF_0000_0000`, both
-/// upper-32 `0xFFFF_FFFF`, while this reads `0xFFFF_FFFE`. It is unreachable for
-/// the same reason the cancel corner is: generation `MAX - 1` needs ~2^24 slot
-/// reuses. The low 32 bits carry the slot and its low 16 generation bits, the
-/// same layout [`encode_cancel_sentinel`] uses.
-const MULTISHOT_TOKEN_BASE: u64 = 0xFFFF_FFFE_0000_0000;
-
-/// Encodes the multishot-completion `user_data` for `key`.
-pub(crate) const fn encode_multishot_sentinel(key: MultishotSlotKey) -> u64 {
-    MULTISHOT_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
-}
-
-/// Whether `user_data` is a multishot-completion sentinel.
-///
-/// The completion drain calls this to route the CQE into the
-/// [`MultishotSlab`]. The marker shares
-/// the upper-32 isolation mask with the cancel sentinel but sits one corner
-/// below it, so no wake-value guard is needed: `u64::MAX` reads upper-32
-/// `0xFFFF_FFFF`, already excluded.
-pub const fn is_multishot_sentinel(user_data: u64) -> bool {
-    user_data & CANCEL_TOKEN_HIGH_MASK == MULTISHOT_TOKEN_BASE
-}
-
-/// The slot index a multishot sentinel names.
-pub(crate) const fn multishot_sentinel_slot(user_data: u64) -> u16 {
-    (user_data & 0xFFFF) as u16
-}
-
-/// The low 16 generation bits a multishot sentinel carries.
-pub(crate) const fn multishot_sentinel_generation(user_data: u64) -> u16 {
-    ((user_data >> 16) & 0xFFFF) as u16
-}
-
-/// `user_data` marker base for a multishot recv completion.
-///
-/// A multishot recv posts many CQEs sharing one `user_data`, routed to the
-/// [`RecvMultishotSlab`] rather than the per-task wake slot. The upper 32 bits
-/// read `0xFFFF_FFFD`: the arena tag bit, worker id 127, and generation
-/// `MAX - 2`, one corner below the multishot accept base. That keeps all four
-/// completion sentinels disjoint by upper-32 -- wake and cancel read
-/// `0xFFFF_FFFF`, multishot accept `0xFFFF_FFFE`, and this `0xFFFF_FFFD`. It is
-/// unreachable for the same reason the others are: generation `MAX - 2` needs
-/// ~2^24 slot reuses, and a slab-path token clears the arena tag bit entirely.
-/// The low 32 bits carry the slot and its low 16 generation bits, the layout
-/// [`multishot_sentinel_slot`] and [`multishot_sentinel_generation`] decode.
-const RECV_MULTISHOT_TOKEN_BASE: u64 = 0xFFFF_FFFD_0000_0000;
-
-/// Encodes the multishot-recv-completion `user_data` for `key`.
-pub(crate) const fn encode_recv_multishot_sentinel(key: RecvMultishotSlotKey) -> u64 {
-    RECV_MULTISHOT_TOKEN_BASE | ((key.generation & 0xFFFF) << 16) | key.slot as u64
-}
-
-/// Whether `user_data` is a multishot-recv-completion sentinel.
-///
-/// The completion drain calls this to route the CQE into the
-/// [`RecvMultishotSlab`]. It sits one corner below the multishot accept base,
-/// so no wake-value guard is needed: `u64::MAX` reads upper-32 `0xFFFF_FFFF`,
-/// already excluded.
-pub const fn is_recv_multishot_sentinel(user_data: u64) -> bool {
-    user_data & CANCEL_TOKEN_HIGH_MASK == RECV_MULTISHOT_TOKEN_BASE
-}
-
-/// `user_data` marker for a cross-ring `msg_ring` wake.
-///
-/// The `IORING_OP_MSG_RING` analog of the wake fd's
-/// [`WAKE_FD_USER_DATA`](crate::wake::WAKE_FD_USER_DATA). A peer worker posts
-/// this as the target CQE's `user_data` purely to break the target's park; the
-/// completion drain recognizes it and unparks without a task route or a stored
-/// result. The upper 32 bits read `0xFFFF_FFFC`: the arena tag
-/// bit, worker id 127, and generation `MAX - 3`, one corner below the
-/// multishot-recv base, so all five completion sentinels stay disjoint by
-/// upper-32 -- wake fd and cancel `0xFFFF_FFFF`, multishot accept `0xFFFF_FFFE`,
-/// multishot recv `0xFFFF_FFFD`, and this `0xFFFF_FFFC`. Unlike the per-slot
-/// sentinels it names no suboperation, so the whole value is the fixed marker
-/// with a zero low half; recognition is an exact-value match, not an upper-32
-/// mask.
-const MSG_RING_WAKE_TOKEN_BASE: u64 = 0xFFFF_FFFC_0000_0000;
-
-/// The CQE `user_data` a cross-ring `msg_ring` wake carries.
-///
-/// The target ring receives it as the delivered wake; the source ring sees it
-/// on the `SKIP_SUCCESS` failure CQE, so a rare send failure is recognized
-/// rather than misrouted onto a task slot.
-pub const MSG_RING_WAKE_USER_DATA: u64 = MSG_RING_WAKE_TOKEN_BASE;
-
-/// Whether `user_data` marks a cross-ring `msg_ring` wake.
-///
-/// The completion drain calls this to recognize a peer's `IORING_OP_MSG_RING`
-/// CQE and unpark without a task route. It is an exact-value match against the
-/// fixed marker, disjoint from every per-slot sentinel corner and from the wake
-/// fd's `u64::MAX`.
-pub const fn is_msg_ring_wake(user_data: u64) -> bool {
-    user_data == MSG_RING_WAKE_USER_DATA
-}
-
-/// `user_data` marker for the discarded half of a linked-timeout pair.
-///
-/// A `submit_linked_timeout_internal` op carries `IOSQE_IO_LINK`; the paired
-/// `IORING_OP_LINK_TIMEOUT` SQE tags its own CQE with this fixed marker. That
-/// CQE (`-ETIME` / `-ECANCELED` / `-ENOENT` per `io_uring_prep_link_timeout.3`)
-/// is pure noise: the primary op's CQE already carries the outcome the caller
-/// observes, and the kernel cancels the timeout once the primary is gone, so
-/// no per-slot registry is needed. The upper 32 bits read `0xFFFF_FFFB`: the
-/// arena tag bit, worker id 127, and generation `MAX - 4`, one corner below the
-/// `msg_ring` wake base, so all six completion sentinels stay disjoint by
-/// upper-32 -- wake fd and cancel `0xFFFF_FFFF`, multishot accept `0xFFFF_FFFE`,
-/// multishot recv `0xFFFF_FFFD`, `msg_ring` `0xFFFF_FFFC`, and this
-/// `0xFFFF_FFFB`. Recognition is an exact-value match, not an upper-32 mask,
-/// like the `msg_ring` wake.
-const LINK_TIMEOUT_TOKEN_BASE: u64 = 0xFFFF_FFFB_0000_0000;
-
-/// The CQE `user_data` the link-timeout half of a linked pair carries.
-///
-/// The completion drain recognizes it and drops the CQE without a task route or
-/// a slot free -- the primary op's own CQE is the caller's result.
-pub(crate) const LINK_TIMEOUT_DISCARD_USER_DATA: u64 = LINK_TIMEOUT_TOKEN_BASE;
-
-/// Whether `user_data` marks the discarded half of a linked-timeout pair.
-///
-/// The completion drain calls this to recognize the paired
-/// `IORING_OP_LINK_TIMEOUT` CQE and drop it. It is an exact-value match against
-/// the fixed marker, disjoint from every per-slot sentinel corner and from the
-/// wake fd's `u64::MAX`.
-pub const fn is_link_timeout_discard(user_data: u64) -> bool {
-    user_data == LINK_TIMEOUT_DISCARD_USER_DATA
 }
 
 /// The wake and retire targets a multishot CQE resolves to.
@@ -2342,7 +1587,9 @@ fn recycle_provided(driver: &DriverType, buf_id: Option<u16>) {
 /// Routes a multishot recv op's completion CQE into the worker's registry.
 ///
 /// The completion drain calls this on a CQE whose `user_data` is a
-/// multishot-recv sentinel (see [`is_recv_multishot_sentinel`]). It queues a
+/// multishot-recv sentinel (see
+/// [`is_recv_multishot_sentinel`](crate::boundary::is_recv_multishot_sentinel)).
+/// It queues a
 /// data completion's `(result, buf_id)` in the owning stream's FIFO, or stashes
 /// the terminal completion in the slot; either way it wakes the owning task and
 /// leaves the buffer for the consumer to recycle, and returns the
@@ -2768,6 +2015,10 @@ pub fn reclaim_notif(slab: &mut InflightBufSlab, op_token: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boundary::cancel::{
+        CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, is_cancel_sentinel,
+        is_recv_multishot_sentinel,
+    };
 
     #[test]
     fn with_current_is_none_when_uninstalled() {
@@ -2969,143 +2220,6 @@ mod tests {
             ),
             "the submit either reaches the ring or degrades cleanly",
         );
-    }
-
-    fn cancel_key(slot: u16) -> InflightSlotKey {
-        InflightSlotKey {
-            slot,
-            generation: 0,
-            worker_id: 3,
-            op_token: u64::from(slot),
-        }
-    }
-
-    #[test]
-    fn cancel_push_pop_fifo() {
-        let mut inbox = CancelInbox::<4>::new();
-        inbox.push_cancel(cancel_key(0));
-        inbox.push_cancel(cancel_key(1));
-        let Some(first) = inbox.pop() else {
-            panic!("pop must yield the first cancel");
-        };
-        assert_eq!(first.slot, 0);
-        let Some(second) = inbox.pop() else {
-            panic!("pop must yield the second cancel");
-        };
-        assert_eq!(second.slot, 1);
-        assert!(inbox.pop().is_none());
-    }
-
-    #[test]
-    fn cancel_full_inbox_leaks() {
-        let mut inbox = CancelInbox::<2>::new();
-        inbox.push_cancel(cancel_key(0));
-        inbox.push_cancel(cancel_key(1));
-        inbox.push_cancel(cancel_key(2));
-        assert_eq!(
-            inbox.len(),
-            2,
-            "a full inbox drops the overflow cancel as a bounded leak"
-        );
-        let Some(first) = inbox.pop() else {
-            panic!("the queued cancels survive the overflow");
-        };
-        assert_eq!(
-            first.slot, 0,
-            "the overflow did not displace a queued cancel"
-        );
-    }
-
-    #[test]
-    fn cancel_inbox_capacity_covers_both_slabs() {
-        let droppable = crate::buffer::inflight::DEFAULT_INFLIGHT_CAP as usize
-            + crate::buffer::multishot::DEFAULT_MULTISHOT_CAP as usize;
-        assert!(
-            CANCEL_INBOX_CAPACITY >= droppable,
-            "the inbox holds a cancel for every op that can drop between drains, \
-             so no worker cancel is silently dropped in production",
-        );
-    }
-
-    #[test]
-    fn cancel_inbox_wraps_across_capacity() {
-        // Fill, drain half, refill: exercises the modulo write past the array end
-        // so the ring stays correct without a power-of-two capacity.
-        let mut inbox = CancelInbox::<3>::new();
-        inbox.push_cancel(cancel_key(0));
-        inbox.push_cancel(cancel_key(1));
-        assert_eq!(inbox.pop().map(|k| k.slot), Some(0));
-        inbox.push_cancel(cancel_key(2));
-        inbox.push_cancel(cancel_key(3));
-        assert_eq!(inbox.len(), 3, "the ring refilled to capacity after wrap");
-        assert_eq!(inbox.pop().map(|k| k.slot), Some(1));
-        assert_eq!(inbox.pop().map(|k| k.slot), Some(2));
-        assert_eq!(inbox.pop().map(|k| k.slot), Some(3));
-        assert!(inbox.pop().is_none());
-    }
-
-    #[test]
-    fn cancel_pop_empty_returns_none() {
-        let mut inbox = CancelInbox::<2>::new();
-        assert!(inbox.pop().is_none());
-    }
-
-    #[test]
-    fn cancel_len_empty_occupancy() {
-        let mut inbox = CancelInbox::<4>::new();
-        assert!(inbox.is_empty());
-        assert_eq!(inbox.len(), 0);
-        inbox.push_cancel(cancel_key(0));
-        assert_eq!(inbox.len(), 1);
-        assert!(!inbox.is_empty());
-        assert!(inbox.pop().is_some());
-        assert!(inbox.is_empty());
-    }
-
-    #[test]
-    fn cancel_wrap_around_reuses_slots() {
-        let mut inbox = CancelInbox::<2>::new();
-        inbox.push_cancel(cancel_key(0));
-        assert!(inbox.pop().is_some());
-        inbox.push_cancel(cancel_key(1));
-        inbox.push_cancel(cancel_key(2));
-        let Some(second) = inbox.pop() else {
-            panic!("pop must yield after wrap");
-        };
-        assert_eq!(second.slot, 1);
-    }
-
-    #[test]
-    fn cancel_default_is_empty() {
-        let inbox = CancelInbox::<4>::default();
-        assert!(inbox.is_empty());
-    }
-
-    #[test]
-    fn cancel_guard_routes_then_clears() {
-        let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
-        {
-            let _guard = CancelInboxGuard::install(7, &mut inbox);
-            push_cancel_for_worker(InflightSlotKey {
-                slot: 1,
-                generation: 0,
-                worker_id: 7,
-                op_token: 0xBEEF,
-            });
-        }
-        // The guard dropped, so the static is null and this push is a no-op.
-        push_cancel_for_worker(InflightSlotKey {
-            slot: 2,
-            generation: 0,
-            worker_id: 7,
-            op_token: 0,
-        });
-        let Some(key) = inbox.pop() else {
-            panic!("the in-guard push reached the inbox");
-        };
-        assert_eq!(key.slot, 1);
-        assert_eq!(key.op_token, 0xBEEF);
-        assert!(inbox.pop().is_none(), "the post-guard push was a no-op");
     }
 
     #[test]
@@ -3543,79 +2657,6 @@ mod tests {
     }
 
     #[test]
-    fn cancel_sentinel_excludes_other_tokens() {
-        assert!(
-            !is_cancel_sentinel(crate::wake::WAKE_FD_USER_DATA),
-            "the wake fd marker is not a cancel sentinel",
-        );
-        assert!(
-            !is_cancel_sentinel(0x7FFF_FFFF_FFFF_FFFF),
-            "a slab-path task token keeps its top bit clear",
-        );
-        assert!(
-            !is_cancel_sentinel(0x8000_0000_0000_0005),
-            "the previous marker corner (arena worker 0, generation 0) no longer aliases",
-        );
-        let sentinel = CANCEL_TOKEN_BASE | (0xAB << 16) | 0x05;
-        assert!(is_cancel_sentinel(sentinel), "the marker is recognized");
-    }
-
-    #[test]
-    fn multishot_sentinel_round_trips() {
-        let key = MultishotSlotKey {
-            slot: 0x2A,
-            generation: 0xABCD,
-            worker_id: 3,
-        };
-        let sentinel = encode_multishot_sentinel(key);
-        assert!(is_multishot_sentinel(sentinel));
-        assert_eq!(multishot_sentinel_slot(sentinel), 0x2A);
-        assert_eq!(multishot_sentinel_generation(sentinel), 0xABCD);
-    }
-
-    #[test]
-    fn multishot_sentinel_excludes_other_markers() {
-        assert!(
-            !is_multishot_sentinel(CANCEL_TOKEN_BASE),
-            "the cancel corner reads upper-32 0xFFFF_FFFF, not 0xFFFF_FFFE",
-        );
-        assert!(
-            !is_multishot_sentinel(crate::wake::WAKE_FD_USER_DATA),
-            "the wake fd reads upper-32 0xFFFF_FFFF",
-        );
-        assert!(
-            !is_cancel_sentinel(MULTISHOT_TOKEN_BASE),
-            "the multishot corner is not a cancel sentinel",
-        );
-        assert!(
-            !is_multishot_sentinel(0x7FFF_FFFF_FFFF_FFFF),
-            "a slab-path task token keeps its top bit clear",
-        );
-    }
-
-    #[test]
-    fn sentinel_carries_slot_and_generation() {
-        let key = InflightSlotKey {
-            slot: 0x2A,
-            generation: 0x1_0007,
-            worker_id: 3,
-            op_token: 0,
-        };
-        let sentinel = encode_cancel_sentinel(key);
-        assert_eq!(
-            sentinel & 0xFFFF,
-            u64::from(key.slot),
-            "the slot sits at bits 0..16"
-        );
-        assert_eq!(
-            (sentinel >> 16) & 0xFFFF,
-            0x0007,
-            "the generation low 16 bits sit at bits 16..32",
-        );
-        assert!(is_cancel_sentinel(sentinel), "the marker is set");
-    }
-
-    #[test]
     fn reclaim_frees_dropped_slot() {
         let Ok(mut slab) = InflightBufSlab::new(4, 8) else {
             panic!("mmap must succeed for the test slab");
@@ -3729,8 +2770,10 @@ mod tests {
         };
         slab.mark_retire_pending(key);
         // A stale sentinel carrying a different generation must not free the slot.
-        let stale =
-            CANCEL_TOKEN_BASE | (((key.generation + 1) & 0xFFFF) << 16) | u64::from(key.slot);
+        let stale = encode_cancel_sentinel(InflightSlotKey {
+            generation: key.generation + 1,
+            ..key
+        });
         reclaim_cancel_completion(&mut slab, stale, -2);
         assert!(
             slab.slot_ptr(key).is_some(),
@@ -3915,52 +2958,6 @@ mod tests {
         );
         // free with no slab is a no-op, never a panic.
         seam.multishot_free(key);
-    }
-
-    #[test]
-    fn msg_ring_wake_sentinel_is_recognized_and_disjoint() {
-        assert!(
-            is_msg_ring_wake(MSG_RING_WAKE_USER_DATA),
-            "the marker recognizes itself",
-        );
-        // Disjoint from every other completion sentinel and the wake fd.
-        assert!(!is_msg_ring_wake(crate::wake::WAKE_FD_USER_DATA));
-        assert!(!is_msg_ring_wake(CANCEL_TOKEN_BASE));
-        assert!(!is_msg_ring_wake(MULTISHOT_TOKEN_BASE));
-        assert!(!is_msg_ring_wake(RECV_MULTISHOT_TOKEN_BASE));
-        // The other predicates reject the msg_ring marker.
-        assert!(!is_cancel_sentinel(MSG_RING_WAKE_USER_DATA));
-        assert!(!is_multishot_sentinel(MSG_RING_WAKE_USER_DATA));
-        assert!(!is_recv_multishot_sentinel(MSG_RING_WAKE_USER_DATA));
-        // One corner below the multishot-recv base.
-        assert_eq!(
-            MSG_RING_WAKE_USER_DATA >> 32,
-            (RECV_MULTISHOT_TOKEN_BASE >> 32) - 1,
-        );
-    }
-
-    #[test]
-    fn link_timeout_discard_sentinel_is_recognized_and_disjoint() {
-        assert!(
-            is_link_timeout_discard(LINK_TIMEOUT_DISCARD_USER_DATA),
-            "the marker recognizes itself",
-        );
-        // Disjoint from every other completion sentinel and the wake fd.
-        assert!(!is_link_timeout_discard(crate::wake::WAKE_FD_USER_DATA));
-        assert!(!is_link_timeout_discard(CANCEL_TOKEN_BASE));
-        assert!(!is_link_timeout_discard(MULTISHOT_TOKEN_BASE));
-        assert!(!is_link_timeout_discard(RECV_MULTISHOT_TOKEN_BASE));
-        assert!(!is_link_timeout_discard(MSG_RING_WAKE_USER_DATA));
-        // The other predicates reject the link-timeout marker.
-        assert!(!is_cancel_sentinel(LINK_TIMEOUT_DISCARD_USER_DATA));
-        assert!(!is_multishot_sentinel(LINK_TIMEOUT_DISCARD_USER_DATA));
-        assert!(!is_recv_multishot_sentinel(LINK_TIMEOUT_DISCARD_USER_DATA));
-        assert!(!is_msg_ring_wake(LINK_TIMEOUT_DISCARD_USER_DATA));
-        // One corner below the msg_ring wake base.
-        assert_eq!(
-            LINK_TIMEOUT_DISCARD_USER_DATA >> 32,
-            (MSG_RING_WAKE_USER_DATA >> 32) - 1,
-        );
     }
 
     #[test]
@@ -4183,70 +3180,6 @@ mod tests {
         );
         // free with no slab is a no-op, never a panic.
         seam.recv_multishot_free(key);
-    }
-
-    #[test]
-    fn recv_cancel_inbox_push_pop_is_fifo() {
-        let Ok(mut inbox) = RecvCancelInbox::<4>::new() else {
-            panic!("the inbox mmap must succeed");
-        };
-        assert!(inbox.is_empty());
-        let key = |slot, generation| RecvMultishotSlotKey {
-            slot,
-            generation,
-            worker_id: 7,
-        };
-        inbox.push_cancel(key(1, 100));
-        inbox.push_cancel(key(2, 200));
-        assert_eq!(inbox.len(), 2);
-        assert_eq!(inbox.pop(), Some(key(1, 100)), "oldest pops first");
-        assert_eq!(inbox.pop(), Some(key(2, 200)));
-        assert_eq!(inbox.pop(), None);
-        assert!(inbox.is_empty());
-    }
-
-    #[test]
-    fn recv_cancel_inbox_drops_on_overflow() {
-        let Ok(mut inbox) = RecvCancelInbox::<2>::new() else {
-            panic!("the inbox mmap must succeed");
-        };
-        let key = |slot| RecvMultishotSlotKey {
-            slot,
-            generation: 0,
-            worker_id: 3,
-        };
-        inbox.push_cancel(key(0));
-        inbox.push_cancel(key(1));
-        inbox.push_cancel(key(2));
-        assert_eq!(inbox.len(), 2, "a full ring drops the newest push");
-        assert_eq!(inbox.pop(), Some(key(0)));
-        assert_eq!(inbox.pop(), Some(key(1)));
-        assert_eq!(inbox.pop(), None, "the overflowing push was dropped");
-    }
-
-    #[test]
-    fn recv_cancel_inbox_guard_routes_push() {
-        let Ok(mut inbox) = RecvCancelInbox::<RECV_CANCEL_INBOX_CAPACITY>::new() else {
-            panic!("the inbox mmap must succeed");
-        };
-        let key = RecvMultishotSlotKey {
-            slot: 5,
-            generation: 9,
-            worker_id: 60,
-        };
-        // With no guard installed, the push finds a null slot and is a no-op.
-        push_recv_multishot_cancel_for_worker(key);
-        {
-            let _guard = RecvCancelInboxGuard::install(60, &mut inbox);
-            push_recv_multishot_cancel_for_worker(key);
-        }
-        // The guard cleared the slot on drop; the one routed push is still queued.
-        assert_eq!(
-            inbox.pop(),
-            Some(key),
-            "the guard routed the push into the worker's inbox",
-        );
-        assert_eq!(inbox.pop(), None, "the no-guard push was a no-op");
     }
 
     #[test]
@@ -4675,30 +3608,6 @@ mod tests {
     }
 
     #[test]
-    fn accept_cancel_set_tracks_tokens() {
-        let mut set = AcceptCancelSet::<4>::new();
-        assert!(set.is_empty());
-        set.insert(0xAA);
-        set.insert(0xBB);
-        assert!(!set.is_empty());
-        assert!(set.take(0xAA), "a recorded token is pending");
-        assert!(!set.take(0xAA), "a taken token is no longer pending");
-        assert!(set.take(0xBB));
-        assert!(set.is_empty());
-    }
-
-    #[test]
-    fn accept_cancel_set_full_drops_the_record() {
-        let mut set = AcceptCancelSet::<2>::new();
-        set.insert(1);
-        set.insert(2);
-        set.insert(3);
-        assert!(set.take(1));
-        assert!(set.take(2));
-        assert!(!set.take(3), "a full set drops the overflow record");
-    }
-
-    #[test]
     fn push_accept_cancel_carries_the_slotless_marker() {
         let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
         {
@@ -4785,21 +3694,6 @@ mod tests {
         // a probe of a closed fd reports `EBADF`, which is the assertion.
         let still_open = unsafe { libc::fcntl(fd, libc::F_GETFD) } != -1;
         assert!(!still_open, "the disposal closed the accepted fd");
-    }
-
-    #[test]
-    fn provided_recv_cancel_set_inserts_and_takes() {
-        let mut cancels = ProvidedRecvCancelSet::<2>::new();
-        assert!(cancels.is_empty());
-        cancels.insert(0xA);
-        cancels.insert(0xB);
-        // A full set drops the record rather than growing.
-        cancels.insert(0xC);
-        assert!(!cancels.take(0xC), "the overflowed record was dropped");
-        assert!(cancels.take(0xB));
-        assert!(cancels.take(0xA));
-        assert!(cancels.is_empty());
-        assert!(!cancels.take(0xA), "a taken token does not linger");
     }
 
     #[cfg(target_os = "linux")]
@@ -4931,21 +3825,6 @@ mod tests {
             accepts.take(0x5),
             "the accept entry survives instead of adopting descriptor zero",
         );
-    }
-
-    #[test]
-    fn connect_cancel_set_inserts_and_takes() {
-        let mut cancels = ConnectCancelSet::<2>::new();
-        assert!(cancels.is_empty());
-        cancels.insert(0xA);
-        cancels.insert(0xB);
-        // A full set drops the record rather than growing.
-        cancels.insert(0xC);
-        assert!(!cancels.take(0xC), "the overflowed record was dropped");
-        assert!(cancels.take(0xB));
-        assert!(cancels.take(0xA));
-        assert!(cancels.is_empty());
-        assert!(!cancels.take(0xA), "a taken token does not linger");
     }
 
     #[test]

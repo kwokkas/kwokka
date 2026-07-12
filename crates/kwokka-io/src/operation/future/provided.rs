@@ -157,9 +157,9 @@ mod tests {
 
     use crate::{
         boundary::{
-            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, IoSeam,
-            PROVIDED_RECV_CANCEL_SLOT, ProvidedPoolGuard, SeamGuard, WakeSlot, WakerBinding,
-            WakerDecoder, decode_waker, register_decoder,
+            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, IoSeam, ProvidedPoolGuard,
+            SeamGuard, WakeSlot, WakerBinding, WakerDecoder, cancel::PROVIDED_RECV_CANCEL_SLOT,
+            decode_waker, register_decoder,
         },
         buffer::{ring::pool::BufRingPool, slot::BufGroupId},
         operation::future::provided::ProvidedRecvFuture,

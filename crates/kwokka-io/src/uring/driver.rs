@@ -37,7 +37,7 @@ use io_uring::{
 
 use crate::{
     CancelError, IoDriver, RegisterError,
-    boundary::LINK_TIMEOUT_DISCARD_USER_DATA,
+    boundary::cancel::LINK_TIMEOUT_DISCARD_USER_DATA,
     buffer::{
         registration::{RegisteredBuffers, RegisteredFds},
         ring::pool::BufRingPool,
