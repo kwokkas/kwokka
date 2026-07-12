@@ -18,9 +18,8 @@ use kwokka_core::slab::{Slab, SlabKey};
 
 use crate::task::{
     TaskRef,
-    cell::slot::TaskSlot,
+    cell::{slot::TaskSlot, state::TaskState},
     join::children::{iter_children, remove_child},
-    state::TaskState,
 };
 
 /// Per-worker capacity of settled-parent records awaiting a reap pass.
@@ -162,7 +161,10 @@ mod tests {
     use kwokka_core::id::{Namespace, Pip};
 
     use super::*;
-    use crate::task::{cell::header::Slot, join::children::push_child, state::TaskState};
+    use crate::task::{
+        cell::{header::Slot, state::TaskState},
+        join::children::push_child,
+    };
 
     /// A child future that never completes; tests drive its state directly.
     struct Inert;

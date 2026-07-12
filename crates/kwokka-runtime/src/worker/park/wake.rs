@@ -15,7 +15,7 @@ use crate::{
 };
 #[cfg(feature = "steal")]
 use crate::{
-    scheduler::stealing::relocate::ForwardTable, task::state::TaskState, worker::registry,
+    scheduler::stealing::relocate::ForwardTable, task::cell::state::TaskState, worker::registry,
 };
 
 /// Wakes `task_ref`: transitions it to `Woken` and, on success, pushes it
@@ -96,10 +96,7 @@ mod tests {
     use super::wake_local;
     use crate::{
         scheduler::runnable::queue::LocalRunQueue,
-        task::{
-            cell::{lifecycle::spawn_insert, slot::TaskSlot},
-            state::TaskState,
-        },
+        task::cell::{lifecycle::spawn_insert, slot::TaskSlot, state::TaskState},
     };
 
     struct Pending;

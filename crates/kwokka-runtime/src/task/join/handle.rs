@@ -27,7 +27,7 @@ use core::{
 use kwokka_core::id::Pip;
 
 use crate::{
-    task::{TaskRef, marker::Mode},
+    task::{TaskRef, migration::marker::Mode},
     worker::{WorkerId, poll::polling},
 };
 
@@ -148,7 +148,7 @@ impl<T, M: Mode> Future for TaskHandle<T, M> {
 #[cfg(not(loom))]
 mod tests {
     use super::*;
-    use crate::task::marker::{Affine, Stealing};
+    use crate::task::migration::marker::{Affine, Stealing};
 
     const _: fn() = || {
         const fn assert_send_sync<T: Send + Sync>() {}

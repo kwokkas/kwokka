@@ -17,7 +17,10 @@ use crate::{
             ForwardTable, HandoffMsg, StealRequest, move_in, move_out, move_out_woken,
         },
     },
-    task::{TaskRef, cell::slot::TaskSlot, state::TaskState},
+    task::{
+        TaskRef,
+        cell::{slot::TaskSlot, state::TaskState},
+    },
 };
 
 /// Where a relocated resident came from: the victim worker and the husk
@@ -316,7 +319,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::task::{cell::header::Slot, state::TaskState};
+    use crate::task::cell::{header::Slot, state::TaskState};
 
     struct Inert;
     impl Future for Inert {

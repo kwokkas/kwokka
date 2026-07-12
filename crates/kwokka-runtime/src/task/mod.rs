@@ -1,17 +1,16 @@
-//! Task identity, state, mode markers, waker, the slab cell, and the join surface.
+//! What a task is: the cell it lives in, what names it, how it migrates,
+//! how it yields, and the join surface a caller waits on.
 
 pub(crate) mod cell;
-mod identity;
+mod cooperative;
 pub(crate) mod join;
-mod marker;
-pub(crate) mod state;
-pub(crate) mod waker;
-mod yielding;
+pub(crate) mod migration;
+pub(crate) mod reference;
 
-pub use identity::TaskRef;
+pub use cooperative::{YieldNow, yield_now};
 pub use join::{
     handle::{JoinError, TaskHandle},
     scope::{Scope, SpawnError, scope, scope_send},
 };
-pub use marker::{Affine, Mode, Stealing};
-pub use yielding::{YieldNow, yield_now};
+pub use migration::marker::{Affine, Mode, Stealing};
+pub use reference::identity::TaskRef;

@@ -25,7 +25,7 @@ use core::{
 use kwokka_io::operation::{IoRequest, SubmitResult};
 
 use crate::{
-    task::{cell::header::WakeData, waker},
+    task::{cell::header::WakeData, reference::waker},
     worker::{WorkerId, poll::polling},
 };
 

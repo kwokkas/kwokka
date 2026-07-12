@@ -218,9 +218,8 @@ mod tests {
     use crate::{
         scheduler::runnable::queue::LocalRunQueue,
         task::{
-            cell::{header::Slot, lifecycle::spawn_insert, slot::TaskSlot},
+            cell::{header::Slot, lifecycle::spawn_insert, slot::TaskSlot, state::TaskState},
             join::children::iter_children,
-            state::TaskState,
         },
         timer::wheel::{TimerWheel, clock::Clock},
         worker::{
