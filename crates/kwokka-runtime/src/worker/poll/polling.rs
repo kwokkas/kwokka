@@ -39,11 +39,11 @@ use crate::{
         cell::{header::WakeData, slot::TaskSlot},
         waker::waker_from_task_ref,
     },
-    timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
     worker::{
         WorkerId,
         poll::frame::PollFrame,
         queue::{
+            arm::{TIMER_INBOX_CAPACITY, TimerInbox},
             inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },

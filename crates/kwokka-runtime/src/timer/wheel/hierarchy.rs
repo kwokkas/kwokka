@@ -6,13 +6,11 @@ use kwokka_core::slab::{Slab, SlabError};
 
 use crate::{
     task::TaskRef,
-    timer::{
+    timer::wheel::{
         clock::Clock,
-        wheel::{
-            entry::TimerEntry,
-            handle::{TimerHandle, nz_to_slab, slab_to_nz},
-            slot::WheelLevel,
-        },
+        entry::TimerEntry,
+        handle::{TimerHandle, nz_to_slab, slab_to_nz},
+        slot::WheelLevel,
     },
 };
 

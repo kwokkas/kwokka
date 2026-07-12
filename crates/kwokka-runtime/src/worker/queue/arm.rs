@@ -2,7 +2,7 @@
 //! to arm a timer without reaching the worker's timer wheel mid-poll.
 //!
 //! A polled task cannot register on the timer wheel directly: the run-loop
-//! owns the wheel, and the [`Clock`](crate::timer::clock::Clock) generic on
+//! owns the wheel, and the [`Clock`](crate::timer::wheel::clock::Clock) generic on
 //! [`TimerWheel`](crate::timer::wheel::TimerWheel) does not cross the
 //! non-generic poll frame. Instead a sleeping future records a relative delay
 //! here -- a worker field disjoint from the task slab -- and the run-loop

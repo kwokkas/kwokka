@@ -27,16 +27,13 @@ use crate::worker::park::wake::wake_or_forward;
 use crate::{
     scheduler::{dispatch::PollOutcome, queue::LocalRunQueue},
     task::{TaskRef, cell::slot::TaskSlot, join::children::push_child},
-    timer::{
-        clock::Clock,
-        request::{TIMER_INBOX_CAPACITY, TimerInbox},
-        wheel::TimerWheel,
-    },
+    timer::wheel::{TimerWheel, clock::Clock},
     worker::{
         WorkerId,
         park::wake::wake_local,
         poll::polling::poll_one,
         queue::{
+            arm::{TIMER_INBOX_CAPACITY, TimerInbox},
             inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },
@@ -221,14 +218,11 @@ mod tests {
             join::children::iter_children,
             state::TaskState,
         },
-        timer::{
-            clock::Clock,
-            request::{TIMER_INBOX_CAPACITY, TimerInbox},
-            wheel::TimerWheel,
-        },
+        timer::wheel::{TimerWheel, clock::Clock},
         worker::{
             WorkerId,
             queue::{
+                arm::{TIMER_INBOX_CAPACITY, TimerInbox},
                 inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
                 reap::{REAP_QUEUE_CAPACITY, ReapQueue},
             },
