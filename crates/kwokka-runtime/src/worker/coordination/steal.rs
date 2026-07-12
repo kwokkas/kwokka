@@ -258,8 +258,7 @@ mod tests {
     #[test]
     fn a_handoff_reply_round_trips_to_the_thief() {
         use kwokka_core::{
-            id::Pip,
-            namespace::Namespace,
+            id::{Namespace, Pip},
             slab::{Slab, SlabKey},
         };
 

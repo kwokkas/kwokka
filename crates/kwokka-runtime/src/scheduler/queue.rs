@@ -97,7 +97,7 @@ mod tests {
 
         let cell = Slot::new(
             kwokka_core::id::Pip::detached(),
-            kwokka_core::namespace::Namespace::ROOT,
+            kwokka_core::id::Namespace::ROOT,
             DummyFut,
         )
         .into_erased();

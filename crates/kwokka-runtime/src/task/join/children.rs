@@ -229,7 +229,10 @@ mod tests {
     };
     use std::collections::HashMap;
 
-    use kwokka_core::{Generation, id::Pip, namespace::Namespace};
+    use kwokka_core::{
+        Generation,
+        id::{Namespace, Pip},
+    };
 
     use super::*;
     use crate::task::cell::header::Slot;

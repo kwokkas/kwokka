@@ -18,7 +18,7 @@
 
 use core::{future::Future, ptr::NonNull};
 
-use kwokka_core::{namespace::Namespace, slab::SlabKey};
+use kwokka_core::{id::Namespace, slab::SlabKey};
 use kwokka_io::{
     IoDriver,
     boundary::{
