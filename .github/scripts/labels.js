@@ -44,10 +44,9 @@ const moduleFor = (path) => {
   if (/^crates\/kwokka-runtime\/src\/runtime\/affine\b/.test(path)) return "M-affine";
   if (/^crates\/kwokka-runtime\/src\/runtime\/stealing\b/.test(path)) return "M-stealing";
   const io = path.match(
-    /^crates\/kwokka-io\/src\/(buffer|uring|epoll|kqueue|iocp|operation)\//,
+    /^crates\/kwokka-io\/src\/(buffer|uring|epoll|kqueue|iocp|operation|driver)\//,
   );
   if (io) return `M-${io[1]}`;
-  if (/^crates\/kwokka-io\/src\/(driver|dispatch)\.rs$/.test(path)) return "M-driver";
   return null;
 };
 
