@@ -50,13 +50,13 @@ use crate::{
         Completion, InlineBuf, IoBuf, IoBufMut, IoRequest, OpCode, SubmitResult, SubmitToken,
     },
     uring::{
-        completion::drain_completions,
+        backend::submission::{SubmitScratch, build_entry, build_entry_read, build_entry_write},
+        cqe::completion::drain_completions,
         opcode::control::build_link_timeout,
         setup::{
             detect::{ProbeResult, probe_and_create},
             flags::SetupTier,
         },
-        submission::{SubmitScratch, build_entry, build_entry_read, build_entry_write},
     },
 };
 
@@ -444,7 +444,7 @@ fn register_provided_recv_pool(ring: &IoUring) -> Result<BufRingPool, RegisterEr
         BufGroupId(PROVIDED_RECV_GROUP_ID),
     )
     .map_err(|_| RegisterError::SlotExhausted)?;
-    crate::uring::fixed::register_buf_ring(
+    crate::uring::backend::fixed::register_buf_ring(
         ring,
         pool.ring_addr(),
         pool.entries(),
@@ -564,18 +564,18 @@ impl IoDriver for UringDriver {
     }
 
     fn unregister_buffers(&self, group: BufGroupId) -> Result<(), RegisterError> {
-        crate::uring::fixed::unregister_buffers(self.ring_mut())?;
+        crate::uring::backend::fixed::unregister_buffers(self.ring_mut())?;
         self.buffers_mut().release(group)?;
         Ok(())
     }
 
     fn register_files(&self, fds: &[i32]) -> Result<FdSlot, RegisterError> {
-        crate::uring::fixed::register_files(self.ring_mut(), fds)?;
+        crate::uring::backend::fixed::register_files(self.ring_mut(), fds)?;
         self.files_mut().allocate()
     }
 
     fn unregister_files(&self, slot: FdSlot) -> Result<(), RegisterError> {
-        crate::uring::fixed::unregister_files(self.ring_mut())?;
+        crate::uring::backend::fixed::unregister_files(self.ring_mut())?;
         self.files_mut().release(slot)?;
         Ok(())
     }
