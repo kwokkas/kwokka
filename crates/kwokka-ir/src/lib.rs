@@ -22,13 +22,12 @@ pub mod node;
 pub mod policy;
 pub mod registry;
 
-pub use conductor::{ConductorView, EdgeView, StageView};
+pub use conductor::{
+    ConductorBlob, ConductorView, ConfigBindingSpec, EdgeView, RegistrySpec, StageSpec, StageView,
+};
 pub use config::{ConfigBindingView, ScalarValue};
 pub use error::IrError;
-pub use flat::{
-    ConductorBlob, ConfigBindingSpec, RegistrySpec, StageSpec, WriteError, validate,
-    write_conductor,
-};
+pub use flat::{WriteError, validate, write_conductor};
 pub use node::{KwokkaIr, NodeTag};
 pub use policy::{BreakerView, LimiterView, PolicyKind, RetryView, TimeoutView};
 pub use registry::RegistryView;
