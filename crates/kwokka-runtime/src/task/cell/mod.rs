@@ -2,6 +2,7 @@
 //! state machine the header carries, and the lifecycle that drives a cell from
 //! insertion through each poll.
 
+pub(crate) mod erased;
 pub(crate) mod header;
 pub(crate) mod layout;
 pub(crate) mod lifecycle;
