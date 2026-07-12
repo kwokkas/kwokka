@@ -9,6 +9,7 @@
 )]
 
 mod buffer;
+mod completion;
 #[cfg(unix)]
 pub(crate) mod msghdr;
 mod op;
@@ -16,5 +17,6 @@ mod token;
 pub(crate) mod vectored;
 
 pub use buffer::{FixedBuf, InlineBuf, IoBuf, IoBufMut};
+pub use completion::{Completion, CqeFlags};
 pub use op::{OpCode, OpFlags};
 pub use token::{SubmitResult, SubmitToken};

@@ -1,20 +1,11 @@
-//! I/O request type -- the submit payload handed to a backend.
-#![allow(
-    dead_code,
-    reason = "consumed by the backend submit path, not yet implemented"
-)]
-#![allow(
-    clippy::redundant_pub_crate,
-    reason = "pub(crate) satisfies unreachable_pub on this private module"
-)]
+//! The request itself: its payload shapes, and the fields every op carries.
 
 #[cfg(unix)]
 use std::ptr::NonNull;
 
 use crate::{
     addr::SockAddr,
-    buffer::registration::slot::BufGroupId,
-    operation::{IoBuf, IoBufMut, OpCode, OpFlags, SubmitToken},
+    operation::core::{OpCode, OpFlags, SubmitToken},
 };
 
 /// An I/O request ready for submission to a backend.
@@ -141,7 +132,7 @@ pub enum ControlPayload {
 }
 
 impl<B> IoRequest<B> {
-    fn build(fd: i32, opcode: OpCode, payload: OpPayload<B>) -> Self {
+    pub(crate) fn build(fd: i32, opcode: OpCode, payload: OpPayload<B>) -> Self {
         Self {
             fd,
             opcode,
@@ -183,254 +174,10 @@ impl<B> IoRequest<B> {
     }
 }
 
-impl<B: IoBufMut> IoRequest<B> {
-    /// Read from `fd` into `buf` at `offset`.
-    pub fn read(fd: i32, buf: B, offset: u64) -> Self {
-        Self::build(fd, OpCode::Read, OpPayload::Buffer { buf, offset })
-    }
-
-    /// Receive from `fd` into `buf`.
-    pub fn recv(fd: i32, buf: B) -> Self {
-        Self::build(fd, OpCode::Recv, OpPayload::Buffer { buf, offset: 0 })
-    }
-
-    /// Receive from `fd` into `buf`, multishot variant.
-    pub fn recv_multishot(fd: i32, buf: B) -> Self {
-        Self::recv(fd, buf).with_multishot()
-    }
-
-    /// Vectored read from `fd` into `buf` at `offset`.
-    pub fn readv(fd: i32, buf: B, offset: u64) -> Self {
-        let mut request = Self::build(fd, OpCode::Read, OpPayload::Buffer { buf, offset });
-        request.flags = request.flags.with_vectored(true);
-        request
-    }
-}
-
-impl<B: IoBuf> IoRequest<B> {
-    /// Write `buf` to `fd` at `offset`.
-    pub fn write(fd: i32, buf: B, offset: u64) -> Self {
-        Self::build(fd, OpCode::Write, OpPayload::Buffer { buf, offset })
-    }
-
-    /// Send `buf` over `fd`.
-    pub fn send(fd: i32, buf: B) -> Self {
-        Self::build(fd, OpCode::Send, OpPayload::Buffer { buf, offset: 0 })
-    }
-
-    /// Send `buf` over `fd` zero-copy (`SEND_ZC`).
-    ///
-    /// The kernel reads `buf` in place rather than copying it into kernel space
-    /// (`io_uring_prep_send_zc.3`), so the buffer must outlive the send: the op
-    /// posts a notification completion once the kernel has released it.
-    pub fn send_zc(fd: i32, buf: B) -> Self {
-        Self::build(fd, OpCode::SendZc, OpPayload::Buffer { buf, offset: 0 })
-    }
-
-    /// Vectored write of `buf` to `fd` at `offset`.
-    pub fn writev(fd: i32, buf: B, offset: u64) -> Self {
-        let mut request = Self::build(fd, OpCode::Write, OpPayload::Buffer { buf, offset });
-        request.flags = request.flags.with_vectored(true);
-        request
-    }
-}
-
-impl IoRequest<()> {
-    /// Accept a connection on `fd`.
-    pub fn accept(fd: i32) -> Self {
-        Self::build(fd, OpCode::Accept, OpPayload::Fd)
-    }
-
-    /// Accept connections on `fd`, multishot variant.
-    pub fn accept_multishot(fd: i32) -> Self {
-        Self::accept(fd).with_multishot()
-    }
-
-    /// Receive on `fd` into a kernel-selected provided buffer from `group`.
-    ///
-    /// Carries no caller buffer -- the kernel picks a buffer from the
-    /// registered `buf_ring` group and echoes the chosen id in the CQE flags.
-    pub fn recv_provided(fd: i32, group: BufGroupId) -> Self {
-        let mut request = Self::build(fd, OpCode::RecvProvided, OpPayload::Fd);
-        request.common.buf_group = Some(group.0);
-        request.flags = request.flags.with_buffer_select(true);
-        request
-    }
-
-    /// Receive on `fd` into kernel-selected provided buffers, multishot variant.
-    ///
-    /// One SQE streams a CQE per received buffer until cancelled; each carries
-    /// the chosen buffer id in its CQE flags, the same as
-    /// [`recv_provided`](Self::recv_provided) but re-armed by the kernel after
-    /// every buffer.
-    pub fn recv_multishot_provided(fd: i32, group: BufGroupId) -> Self {
-        Self::recv_provided(fd, group).with_multishot()
-    }
-
-    /// Connect `fd` to `addr`.
-    pub fn connect(fd: i32, addr: SockAddr) -> Self {
-        Self::build(fd, OpCode::Connect, OpPayload::Socket { addr })
-    }
-
-    /// Send a pre-built message over `fd` (`sendmsg`).
-    ///
-    /// The `msghdr` and its backing bytes live in the caller's future-pinned
-    /// in-flight slot, so this carries only the pointer.
-    #[cfg(unix)]
-    pub(crate) fn sendmsg_prepared(fd: i32, msghdr: NonNull<libc::msghdr>) -> Self {
-        Self::build(fd, OpCode::Sendmsg, OpPayload::Msg { msghdr })
-    }
-
-    /// Receive a message on `fd` into a pre-built `msghdr` (`recvmsg`).
-    ///
-    /// The `msghdr` and its backing bytes live in the caller's future-pinned
-    /// in-flight slot, so this carries only the pointer.
-    #[cfg(unix)]
-    pub(crate) fn recvmsg_prepared(fd: i32, msghdr: NonNull<libc::msghdr>) -> Self {
-        Self::build(fd, OpCode::Recvmsg, OpPayload::Msg { msghdr })
-    }
-
-    /// Close `fd`.
-    pub fn close(fd: i32) -> Self {
-        Self::build(fd, OpCode::Close, OpPayload::Fd)
-    }
-
-    /// Flush data and metadata for `fd`.
-    pub fn fsync(fd: i32) -> Self {
-        Self::build(fd, OpCode::Fsync, OpPayload::Fd)
-    }
-
-    /// Pre-allocate or deallocate disk space for `fd`.
-    pub fn fallocate(fd: i32) -> Self {
-        Self::build(fd, OpCode::Fallocate, OpPayload::Fd)
-    }
-
-    /// Advise the kernel on access pattern for `fd`.
-    pub fn fadvise(fd: i32) -> Self {
-        Self::build(fd, OpCode::Fadvise, OpPayload::Fd)
-    }
-
-    /// Move data between file descriptors without copying to userspace.
-    pub fn splice(
-        fd_in: i32,
-        off_in: i64,
-        fd_out: i32,
-        off_out: i64,
-        nbytes: u32,
-        splice_flags: u32,
-    ) -> Self {
-        Self::build(
-            fd_in,
-            OpCode::Splice,
-            OpPayload::Splice {
-                fd_out,
-                off_in,
-                off_out,
-                nbytes,
-                splice_flags,
-            },
-        )
-    }
-
-    /// Duplicate data from `fd_in` to `fd_out` without consuming it.
-    pub fn tee(fd_in: i32, fd_out: i32, nbytes: u32, splice_flags: u32) -> Self {
-        Self::build(
-            fd_in,
-            OpCode::Tee,
-            OpPayload::Splice {
-                fd_out,
-                off_in: -1,
-                off_out: -1,
-                nbytes,
-                splice_flags,
-            },
-        )
-    }
-
-    /// Shut down a socket `fd`.
-    pub fn shutdown(fd: i32) -> Self {
-        Self::build(fd, OpCode::Shutdown, OpPayload::Fd)
-    }
-
-    /// Create a new socket with the given domain, type, and protocol.
-    pub fn socket(domain: i32, socket_type: i32, protocol: i32) -> Self {
-        Self::build(
-            -1,
-            OpCode::Socket,
-            OpPayload::NewSocket {
-                domain,
-                socket_type,
-                protocol,
-            },
-        )
-    }
-}
-
-impl IoRequest<()> {
-    /// Arm a completion timeout.
-    #[doc(hidden)]
-    pub fn timeout(duration_ns: u64) -> Self {
-        Self::build(
-            -1,
-            OpCode::Timeout,
-            OpPayload::Control(ControlPayload::Timeout { duration_ns }),
-        )
-    }
-
-    /// Cancel an in-flight operation.
-    #[doc(hidden)]
-    pub fn cancel(target: SubmitToken) -> Self {
-        Self::build(
-            -1,
-            OpCode::Cancel,
-            OpPayload::Control(ControlPayload::Cancel { target }),
-        )
-    }
-
-    /// Wake another ring via `IORING_OP_MSG_RING`.
-    ///
-    /// Posts [`MSG_RING_WAKE_USER_DATA`](crate::boundary::MSG_RING_WAKE_USER_DATA)
-    /// as the target ring's CQE `user_data`, and as this op's own SQE
-    /// `user_data`, so a rare source-side failure CQE (`SKIP_SUCCESS` drops the
-    /// success CQE) is recognized by the same sentinel rather than misrouted
-    /// onto a task slot. The target's completion drain unparks and discards it.
-    #[doc(hidden)]
-    pub fn msg_ring_wake(target_ring_fd: i32) -> Self {
-        Self::build(
-            target_ring_fd,
-            OpCode::MsgRing,
-            OpPayload::Control(ControlPayload::MsgRing {
-                result: 0,
-                sentinel: crate::boundary::MSG_RING_WAKE_USER_DATA,
-            }),
-        )
-        .with_user_data(crate::boundary::MSG_RING_WAKE_USER_DATA)
-    }
-
-    /// Poll a file descriptor for readiness.
-    #[doc(hidden)]
-    pub fn poll_add(fd: i32, events: u32) -> Self {
-        Self::build(
-            fd,
-            OpCode::Poll,
-            OpPayload::Control(ControlPayload::PollAdd { events }),
-        )
-    }
-
-    /// Remove a poll watch.
-    #[doc(hidden)]
-    pub fn poll_remove(fd: i32, token: SubmitToken) -> Self {
-        Self::build(
-            fd,
-            OpCode::Poll,
-            OpPayload::Control(ControlPayload::PollRemove { token }),
-        )
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::operation::core::{IoBuf, IoBufMut};
 
     struct MockBuf {
         data: [u8; 64],
