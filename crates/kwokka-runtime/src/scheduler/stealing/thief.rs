@@ -106,11 +106,8 @@ pub(crate) fn report_settled<F>(
 ) where
     F: FnMut(Origin) -> bool,
 {
-    let Ok(capacity) = u32::try_from(origins.entries.len()) else {
-        return;
-    };
-    for index in 0..capacity {
-        let Some(origin) = origins.entries[index as usize] else {
+    for index in 0..origins.capacity() {
+        let Some(origin) = origins.peek(index) else {
             continue;
         };
         if !is_resident_settled(tasks, index) {
@@ -119,7 +116,7 @@ pub(crate) fn report_settled<F>(
         if !report(origin) {
             continue;
         }
-        origins.entries[index as usize] = None;
+        origins.take(index);
         tasks.remove_by_index(index);
     }
 }

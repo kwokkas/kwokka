@@ -31,7 +31,7 @@ pub(crate) struct Origin {
 /// is pushed, so a slot index never carries a stale origin into its next
 /// resident: the take precedes the slot's release on every settle path.
 pub(crate) struct ForwardOrigin {
-    pub(crate) entries: Vec<Option<Origin>>,
+    entries: Vec<Option<Origin>>,
 }
 
 impl ForwardOrigin {
@@ -42,6 +42,22 @@ impl ForwardOrigin {
             entries.push(None);
         }
         Self { entries }
+    }
+
+    /// Slots the table covers, matching the owning slab's capacity.
+    ///
+    /// A table too large to index with a `u32` reports zero, which walks no
+    /// slots -- a slab that big cannot be addressed by a `SlabKey` anyway.
+    pub(crate) fn capacity(&self) -> u32 {
+        u32::try_from(self.entries.len()).unwrap_or(0)
+    }
+
+    /// The origin recorded for `index`, leaving it in place.
+    ///
+    /// The read half of [`take`](ForwardOrigin::take): a settle report reads
+    /// the origin, decides whether the note landed, and only then takes it.
+    pub(crate) fn peek(&self, index: u32) -> Option<Origin> {
+        *self.entries.get(index as usize)?
     }
 
     /// Records that the resident installed at `index` came from `origin`.
@@ -58,13 +74,6 @@ impl ForwardOrigin {
     }
 
     /// Takes the origin recorded for `index`, leaving the slot bare.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "consumed only in test assertions; the settle report path lands in a later PR"
-        )
-    )]
     pub(crate) fn take(&mut self, index: u32) -> Option<Origin> {
         self.entries.get_mut(index as usize)?.take()
     }
