@@ -19,7 +19,7 @@ use core::{
 use kwokka_core::id::{Namespace, Pip};
 
 pub(crate) use crate::task::cell::layout::Slot;
-use crate::task::{TaskRef, state::AtomicTaskState};
+use crate::task::{TaskRef, cell::state::AtomicTaskState};
 
 /// I/O completion data stored by the worker drain loop for the task's
 /// next poll to consume.

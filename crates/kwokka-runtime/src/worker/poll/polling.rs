@@ -40,7 +40,7 @@ use crate::{
             lifecycle::{PollOutcome, poll_task},
             slot::TaskSlot,
         },
-        waker::waker_from_task_ref,
+        reference::waker::waker_from_task_ref,
     },
     worker::{
         WorkerId,
@@ -256,8 +256,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        task::{
-            cell::header::{Slot, WakeData},
+        task::cell::{
+            header::{Slot, WakeData},
             state::TaskState,
         },
         worker::queue::{

@@ -140,7 +140,7 @@ impl WorkerShard {
     pub(crate) fn new(id: WorkerId, driver: DriverType, task_capacity: usize) -> io::Result<Self> {
         // Every shard construction precedes its worker's first poll, so the
         // seam can translate task wakers from the very first submit.
-        crate::task::waker::register_seam_decoder();
+        crate::task::reference::waker::register_seam_decoder();
         let timer = TimerWheel::new(SystemClock::new(), task_capacity);
         let inflight_slab = InflightBufSlab::new(id.raw(), DEFAULT_INFLIGHT_CAP)?;
         Ok(Self {

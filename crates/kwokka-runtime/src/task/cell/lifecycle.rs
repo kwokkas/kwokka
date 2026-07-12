@@ -18,8 +18,7 @@ use kwokka_core::{
 
 use crate::task::{
     TaskRef,
-    cell::{header::Slot, slot::TaskSlot},
-    state::TaskState,
+    cell::{header::Slot, slot::TaskSlot, state::TaskState},
 };
 
 /// Result of a single [`poll_task`] attempt.
@@ -126,7 +125,10 @@ mod tests {
     };
 
     use super::{PollOutcome, poll_task, spawn_insert};
-    use crate::task::{cell::slot::TaskSlot, state::TaskState, waker::waker_from_task_ref};
+    use crate::task::{
+        cell::{slot::TaskSlot, state::TaskState},
+        reference::waker::waker_from_task_ref,
+    };
 
     /// Future that records its own drop, optionally completing immediately.
     struct CountingFuture {

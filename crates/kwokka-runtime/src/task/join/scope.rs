@@ -45,8 +45,8 @@ use crate::{
     task::{
         TaskRef,
         cell::{header::Slot, slot::TaskSlot},
-        marker::{Affine, Mode, Stealing},
-        waker,
+        migration::marker::{Affine, Mode, Stealing},
+        reference::waker,
     },
     worker::{WorkerId, poll::polling, queue::inbox::PendingSpawn},
 };

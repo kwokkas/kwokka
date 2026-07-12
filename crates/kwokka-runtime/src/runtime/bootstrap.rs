@@ -34,7 +34,10 @@ use kwokka_io::{
 
 use crate::{
     runtime::handle::Runtime,
-    task::{Affine, TaskRef, cell::lifecycle::spawn_insert, state::TaskState},
+    task::{
+        Affine, TaskRef,
+        cell::{lifecycle::spawn_insert, state::TaskState},
+    },
     timer::wheel::clock::SystemClock,
     worker::{
         cycle::{self, Tick},

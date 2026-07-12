@@ -21,11 +21,9 @@ use core::{
 
 use kwokka_core::id::{Namespace, Pip};
 
-use crate::task::{
-    cell::{
-        header::{TaskHeader, TaskVTable},
-        slot::TaskSlot,
-    },
+use crate::task::cell::{
+    header::{TaskHeader, TaskVTable},
+    slot::TaskSlot,
     state::TaskState,
 };
 
@@ -34,7 +32,7 @@ use crate::task::{
 /// `repr(C)` puts `output` first so the join handle can read it at the
 /// fixed offset [`Slot::OUTPUT_OFFSET`] without consulting `offset_of!`.
 /// The cell is *not* an enum: which half is currently initialized is
-/// encoded by the header's [`TaskState`](crate::task::state::TaskState)
+/// encoded by the header's [`TaskState`](crate::task::cell::state::TaskState)
 /// (Pending / Done / Taken) per the layout contract.
 #[repr(C)]
 pub(crate) struct TaskCell<F: Future> {
@@ -472,10 +470,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::task::{
-        cell::{header::WakeData, slot::TaskSlot},
-        state::TaskState,
-    };
+    use crate::task::cell::{header::WakeData, slot::TaskSlot, state::TaskState};
 
     /// Counts how many times each side of the cell has been dropped, used by
     /// `drop_in_place` branching tests.

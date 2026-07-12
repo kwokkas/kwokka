@@ -18,7 +18,7 @@ use core::{
 };
 
 use crate::{
-    task::waker,
+    task::reference::waker,
     timer::wheel::clock::TICK_NS,
     worker::{WorkerId, poll::polling},
 };
@@ -145,7 +145,7 @@ mod tests {
         task::{
             TaskRef,
             cell::{header::WakeData, slot::TaskSlot},
-            waker::waker_from_task_ref,
+            reference::waker::waker_from_task_ref,
         },
         worker::{
             WorkerId,
