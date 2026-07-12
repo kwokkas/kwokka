@@ -13,7 +13,7 @@ use kwokka_io::wake;
 use crate::{
     runtime::{builder::RuntimeBuilder, crew::Crew},
     task::{Affine, Mode},
-    worker::{registry, shard::WorkerShard},
+    worker::{registry, shard::state::WorkerShard},
 };
 
 /// A constructed runtime owning its lead worker's state.

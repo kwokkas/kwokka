@@ -7,7 +7,7 @@ use kwokka_io::{DriverType, wake};
 use crate::{
     runtime::handle::Runtime,
     task::{Affine, Stealing},
-    worker::{registry, shard::WorkerShard},
+    worker::{registry, shard::state::WorkerShard},
 };
 
 /// Default `io_uring` submission/completion ring depth.
