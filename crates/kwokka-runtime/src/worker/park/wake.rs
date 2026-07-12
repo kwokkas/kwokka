@@ -15,7 +15,7 @@ use crate::{
 };
 #[cfg(feature = "steal")]
 use crate::{
-    scheduler::stealing::relocate::ForwardTable, task::cell::state::TaskState, worker::registry,
+    scheduler::stealing::forward::ForwardTable, task::cell::state::TaskState, worker::registry,
 };
 
 /// Wakes `task_ref`: transitions it to `Woken` and, on success, pushes it
@@ -151,7 +151,7 @@ mod tests {
         use kwokka_core::Generation;
 
         use crate::{
-            scheduler::stealing::relocate::ForwardTable,
+            scheduler::stealing::forward::ForwardTable,
             task::TaskRef,
             worker::{WorkerId, registry},
         };
@@ -186,7 +186,7 @@ mod tests {
     #[cfg(feature = "steal")]
     #[test]
     fn a_husk_wake_without_route_drops() {
-        use crate::scheduler::stealing::relocate::ForwardTable;
+        use crate::scheduler::stealing::forward::ForwardTable;
         let mut tasks = Slab::<TaskSlot>::new(1);
         let mut run_queue = LocalRunQueue::new();
         let Ok(stale) = spawn_insert(&mut tasks, 19, Pip::detached(), Namespace::ROOT, Pending)
