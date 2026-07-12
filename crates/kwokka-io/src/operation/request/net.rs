@@ -1,7 +1,8 @@
 //! Socket lifecycle and message ops: accept, connect, shutdown, and the
 //! prepared `msghdr` pair.
 
-use core::ptr::NonNull;
+#[cfg(unix)]
+use std::ptr::NonNull;
 
 use crate::{
     addr::SockAddr,
