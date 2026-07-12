@@ -209,8 +209,7 @@ mod tests {
     };
 
     use kwokka_core::{
-        id::Pip,
-        namespace::Namespace,
+        id::{Namespace, Pip},
         slab::{Slab, SlabKey},
     };
 

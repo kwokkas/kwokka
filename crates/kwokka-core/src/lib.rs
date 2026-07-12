@@ -23,7 +23,6 @@ pub mod flat;
 pub mod generation;
 pub mod hint;
 pub mod id;
-pub mod namespace;
 pub mod slab;
 
 pub use arena::{
@@ -35,6 +34,5 @@ pub use cancellation::{
 pub use flat::FlatLayout;
 pub use generation::Generation;
 pub use hint::{AffinityHint, SchedulingHint};
-pub use id::{Pip, PipError};
-pub use namespace::Namespace;
+pub use id::{Namespace, Pip, PipError};
 pub use slab::{Slab, SlabError, SlabKey};

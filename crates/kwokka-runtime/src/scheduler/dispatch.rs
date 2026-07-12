@@ -11,8 +11,7 @@ use core::{
 };
 
 use kwokka_core::{
-    id::Pip,
-    namespace::Namespace,
+    id::{Namespace, Pip},
     slab::{Slab, SlabError},
 };
 
@@ -121,8 +120,7 @@ mod tests {
     };
 
     use kwokka_core::{
-        id::Pip,
-        namespace::Namespace,
+        id::{Namespace, Pip},
         slab::{Slab, SlabError, SlabKey},
     };
 

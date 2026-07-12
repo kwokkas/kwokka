@@ -16,7 +16,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use kwokka_core::{id::Pip, namespace::Namespace};
+use kwokka_core::id::{Namespace, Pip};
 
 pub(crate) use crate::task::cell::layout::Slot;
 use crate::task::{TaskRef, state::AtomicTaskState};

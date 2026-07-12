@@ -310,7 +310,10 @@ mod tests {
         task::{Context, Poll, Waker},
     };
 
-    use kwokka_core::{Generation, id::Pip, namespace::Namespace};
+    use kwokka_core::{
+        Generation,
+        id::{Namespace, Pip},
+    };
 
     use super::*;
     use crate::task::{cell::header::Slot, state::TaskState};

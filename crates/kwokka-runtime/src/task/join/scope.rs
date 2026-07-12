@@ -39,7 +39,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use kwokka_core::{id::Pip, namespace::Namespace};
+use kwokka_core::id::{Namespace, Pip};
 
 use crate::{
     task::{
