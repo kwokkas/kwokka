@@ -51,7 +51,7 @@ use crate::{
     worker::{WorkerId, cycle::Tick, registry, shard::state::WorkerShard},
 };
 #[cfg(feature = "steal")]
-use crate::{scheduler::stealing::handoff, worker::park::wake::wake_or_forward};
+use crate::{scheduler::stealing::thief, worker::park::wake::wake_or_forward};
 
 /// One stealing runtime per process: the crew shares the process-global
 /// wake tables, the shutdown flag, and a contiguous id block. Claimed at
@@ -293,7 +293,7 @@ fn try_steal(shard: &mut WorkerShard, lead: WorkerId, workers: usize) {
     let Some(victim) = next_victim(shard, lead, workers) else {
         return;
     };
-    let Some(request) = handoff::prepare_steal(&mut shard.tasks, shard.id.raw()) else {
+    let Some(request) = thief::prepare_steal(&mut shard.tasks, shard.id.raw()) else {
         return;
     };
     let promised = SlabKey::new(request.dest.index(), request.dest.generation());
