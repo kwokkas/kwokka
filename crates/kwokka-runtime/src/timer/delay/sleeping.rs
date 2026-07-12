@@ -19,7 +19,7 @@ use core::{
 
 use crate::{
     task::waker,
-    timer::clock::TICK_NS,
+    timer::wheel::clock::TICK_NS,
     worker::{WorkerId, poll::polling},
 };
 
@@ -147,7 +147,6 @@ mod tests {
             cell::{header::WakeData, slot::TaskSlot},
             waker::waker_from_task_ref,
         },
-        timer::request::{TIMER_INBOX_CAPACITY, TimerInbox},
         worker::{
             WorkerId,
             poll::{
@@ -155,6 +154,7 @@ mod tests {
                 polling::{clear, install},
             },
             queue::{
+                arm::{TIMER_INBOX_CAPACITY, TimerInbox},
                 inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
                 reap::{REAP_QUEUE_CAPACITY, ReapQueue},
             },

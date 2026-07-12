@@ -10,9 +10,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-pub(crate) mod clock;
-pub(crate) mod request;
-mod sleeping;
+mod delay;
 pub(crate) mod wheel;
 
-pub use sleeping::{Sleep, sleep};
+pub use delay::{Sleep, sleep};

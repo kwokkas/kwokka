@@ -30,8 +30,8 @@ use crate::{
         cell::{header::WakeData, slot::TaskSlot},
         state::TaskState,
     },
-    timer::request::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest},
     worker::queue::{
+        arm::{TIMER_INBOX_CAPACITY, TimerInbox, TimerRequest},
         inbox::{PendingSpawn, SPAWN_INBOX_CAPACITY, SpawnInbox},
         reap::{REAP_QUEUE_CAPACITY, ReapQueue},
     },

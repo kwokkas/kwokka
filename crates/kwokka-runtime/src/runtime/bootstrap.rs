@@ -36,7 +36,7 @@ use crate::{
     runtime::handle::Runtime,
     scheduler::dispatch::spawn_insert,
     task::{Affine, TaskRef, state::TaskState},
-    timer::clock::SystemClock,
+    timer::wheel::clock::SystemClock,
     worker::{
         cycle::{self, Tick},
         park::wake::wake_local,

@@ -30,14 +30,11 @@ use crate::scheduler::stealing::{handoff::ForwardOrigin, relocate::ForwardTable}
 use crate::{
     scheduler::queue::LocalRunQueue,
     task::cell::slot::TaskSlot,
-    timer::{
-        clock::SystemClock,
-        request::{TIMER_INBOX_CAPACITY, TimerInbox},
-        wheel::TimerWheel,
-    },
+    timer::wheel::{TimerWheel, clock::SystemClock},
     worker::{
         WorkerId,
         queue::{
+            arm::{TIMER_INBOX_CAPACITY, TimerInbox},
             inbox::{SPAWN_INBOX_CAPACITY, SpawnInbox},
             reap::{REAP_QUEUE_CAPACITY, ReapQueue},
         },
