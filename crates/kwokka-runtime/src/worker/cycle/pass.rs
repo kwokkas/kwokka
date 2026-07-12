@@ -18,7 +18,7 @@ use kwokka_io::{
 };
 
 #[cfg(feature = "steal")]
-use crate::scheduler::stealing::relocate::ForwardTable;
+use crate::scheduler::stealing::forward::ForwardTable;
 #[cfg(not(feature = "steal"))]
 use crate::worker::park::wake::wake_local;
 #[cfg(feature = "steal")]
@@ -220,7 +220,7 @@ mod tests {
         let mut timer_requests = TimerInbox::<TIMER_INBOX_CAPACITY>::new();
         #[cfg(feature = "steal")]
         {
-            let forward = crate::scheduler::stealing::relocate::ForwardTable::new(1);
+            let forward = crate::scheduler::stealing::forward::ForwardTable::new(1);
             tick(
                 tasks,
                 timer,
