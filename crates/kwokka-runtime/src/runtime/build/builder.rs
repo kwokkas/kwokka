@@ -5,7 +5,7 @@ use std::io;
 use kwokka_io::{DriverType, wake};
 
 use crate::{
-    runtime::handle::Runtime,
+    runtime::build::handle::Runtime,
     task::{Affine, Stealing},
     worker::{registry, shard::state::WorkerShard},
 };
@@ -88,14 +88,14 @@ impl RuntimeBuilder {
                 "task_capacity exceeds the wake-inbox capacity",
             ));
         }
-        if self.workers > crate::runtime::crew::MAX_WORKERS {
+        if self.workers > crate::runtime::crew::kind::MAX_WORKERS {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "worker count must not exceed the crew cap",
             ));
         }
         if self.workers > 1 {
-            return crate::runtime::affine::build(
+            return crate::runtime::crew::affine::build(
                 self.ring_entries,
                 self.task_capacity,
                 self.workers,
@@ -145,7 +145,7 @@ impl RuntimeBuilder {
                 "task_capacity exceeds the wake-inbox capacity",
             ));
         }
-        crate::runtime::stealing::build(self.ring_entries, self.task_capacity, self.workers)
+        crate::runtime::crew::stealing::build(self.ring_entries, self.task_capacity, self.workers)
     }
 }
 

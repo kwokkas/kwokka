@@ -17,11 +17,12 @@ use kwokka_io::boundary::{CancelInboxGuard, ProvidedPoolGuard, RecvCancelInboxGu
 
 use crate::{
     runtime::{
-        bootstrap::{arm_wake, park_for_next_event, run_pass},
-        handle::Runtime,
+        build::handle::Runtime,
+        crew::stealing::park_bracketed,
+        drive::turn::{arm_wake, park_for_next_event, run_pass},
     },
     task::{
-        Affine,
+        Affine, Stealing,
         cell::{lifecycle::spawn_insert, state::TaskState},
     },
     worker::{cycle::Tick, park::wake::wake_local, shard::state::WorkerShard},
@@ -115,6 +116,55 @@ impl Runtime<Affine> {
             }
             if outcome == Tick::Idle {
                 park_for_next_event(&self.shard);
+            }
+        }
+        take_root_output::<F::Output>(&mut self.shard, root_key)
+    }
+}
+
+impl Runtime<Stealing> {
+    /// Runs `future` to completion on the lead worker, blocking the calling
+    /// thread, and returns its output.
+    ///
+    /// The root task is pinned to the lead worker: it is spawned into the
+    /// lead shard, driven by the lead's run-loop, and its output is read
+    /// back on this thread. Sibling workers keep parking between calls, so
+    /// the runtime can run another future after this one returns; the crew
+    /// shuts down when the runtime drops.
+    ///
+    /// The idle park is the one step that differs from the affine root: a
+    /// lead with siblings parks through the endpoint's parked bracket, so a
+    /// cross-worker wake or the shutdown broadcast always completes it.
+    ///
+    /// The `Send` bound is the work-stealing admission contract. The root
+    /// itself never migrates, but every future entering this runtime
+    /// satisfies the bound the steal path relies on.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the root task cannot be spawned into the lead shard, or if
+    /// it terminates abnormally (cancelled or failed). A recoverable error
+    /// is the future's own `Output` and does not panic.
+    pub fn block_on<F>(&mut self, future: F) -> F::Output
+    where
+        F: Future + Send + 'static,
+    {
+        let worker_id = self.shard.id.raw();
+        let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
+        let _recv_cancel_guard =
+            RecvCancelInboxGuard::install(worker_id, &mut self.shard.recv_cancel_inbox);
+        // The pool outlives this run (it is driver-owned); the guard scopes
+        // handle access to the run-loop, clearing the slot on exit.
+        let _pool_guard = ProvidedPoolGuard::install(worker_id, &self.shard.driver);
+        let root_key = spawn_root(&mut self.shard, future);
+        arm_wake(&self.shard, self.wake_fd);
+        loop {
+            let outcome = run_pass(&mut self.shard, self.wake_fd);
+            if root_settled(&self.shard, root_key) {
+                break;
+            }
+            if outcome == Tick::Idle {
+                park_bracketed(&mut self.shard);
             }
         }
         take_root_output::<F::Output>(&mut self.shard, root_key)

@@ -3,10 +3,11 @@
 //!
 //! [`run_pass`] is the whole module in one function; the rest is the wake and
 //! cancel drains it owns, plus the park. What a pass calls out to lives next
-//! door: the completion drain in [`completion`](crate::runtime::completion) and
-//! the steal steps in [`steal`](crate::runtime::steal). The traffic with
-//! [`root`](crate::runtime::root) runs the other way, since `block_on` is what
-//! drives this loop.
+//! door: the completion drain in
+//! [`completion`](crate::runtime::drive::completion) and the steal steps in
+//! [`steal`](crate::runtime::drive::steal). The traffic with
+//! [`root`](crate::runtime::drive::root) runs the other way, since `block_on`
+//! is what drives this loop.
 //!
 //! Order is the point. Each pass flushes deferred kernel task work (a
 //! `DEFER_TASKRUN` ring posts CQEs only at a GETEVENTS enter) and drains driver
@@ -29,7 +30,7 @@ use kwokka_io::{
 #[cfg(not(feature = "steal"))]
 use crate::worker::park::wake::wake_local;
 use crate::{
-    runtime::completion::drain_completions,
+    runtime::drive::completion::drain_completions,
     timer::wheel::clock::SystemClock,
     worker::{
         cycle::{self, Tick},
@@ -40,7 +41,7 @@ use crate::{
 };
 #[cfg(feature = "steal")]
 use crate::{
-    runtime::steal::{
+    runtime::drive::steal::{
         drain_settled_notes, receive_handoffs, report_settled_relocations, serve_steals,
     },
     worker::park::wake::wake_or_forward,

@@ -25,9 +25,9 @@ use kwokka_io::{
 
 use crate::{
     runtime::{
-        bootstrap,
-        crew::{Crew, CrewKind, MAX_WORKERS, sibling_id},
-        handle::Runtime,
+        build::handle::Runtime,
+        crew::kind::{Crew, CrewKind, MAX_WORKERS, sibling_id},
+        drive::turn,
     },
     task::Affine,
     worker::{WorkerId, cycle::Tick, park::wake::wake_local, registry, shard::state::WorkerShard},
@@ -206,7 +206,7 @@ fn sibling_main(id: WorkerId, ring_entries: u32, task_capacity: usize) {
     // and the driver-owned pool -- is reclaimed.
     let _pool_guard = ProvidedPoolGuard::install(id.raw(), &shard.driver);
     registry::publish_endpoint(id, wake_fd, shard.driver.ring_fd());
-    bootstrap::arm_wake(&shard, wake_fd);
+    turn::arm_wake(&shard, wake_fd);
     AFFINE_READY.fetch_add(1, Ordering::SeqCst);
     sibling_loop(&mut shard, wake_fd);
     registry::withdraw_endpoint(id);
@@ -218,7 +218,7 @@ fn sibling_main(id: WorkerId, ring_entries: u32, task_capacity: usize) {
 /// parking through the endpoint bracket on idle passes.
 fn sibling_loop(shard: &mut WorkerShard, wake_fd: i32) {
     loop {
-        let outcome = bootstrap::run_pass(shard, wake_fd);
+        let outcome = turn::run_pass(shard, wake_fd);
         if AFFINE_SHUTDOWN.load(Ordering::SeqCst) {
             return;
         }
@@ -245,35 +245,8 @@ fn park_bracketed(shard: &mut WorkerShard) {
         wake_local(&mut shard.tasks, &mut shard.run_queue, task_ref);
         return;
     }
-    bootstrap::park_for_next_event(shard);
+    turn::park_for_next_event(shard);
     registry::set_parked(shard.id, false);
-}
-
-impl Runtime<Affine> {
-    /// Builds a multi-worker affine (thread-per-core) runtime, sized to the
-    /// host's available parallelism.
-    ///
-    /// Unlike [`Runtime::affine`], which always drives one worker on the
-    /// calling thread, the crew runtime spawns one sibling worker per available
-    /// core, each on its own thread, and is one-per-process. On a single-core
-    /// host (where `available_parallelism` reports one) it falls back to a solo
-    /// affine runtime with no one-per-process enforcement. For a custom worker
-    /// count use [`RuntimeBuilder`](crate::runtime::builder::RuntimeBuilder).
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend setup error from any worker's driver factory,
-    /// `InvalidInput` for an out-of-range configuration, or an error when
-    /// another multi-worker affine runtime is already live in this process or
-    /// the worker id space is exhausted.
-    pub fn affine_crew() -> io::Result<Self> {
-        let workers = thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(MAX_WORKERS);
-        crate::runtime::builder::RuntimeBuilder::new()
-            .workers(workers)
-            .affine()
-    }
 }
 
 #[cfg(test)]
@@ -282,7 +255,7 @@ impl Runtime<Affine> {
 // loom build drives outside a model; the miri job skips this test by name.
 #[cfg(not(any(miri, loom)))]
 mod tests {
-    use crate::runtime::builder::RuntimeBuilder;
+    use crate::runtime::build::builder::RuntimeBuilder;
 
     // AFFINE_LIVE is process-global, so one test drives the whole crew lifecycle
     // (build, run, single-instance) to keep the sequence deterministic.
