@@ -144,19 +144,22 @@ pub(crate) fn recv_cancel_inbox(
 mod tests {
     use super::*;
     use crate::{
-        boundary::{push_cancel_for_worker, push_recv_multishot_cancel_for_worker},
+        boundary::{
+            push_cancel_for_worker, push_recv_multishot_cancel_for_worker, reserve_worker_id,
+        },
         buffer::{multishot::RecvMultishotSlotKey, oneshot::inflight::InflightSlotKey},
     };
 
     #[test]
     fn cancel_guard_routes_then_clears() {
+        let worker_id = reserve_worker_id();
         let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
         {
-            let _guard = CancelInboxGuard::install(7, &mut inbox);
+            let _guard = CancelInboxGuard::install(worker_id, &mut inbox);
             push_cancel_for_worker(InflightSlotKey {
                 slot: 1,
                 generation: 0,
-                worker_id: 7,
+                worker_id,
                 op_token: 0xBEEF,
             });
         }
@@ -164,7 +167,7 @@ mod tests {
         push_cancel_for_worker(InflightSlotKey {
             slot: 2,
             generation: 0,
-            worker_id: 7,
+            worker_id,
             op_token: 0,
         });
         let Some(key) = inbox.pop() else {
@@ -180,15 +183,16 @@ mod tests {
         let Ok(mut inbox) = RecvCancelInbox::<RECV_CANCEL_INBOX_CAPACITY>::new() else {
             panic!("the inbox mmap must succeed");
         };
+        let worker_id = reserve_worker_id();
         let key = RecvMultishotSlotKey {
             slot: 5,
             generation: 9,
-            worker_id: 60,
+            worker_id,
         };
         // With no guard installed, the push finds a null slot and is a no-op.
         push_recv_multishot_cancel_for_worker(key);
         {
-            let _guard = RecvCancelInboxGuard::install(60, &mut inbox);
+            let _guard = RecvCancelInboxGuard::install(worker_id, &mut inbox);
             push_recv_multishot_cancel_for_worker(key);
         }
         // The guard cleared the slot on drop; the one routed push is still queued.

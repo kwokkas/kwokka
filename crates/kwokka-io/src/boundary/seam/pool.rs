@@ -160,6 +160,7 @@ pub(crate) fn provided_pool_epoch(worker_id: u8) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::boundary::reserve_worker_id;
 
     #[test]
     fn provided_pool_guard_brackets_install_and_clear() {
@@ -170,35 +171,37 @@ mod tests {
         ) else {
             panic!("pool creation must succeed");
         };
-        let before = provided_pool_epoch(210);
+        let worker_id = reserve_worker_id();
+        let before = provided_pool_epoch(worker_id);
         {
-            let _guard = ProvidedPoolGuard::install_pool(210, Some(&pool));
-            let epoch = provided_pool_epoch(210);
+            let _guard = ProvidedPoolGuard::install_pool(worker_id, Some(&pool));
+            let epoch = provided_pool_epoch(worker_id);
             assert_eq!(epoch, before.wrapping_add(1), "an install bumps the epoch");
             assert!(
-                provided_pool(210, epoch).is_some(),
+                provided_pool(worker_id, epoch).is_some(),
                 "the current epoch resolves the installed pool",
             );
             assert!(
-                provided_pool(210, epoch.wrapping_sub(1)).is_none(),
+                provided_pool(worker_id, epoch.wrapping_sub(1)).is_none(),
                 "a stale epoch is refused",
             );
         }
         assert!(
-            provided_pool(210, provided_pool_epoch(210)).is_none(),
+            provided_pool(worker_id, provided_pool_epoch(worker_id)).is_none(),
             "the guard clears the slot on drop",
         );
     }
 
     #[test]
     fn provided_pool_guard_without_pool_installs_nothing() {
-        let before = provided_pool_epoch(211);
-        let _guard = ProvidedPoolGuard::install_pool(211, None);
+        let worker_id = reserve_worker_id();
+        let before = provided_pool_epoch(worker_id);
+        let _guard = ProvidedPoolGuard::install_pool(worker_id, None);
         assert_eq!(
-            provided_pool_epoch(211),
+            provided_pool_epoch(worker_id),
             before,
             "a poolless install does not bump the epoch",
         );
-        assert!(provided_pool(211, before).is_none());
+        assert!(provided_pool(worker_id, before).is_none());
     }
 }

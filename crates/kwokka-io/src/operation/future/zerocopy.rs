@@ -317,30 +317,23 @@ impl<B: IoBuf> Drop for SendZcFuture<B> {
 #[cfg(test)]
 mod tests {
     use core::{pin::pin, ptr::NonNull, task::Context};
-    use std::task::Waker;
 
     use super::*;
     use crate::{
         boundary::{
-            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, SeamGuard, WakeSlot,
-            WakerBinding, WakerDecoder, decode_waker, register_decoder,
+            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, SeamGuard, TEST_DECODER,
+            WakeSlot, WakerBinding, decode_waker, register_decoder, reserve_worker_id, test_waker,
         },
         buffer::oneshot::inflight::InflightBufSlab,
         operation::FixedBuf,
     };
 
-    fn stub(waker: &Waker) -> Option<WakerBinding> {
-        waker.will_wake(Waker::noop()).then_some(WakerBinding {
-            token: 7,
-            worker_id: 3,
-        })
-    }
-
-    static STUB: WakerDecoder = stub;
-
+    // Reserves a worker id nothing else in this binary holds, so the seam and the
+    // inboxes this test installs cannot be clobbered by a test on another thread.
     fn poll_binding() -> WakerBinding {
-        register_decoder(&STUB);
-        let Some(binding) = decode_waker(Waker::noop()) else {
+        register_decoder(&TEST_DECODER);
+        let waker = test_waker(reserve_worker_id());
+        let Some(binding) = decode_waker(&waker) else {
             panic!("a registered decoder yields a binding");
         };
         binding
@@ -359,7 +352,8 @@ mod tests {
             None,
         );
         let _guard = SeamGuard::install(&seam);
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         // No driver: the first poll allocates a slot, copies the input, builds the
         // InlineBuf, has the submit refused, frees the slot, and resolves -EINVAL.
         let Poll::Ready(result) =
@@ -399,7 +393,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready(result) = pin!(future).poll(&mut cx) else {
             panic!("a completion without more-to-come resolves at once");
         };
@@ -437,7 +432,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         assert!(
             pin!(future).poll(&mut cx).is_pending(),
             "the send stays pending until its notification releases the slot",
@@ -473,7 +469,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready(result) = pin!(future).poll(&mut cx) else {
             panic!("a MORE primary with a ready notification resolves in one poll");
         };
@@ -538,7 +535,8 @@ mod tests {
         future.key = Some(key);
         future.is_submitted = true;
         future.was_zero_copy = true;
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
 
         // Inject the runtime EINVAL refusal (one CQE, no MORE, no notif). The future
         // frees the slot, resets to unsubmitted, and self-wakes.
@@ -621,7 +619,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready(result) = pin!(future).poll(&mut cx) else {
             panic!("a second -EINVAL after the fallback resolves rather than re-substituting");
         };
@@ -663,7 +662,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let mut cx = Context::from_waker(Waker::noop());
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let polled = core::pin::Pin::new(&mut future).poll(&mut cx);
         let Poll::Ready(result) = polled else {
             panic!("a plain send's -EINVAL resolves rather than falling back");

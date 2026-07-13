@@ -322,33 +322,23 @@ impl<B: IoBuf> Drop for SendFuture<B> {
 #[cfg(test)]
 mod tests {
     use core::{pin::pin, ptr::NonNull, task::Context};
-    use std::task::Waker;
 
     use super::*;
     use crate::{
         boundary::{
-            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, SeamGuard, WakeSlot,
-            WakerBinding, WakerDecoder, decode_waker, register_decoder,
+            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, SeamGuard, TEST_DECODER,
+            WakeSlot, WakerBinding, decode_waker, register_decoder, reserve_worker_id, test_waker,
         },
         buffer::oneshot::inflight::InflightBufSlab,
         operation::FixedBuf,
     };
 
-    fn stub(waker: &Waker) -> Option<WakerBinding> {
-        waker.will_wake(Waker::noop()).then_some(WakerBinding {
-            token: 7,
-            worker_id: 3,
-        })
-    }
-
-    static STUB: WakerDecoder = stub;
-
-    // Registers the seam decoder and returns the binding the futures decode;
-    // `register_decoder` is first-wins, so the worker id is read back rather
-    // than assumed.
+    // Reserves a worker id nothing else in this binary holds, so the seam and the
+    // inboxes this test installs cannot be clobbered by a test on another thread.
     fn poll_binding() -> WakerBinding {
-        register_decoder(&STUB);
-        let Some(binding) = decode_waker(Waker::noop()) else {
+        register_decoder(&TEST_DECODER);
+        let waker = test_waker(reserve_worker_id());
+        let Some(binding) = decode_waker(&waker) else {
             panic!("a registered decoder yields a binding");
         };
         binding
@@ -367,8 +357,8 @@ mod tests {
             None,
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         // No driver: the first poll allocates a slot, builds the InlineBuf over
         // it, has the submit refused, frees the slot, and resolves with -EINVAL.
         let Poll::Ready((result, _)) = pin!(RecvFuture::new(5, [0u8; 8])).poll(&mut cx) else {
@@ -394,8 +384,8 @@ mod tests {
             None,
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let big = [0u8; INFLIGHT_BUF_STRIDE as usize + 1];
         let Poll::Ready((result, _)) = pin!(RecvFuture::new(5, big)).poll(&mut cx) else {
             panic!("an oversized buffer resolves immediately");
@@ -419,8 +409,8 @@ mod tests {
             None,
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         // The first poll allocates a slot, copies the input into it, builds the
         // InlineBuf, has the submit refused, and frees the slot.
         let Poll::Ready(result) =
@@ -448,8 +438,8 @@ mod tests {
             None,
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let over = INFLIGHT_BUF_STRIDE as usize + 1;
         let big = FixedBuf::new([0u8; INFLIGHT_BUF_STRIDE as usize + 1], over);
         let Poll::Ready(result) = pin!(SendFuture::new(5, big)).poll(&mut cx) else {
@@ -495,8 +485,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready((result, out)) = pin!(future).poll(&mut cx) else {
             panic!("a captured completion resolves the recv");
         };
@@ -536,8 +526,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready(result) = pin!(future).poll(&mut cx) else {
             panic!("a captured completion resolves the send");
         };
@@ -617,8 +607,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready((result, _)) = pin!(future).poll(&mut cx) else {
             panic!("a captured completion resolves the recv");
         };
@@ -654,8 +644,8 @@ mod tests {
             Some(wake),
         );
         let _guard = SeamGuard::install(&seam);
-        let waker = Waker::noop();
-        let mut cx = Context::from_waker(waker);
+        let waker = test_waker(binding.worker_id);
+        let mut cx = Context::from_waker(&waker);
         let Poll::Ready(result) = pin!(future).poll(&mut cx) else {
             panic!("a captured completion resolves the send");
         };

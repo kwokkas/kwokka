@@ -423,7 +423,7 @@ mod tests {
 
     #[test]
     fn provided_buf_reads_and_recycles_through_the_registration() {
-        let worker_id = 220;
+        let worker_id = boundary::reserve_worker_id();
         let Ok(pool) = BufRingPool::new(4, 64, BufGroupId::new(0)) else {
             panic!("pool creation must succeed");
         };
