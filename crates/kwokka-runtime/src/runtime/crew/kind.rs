@@ -63,8 +63,8 @@ impl Crew {
             return;
         }
         match self.kind {
-            CrewKind::Stealing => crate::runtime::stealing::raise_shutdown(),
-            CrewKind::Affine => crate::runtime::affine::raise_shutdown(),
+            CrewKind::Stealing => crate::runtime::crew::stealing::raise_shutdown(),
+            CrewKind::Affine => crate::runtime::crew::affine::raise_shutdown(),
             CrewKind::Solo => return,
         }
         for offset in 1..self.count {
@@ -94,8 +94,8 @@ impl Crew {
         // so its drop must reset the statics even though it claimed one id. The
         // solo affine path sets no liveness flag, so it has nothing to reset.
         match self.kind {
-            CrewKind::Affine => crate::runtime::affine::reset_statics(),
-            CrewKind::Stealing => crate::runtime::stealing::reset_statics(),
+            CrewKind::Affine => crate::runtime::crew::affine::reset_statics(),
+            CrewKind::Stealing => crate::runtime::crew::stealing::reset_statics(),
             CrewKind::Solo => {}
         }
     }

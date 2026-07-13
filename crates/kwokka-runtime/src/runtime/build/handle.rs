@@ -6,13 +6,16 @@
 )]
 
 use core::marker::PhantomData;
-use std::io;
+use std::{io, thread};
 
 use kwokka_io::wake;
 
 use crate::{
-    runtime::{builder::RuntimeBuilder, crew::Crew},
-    task::{Affine, Mode},
+    runtime::{
+        build::builder::RuntimeBuilder,
+        crew::kind::{Crew, MAX_WORKERS},
+    },
+    task::{Affine, Mode, Stealing},
     worker::{registry, shard::state::WorkerShard},
 };
 
@@ -93,5 +96,48 @@ impl Runtime<Affine> {
     /// capacity. See [`RuntimeBuilder::affine`].
     pub fn affine() -> io::Result<Self> {
         RuntimeBuilder::new().affine()
+    }
+
+    /// Builds a multi-worker affine (thread-per-core) runtime, sized to the
+    /// host's available parallelism.
+    ///
+    /// Unlike [`Runtime::affine`], which always drives one worker on the
+    /// calling thread, the crew runtime spawns one sibling worker per available
+    /// core, each on its own thread, and is one-per-process. On a single-core
+    /// host (where `available_parallelism` reports one) it falls back to a solo
+    /// affine runtime with no one-per-process enforcement. For a custom worker
+    /// count use [`RuntimeBuilder`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend setup error from any worker's driver factory,
+    /// `InvalidInput` for an out-of-range configuration, or an error when
+    /// another multi-worker affine runtime is already live in this process or
+    /// the worker id space is exhausted.
+    pub fn affine_crew() -> io::Result<Self> {
+        let workers = thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_WORKERS);
+        RuntimeBuilder::new().workers(workers).affine()
+    }
+}
+
+impl Runtime<Stealing> {
+    /// Builds a work-stealing runtime with default configuration, sized to
+    /// the host's available parallelism.
+    ///
+    /// For custom configuration, use [`RuntimeBuilder`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the backend setup error from any worker's driver factory,
+    /// `InvalidInput` for an out-of-range configuration, or an error when
+    /// another stealing runtime is already live in this process or the
+    /// worker id space is exhausted.
+    pub fn stealing() -> io::Result<Self> {
+        let workers = thread::available_parallelism()
+            .map_or(1, usize::from)
+            .min(MAX_WORKERS);
+        RuntimeBuilder::new().workers(workers).stealing()
     }
 }

@@ -24,10 +24,7 @@
     reason = "pub(crate) on module-private items"
 )]
 
-use core::{
-    future::Future,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
-};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::{io, thread};
 
 #[cfg(feature = "steal")]
@@ -42,10 +39,9 @@ use kwokka_io::{
 use crate::worker::park::wake::wake_local;
 use crate::{
     runtime::{
-        bootstrap,
-        crew::{Crew, CrewKind, MAX_WORKERS, sibling_id},
-        handle::Runtime,
-        root,
+        build::handle::Runtime,
+        crew::kind::{Crew, CrewKind, MAX_WORKERS, sibling_id},
+        drive::turn,
     },
     task::Stealing,
     worker::{WorkerId, cycle::Tick, registry, shard::state::WorkerShard},
@@ -230,7 +226,7 @@ fn sibling_main(
     // and the driver-owned pool -- is reclaimed.
     let _pool_guard = ProvidedPoolGuard::install(id.raw(), &shard.driver);
     registry::publish_endpoint(id, wake_fd, shard.driver.ring_fd());
-    bootstrap::arm_wake(&shard, wake_fd);
+    turn::arm_wake(&shard, wake_fd);
     READY.fetch_add(1, Ordering::SeqCst);
     sibling_loop(
         &mut shard,
@@ -266,7 +262,7 @@ fn sibling_loop(
     #[cfg(feature = "steal")] workers: usize,
 ) {
     loop {
-        let outcome = bootstrap::run_pass(shard, wake_fd);
+        let outcome = turn::run_pass(shard, wake_fd);
         if SHUTDOWN.load(Ordering::SeqCst) {
             return;
         }
@@ -330,7 +326,7 @@ fn next_victim(shard: &mut WorkerShard, lead: WorkerId, workers: usize) -> Optio
 /// pins. A wake or shutdown that landed before the flag was visible is
 /// caught by the re-checks; one landing after raises the eventfd and
 /// completes the park.
-fn park_bracketed(shard: &mut WorkerShard) {
+pub(crate) fn park_bracketed(shard: &mut WorkerShard) {
     registry::set_parked(shard.id, true);
     if SHUTDOWN.load(Ordering::SeqCst) {
         registry::set_parked(shard.id, false);
@@ -358,74 +354,8 @@ fn park_bracketed(shard: &mut WorkerShard) {
         registry::set_parked(shard.id, false);
         return;
     }
-    bootstrap::park_for_next_event(shard);
+    turn::park_for_next_event(shard);
     registry::set_parked(shard.id, false);
-}
-
-impl Runtime<Stealing> {
-    /// Builds a work-stealing runtime with default configuration, sized to
-    /// the host's available parallelism.
-    ///
-    /// For custom configuration, use
-    /// [`RuntimeBuilder`](crate::runtime::builder::RuntimeBuilder).
-    ///
-    /// # Errors
-    ///
-    /// Returns the backend setup error from any worker's driver factory,
-    /// `InvalidInput` for an out-of-range configuration, or an error when
-    /// another stealing runtime is already live in this process or the
-    /// worker id space is exhausted.
-    pub fn stealing() -> io::Result<Self> {
-        let workers = thread::available_parallelism()
-            .map_or(1, usize::from)
-            .min(MAX_WORKERS);
-        crate::runtime::builder::RuntimeBuilder::new()
-            .workers(workers)
-            .stealing()
-    }
-
-    /// Runs `future` to completion on the lead worker, blocking the calling
-    /// thread, and returns its output.
-    ///
-    /// The root task is pinned to the lead worker: it is spawned into the
-    /// lead shard, driven by the lead's run-loop, and its output is read
-    /// back on this thread. Sibling workers keep parking between calls, so
-    /// the runtime can run another future after this one returns; the crew
-    /// shuts down when the runtime drops.
-    ///
-    /// The `Send` bound is the work-stealing admission contract. The root
-    /// itself never migrates, but every future entering this runtime
-    /// satisfies the bound the steal path relies on.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the root task cannot be spawned into the lead shard, or if
-    /// it terminates abnormally (cancelled or failed). A recoverable error
-    /// is the future's own `Output` and does not panic.
-    pub fn block_on<F>(&mut self, future: F) -> F::Output
-    where
-        F: Future + Send + 'static,
-    {
-        let worker_id = self.shard.id.raw();
-        let _cancel_guard = CancelInboxGuard::install(worker_id, &mut self.shard.cancel_inbox);
-        let _recv_cancel_guard =
-            RecvCancelInboxGuard::install(worker_id, &mut self.shard.recv_cancel_inbox);
-        // The pool outlives this run (it is driver-owned); the guard scopes
-        // handle access to the run-loop, clearing the slot on exit.
-        let _pool_guard = ProvidedPoolGuard::install(worker_id, &self.shard.driver);
-        let root_key = root::spawn_root(&mut self.shard, future);
-        bootstrap::arm_wake(&self.shard, self.wake_fd);
-        loop {
-            let outcome = bootstrap::run_pass(&mut self.shard, self.wake_fd);
-            if root::root_settled(&self.shard, root_key) {
-                break;
-            }
-            if outcome == Tick::Idle {
-                park_bracketed(&mut self.shard);
-            }
-        }
-        root::take_root_output::<F::Output>(&mut self.shard, root_key)
-    }
 }
 
 #[cfg(test)]
@@ -448,7 +378,7 @@ mod tests {
     };
 
     use crate::{
-        runtime::{builder::RuntimeBuilder, probe::SubmitProbe},
+        runtime::{build::builder::RuntimeBuilder, drive::probe::SubmitProbe},
         task::scope_send,
     };
 

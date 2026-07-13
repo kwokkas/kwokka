@@ -41,8 +41,10 @@ const moduleFor = (path) => {
   if (/^crates\/kwokka-runtime\/src\/scheduler\/affine\//.test(path)) return "M-affine";
   if (/^crates\/kwokka-runtime\/src\/scheduler\/stealing\//.test(path)) return "M-stealing";
   if (/^crates\/kwokka-runtime\/src\/scheduler\//.test(path)) return "M-scheduler";
-  if (/^crates\/kwokka-runtime\/src\/runtime\/affine\b/.test(path)) return "M-affine";
-  if (/^crates\/kwokka-runtime\/src\/runtime\/stealing\b/.test(path)) return "M-stealing";
+  const crew = path.match(
+    /^crates\/kwokka-runtime\/src\/runtime\/crew\/(affine|stealing)\b/,
+  );
+  if (crew) return `M-${crew[1]}`;
   const io = path.match(
     /^crates\/kwokka-io\/src\/(buffer|uring|epoll|kqueue|iocp|operation|driver)\//,
   );

@@ -3,7 +3,7 @@
 //!
 //! A completion may wake a task, retire an in-flight op, hand back a provided
 //! buffer, or be a sentinel that means none of those. Sorting them is the bulk
-//! of this module; the run-loop in [`bootstrap`](crate::runtime::bootstrap)
+//! of this module; the run-loop in [`turn`](crate::runtime::drive::turn)
 //! only asks for the pass.
 
 #![allow(
@@ -25,7 +25,7 @@ use kwokka_io::{
 };
 
 use crate::{
-    runtime::bootstrap::arm_wake,
+    runtime::drive::turn::arm_wake,
     task::TaskRef,
     worker::{park::wake::wake_local, shard::state::WorkerShard},
 };
