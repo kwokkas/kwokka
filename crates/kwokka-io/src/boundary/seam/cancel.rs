@@ -146,14 +146,18 @@ pub fn push_recv_multishot_cancel_for_worker(key: RecvMultishotSlotKey) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::cancel::{CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard};
+    use crate::boundary::{
+        cancel::{CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard},
+        reserve_worker_id,
+    };
 
     #[test]
     fn push_accept_cancel_carries_the_slotless_marker() {
+        let worker_id = reserve_worker_id();
         let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
         {
-            let _guard = CancelInboxGuard::install(9, &mut inbox);
-            push_accept_cancel_for_worker(9, 0xABCD);
+            let _guard = CancelInboxGuard::install(worker_id, &mut inbox);
+            push_accept_cancel_for_worker(worker_id, 0xABCD);
         }
         let Some(key) = inbox.pop() else {
             panic!("the accept cancel reached the inbox");
@@ -163,15 +167,16 @@ mod tests {
             "the slotless marker rides along"
         );
         assert_eq!(key.op_token, 0xABCD);
-        assert_eq!(key.worker_id, 9);
+        assert_eq!(key.worker_id, worker_id);
     }
 
     #[test]
     fn push_connect_cancel_carries_the_slotless_marker() {
+        let worker_id = reserve_worker_id();
         let mut inbox = CancelInbox::<CANCEL_INBOX_CAPACITY>::new();
         {
-            let _guard = CancelInboxGuard::install(11, &mut inbox);
-            push_connect_cancel_for_worker(11, 0xC0DE);
+            let _guard = CancelInboxGuard::install(worker_id, &mut inbox);
+            push_connect_cancel_for_worker(worker_id, 0xC0DE);
         }
         let Some(key) = inbox.pop() else {
             panic!("the connect cancel reached the inbox");
@@ -183,6 +188,6 @@ mod tests {
         assert_ne!(key.slot, ACCEPT_CANCEL_SLOT);
         assert_ne!(key.slot, PROVIDED_RECV_CANCEL_SLOT);
         assert_eq!(key.op_token, 0xC0DE);
-        assert_eq!(key.worker_id, 11);
+        assert_eq!(key.worker_id, worker_id);
     }
 }

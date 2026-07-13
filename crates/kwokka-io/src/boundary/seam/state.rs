@@ -1043,9 +1043,12 @@ impl Drop for SeamGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boundary::cancel::{
-        is_multishot_sentinel, is_recv_multishot_sentinel, multishot_sentinel_generation,
-        multishot_sentinel_slot,
+    use crate::boundary::{
+        cancel::{
+            is_multishot_sentinel, is_recv_multishot_sentinel, multishot_sentinel_generation,
+            multishot_sentinel_slot,
+        },
+        reserve_worker_id,
     };
 
     struct MockBuf {
@@ -1105,21 +1108,26 @@ mod tests {
 
     #[test]
     fn with_current_is_none_when_uninstalled() {
-        assert_eq!(IoSeam::with_current(200, IoSeam::worker_id), None);
+        let worker_id = reserve_worker_id();
+        assert_eq!(IoSeam::with_current(worker_id, IoSeam::worker_id), None);
     }
 
     #[test]
     fn guard_brackets_install_and_clear() {
-        let seam = IoSeam::new(201, None, None, None);
+        let worker_id = reserve_worker_id();
+        let seam = IoSeam::new(worker_id, None, None, None);
         {
             let _guard = SeamGuard::install(&seam);
-            assert_eq!(IoSeam::with_current(201, IoSeam::worker_id), Some(201));
             assert_eq!(
-                IoSeam::with_current(201, IoSeam::completion_result),
+                IoSeam::with_current(worker_id, IoSeam::worker_id),
+                Some(worker_id)
+            );
+            assert_eq!(
+                IoSeam::with_current(worker_id, IoSeam::completion_result),
                 Some(None),
                 "no captured result means the op is still in flight",
             );
-            let submitted = IoSeam::with_current(201, |current| {
+            let submitted = IoSeam::with_current(worker_id, |current| {
                 current.submit_internal(IoRequest::<()>::timeout(1))
             });
             assert_eq!(
@@ -1127,10 +1135,10 @@ mod tests {
                 Some(None),
                 "a driverless seam refuses the submit instead of counting it",
             );
-            assert_eq!(IoSeam::with_current(201, IoSeam::submitted), Some(0));
+            assert_eq!(IoSeam::with_current(worker_id, IoSeam::submitted), Some(0));
         }
         assert_eq!(
-            IoSeam::with_current(201, IoSeam::worker_id),
+            IoSeam::with_current(worker_id, IoSeam::worker_id),
             None,
             "the guard clears the slot on drop",
         );

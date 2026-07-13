@@ -31,6 +31,11 @@ pub use cancel::{
     RecvCancelInbox, RecvCancelInboxGuard, is_cancel_sentinel, is_link_timeout_discard,
     is_msg_ring_wake, is_multishot_sentinel, is_recv_multishot_sentinel,
 };
+/// Test fixtures every suite in this crate shares: a waker that carries the
+/// worker id it was built for, and the reservation that keeps two tests from
+/// picking the same id.
+#[cfg(test)]
+pub(crate) use seam::waker::{TEST_DECODER, reserve_worker_id, test_waker};
 pub use seam::{
     cancel::{
         push_accept_cancel_for_worker, push_cancel_for_worker, push_connect_cancel_for_worker,
