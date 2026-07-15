@@ -101,7 +101,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "kwokka"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "kwokka-core",
  "kwokka-fs",
@@ -112,7 +112,7 @@ dependencies = [
 
 [[package]]
 name = "kwokka-core"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "kwokka-ensemble"
@@ -120,7 +120,7 @@ version = "0.0.1"
 
 [[package]]
 name = "kwokka-fs"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "kwokka-io",
  "kwokka-runtime",
@@ -128,7 +128,7 @@ dependencies = [
 
 [[package]]
 name = "kwokka-io"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "io-uring",
  "libc",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "kwokka-ir"
-version = "0.0.1"
+version = "0.0.2"
 
 [[package]]
 name = "kwokka-macros"
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "kwokka-net"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "kwokka-io",
  "kwokka-runtime",
@@ -160,7 +160,7 @@ dependencies = [
 
 [[package]]
 name = "kwokka-runtime"
-version = "0.0.2"
+version = "0.0.3"
 dependencies = [
  "kwokka-core",
  "kwokka-io",

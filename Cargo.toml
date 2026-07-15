@@ -34,14 +34,14 @@ homepage = "https://kwokka.dev"
 # packaging kwokka-macros, so the not-yet-published facade is never resolved
 # from the registry (which would deadlock the publish order).
 kwokka = { path = "crates/kwokka" }
-kwokka-core = { path = "crates/kwokka-core", version = "0.0.1" }
+kwokka-core = { path = "crates/kwokka-core", version = "0.0.2" }
 kwokka-ensemble = { path = "crates/kwokka-ensemble", version = "0.0.1" }
-kwokka-fs = { path = "crates/kwokka-fs", version = "0.0.2" }
-kwokka-io = { path = "crates/kwokka-io", version = "0.0.1" }
-kwokka-ir = { path = "crates/kwokka-ir", version = "0.0.1" }
+kwokka-fs = { path = "crates/kwokka-fs", version = "0.0.3" }
+kwokka-io = { path = "crates/kwokka-io", version = "0.0.2" }
+kwokka-ir = { path = "crates/kwokka-ir", version = "0.0.2" }
 kwokka-macros = { path = "crates/kwokka-macros", version = "0.0.1" }
-kwokka-net = { path = "crates/kwokka-net", version = "0.0.2" }
-kwokka-runtime = { path = "crates/kwokka-runtime", version = "0.0.2" }
+kwokka-net = { path = "crates/kwokka-net", version = "0.0.3" }
+kwokka-runtime = { path = "crates/kwokka-runtime", version = "0.0.3" }
 # External dependencies. Each is pulled by a single concern so the
 # dependency surface stays auditable.
 # EnterFlags moved to the crate root in 0.7.11; the driver imports it there.
