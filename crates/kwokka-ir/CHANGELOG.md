@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.0.2](https://github.com/kwokkas/kwokka/compare/kwokka-ir-v0.0.1...kwokka-ir-v0.0.2) - 2026-07-15
+
+### Refactor
+
+- hold the conductor checks in one module ([#292](https://github.com/kwokkas/kwokka/pull/292))
+- put the conductor draft beside its views ([#290](https://github.com/kwokkas/kwokka/pull/290))
+- give the core and ir modules a code leaf ([#288](https://github.com/kwokkas/kwokka/pull/288))
+- give every crate root a lib.rs-only tree ([#286](https://github.com/kwokkas/kwokka/pull/286))
+
 ## [0.0.1](https://github.com/kwokkas/kwokka/releases/tag/kwokka-ir-v0.0.1) - 2026-06-28
 
 ### Documentation
