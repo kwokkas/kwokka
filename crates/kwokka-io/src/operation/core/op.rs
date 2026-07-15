@@ -80,11 +80,10 @@ pub enum OpCode {
 /// - `fixed_fd`: set by `with_registered_fd(slot)`
 /// - `zero_copy`: set for `Send` ops when a registered buffer and capability `send_zc` are present
 /// - `multishot`: determined by builder method name (`accept_multishot()` / `recv_multishot()`)
-/// - `vectored`: set in `readv` / `writev` dedicated builders only
 /// - `buffer_select`: set by `recv_provided()` (`IOSQE_BUFFER_SELECT`)
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "six independent op-variant flags; each maps to a distinct SQE modifier with no natural grouping"
+    reason = "five independent op-variant flags; each maps to a distinct SQE modifier with no natural grouping"
 )]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -97,8 +96,6 @@ pub struct OpFlags {
     pub zero_copy: bool,
     /// Use the multishot variant (`ACCEPT_MULTI` / `RECV_MULTI`).
     pub multishot: bool,
-    /// Use the vectored variant (`readv` / `writev`).
-    pub vectored: bool,
     /// Use kernel-selected provided buffers (`IOSQE_BUFFER_SELECT`).
     pub buffer_select: bool,
 }
@@ -112,7 +109,6 @@ impl OpFlags {
             fixed_fd: false,
             zero_copy: false,
             multishot: false,
-            vectored: false,
             buffer_select: false,
         }
     }
@@ -166,18 +162,6 @@ impl OpFlags {
     }
 
     #[must_use]
-    #[allow(
-        dead_code,
-        reason = "consumed by the IoRequest builder, not yet implemented"
-    )]
-    pub(crate) const fn with_vectored(self, v: bool) -> Self {
-        Self {
-            vectored: v,
-            ..self
-        }
-    }
-
-    #[must_use]
     pub(crate) const fn with_buffer_select(self, v: bool) -> Self {
         Self {
             buffer_select: v,
@@ -197,7 +181,6 @@ mod tests {
         assert!(!flags.fixed_fd);
         assert!(!flags.zero_copy);
         assert!(!flags.multishot);
-        assert!(!flags.vectored);
         assert!(!flags.buffer_select);
     }
 
@@ -213,7 +196,6 @@ mod tests {
         assert!(flags.multishot);
         assert!(!flags.fixed_fd);
         assert!(!flags.zero_copy);
-        assert!(!flags.vectored);
     }
 
     #[test]
@@ -225,19 +207,17 @@ mod tests {
     }
 
     #[test]
-    fn op_flags_all_six_flags_independent() {
+    fn op_flags_all_five_flags_independent() {
         let flags = OpFlags::new()
             .with_fixed_buf(true)
             .with_fixed_fd(true)
             .with_zero_copy(true)
             .with_multishot(true)
-            .with_vectored(true)
             .with_buffer_select(true);
         assert!(flags.fixed_buf);
         assert!(flags.fixed_fd);
         assert!(flags.zero_copy);
         assert!(flags.multishot);
-        assert!(flags.vectored);
         assert!(flags.buffer_select);
     }
 

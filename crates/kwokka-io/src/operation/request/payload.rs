@@ -66,6 +66,20 @@ pub enum OpPayload<B> {
         /// Pointer to the `msghdr` staged in the worker's in-flight slot.
         msghdr: NonNull<libc::msghdr>,
     },
+    /// Scatter/gather read or write via a pre-built `iovec` array.
+    ///
+    /// The `iovec` array and the gathered or scattered payload live in one
+    /// worker in-flight slot (`operation::core::vectored`); this variant carries
+    /// only the pointer into that slot and the entry count, never owned bytes.
+    #[cfg(unix)]
+    Vectored {
+        /// Pointer to the `iovec` array staged in the worker's in-flight slot.
+        iovec: NonNull<libc::iovec>,
+        /// Number of entries in the array.
+        count: u32,
+        /// File offset the read or write starts at.
+        offset: u64,
+    },
     /// Splice/tee data transfer between file descriptors.
     Splice {
         /// Output file descriptor.

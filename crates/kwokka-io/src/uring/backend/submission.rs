@@ -132,6 +132,22 @@ pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) 
         (OpCode::Recvmsg, OpPayload::Msg { msghdr }) => {
             net::build_recvmsg(request.fd, *msghdr, request.flags)
         }
+        (
+            OpCode::Read,
+            OpPayload::Vectored {
+                iovec,
+                count,
+                offset,
+            },
+        ) => io::build_readv(request.fd, iovec.as_ptr(), *count, *offset, request.flags),
+        (
+            OpCode::Write,
+            OpPayload::Vectored {
+                iovec,
+                count,
+                offset,
+            },
+        ) => io::build_writev(request.fd, iovec.as_ptr(), *count, *offset, request.flags),
         (opcode, _) => panic!("unsupported opcode {opcode:?} in build_entry"),
     };
     apply_common(entry, &request.common, request.flags)
@@ -139,14 +155,11 @@ pub(crate) fn build_entry(request: &IoRequest<()>, scratch: &mut SubmitScratch) 
 
 /// Build an SQE from a read-side [`IoRequest`].
 ///
-/// Vectored read falls back to nop (pending `IoVec` integration).
-///
 /// # Panics
 ///
 /// Panics on an unsupported `(opcode, payload)` combination.
 pub(crate) fn build_entry_read<B: IoBufMut>(request: &IoRequest<B>) -> Entry {
     let entry = match (&request.opcode, &request.payload) {
-        (OpCode::Read, OpPayload::Buffer { .. }) if request.flags.vectored => build_nop(),
         (OpCode::Read, OpPayload::Buffer { buf, offset }) => io::build_read(
             request.fd,
             #[allow(
@@ -177,14 +190,11 @@ pub(crate) fn build_entry_read<B: IoBufMut>(request: &IoRequest<B>) -> Entry {
 
 /// Build an SQE from a write-side [`IoRequest`].
 ///
-/// Vectored write falls back to nop (pending `IoVec` integration).
-///
 /// # Panics
 ///
 /// Panics on an unsupported `(opcode, payload)` combination.
 pub(crate) fn build_entry_write<B: IoBuf>(request: &IoRequest<B>) -> Entry {
     let entry = match (&request.opcode, &request.payload) {
-        (OpCode::Write, OpPayload::Buffer { .. }) if request.flags.vectored => build_nop(),
         (OpCode::Write, OpPayload::Buffer { buf, offset }) => io::build_write(
             request.fd,
             buf.as_ptr(),
@@ -205,10 +215,6 @@ pub(crate) fn build_entry_write<B: IoBuf>(request: &IoRequest<B>) -> Entry {
 
 fn apply_common(entry: Entry, common: &CommonFields, flags: OpFlags) -> Entry {
     entry.user_data(common.user_data).flags(sqe_flags(flags))
-}
-
-fn build_nop() -> Entry {
-    io_uring::opcode::Nop::new().build()
 }
 
 #[cfg(test)]

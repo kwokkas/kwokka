@@ -61,6 +61,52 @@ pub(crate) fn build_write(
     }
 }
 
+/// Build a vectored read SQE (`READV`).
+///
+/// `iovec` points at a `count`-entry `libc::iovec` array pinned in the caller's
+/// in-flight slot; `count` is the entry count, not a byte length.
+#[cfg(unix)]
+pub(crate) fn build_readv(
+    fd: i32,
+    iovec: *const libc::iovec,
+    count: u32,
+    offset: u64,
+    flags: OpFlags,
+) -> Entry {
+    if flags.fixed_fd {
+        opcode::Readv::new(Fixed(fd as u32), iovec, count)
+            .offset(offset)
+            .build()
+    } else {
+        opcode::Readv::new(Fd(fd), iovec, count)
+            .offset(offset)
+            .build()
+    }
+}
+
+/// Build a vectored write SQE (`WRITEV`).
+///
+/// `iovec` points at a `count`-entry `libc::iovec` array pinned in the caller's
+/// in-flight slot; `count` is the entry count, not a byte length.
+#[cfg(unix)]
+pub(crate) fn build_writev(
+    fd: i32,
+    iovec: *const libc::iovec,
+    count: u32,
+    offset: u64,
+    flags: OpFlags,
+) -> Entry {
+    if flags.fixed_fd {
+        opcode::Writev::new(Fixed(fd as u32), iovec, count)
+            .offset(offset)
+            .build()
+    } else {
+        opcode::Writev::new(Fd(fd), iovec, count)
+            .offset(offset)
+            .build()
+    }
+}
+
 /// Build an fsync SQE.
 pub(crate) fn build_fsync(fd: i32, flags: OpFlags) -> Entry {
     if flags.fixed_fd {

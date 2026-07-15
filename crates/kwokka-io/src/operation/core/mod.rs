@@ -14,6 +14,7 @@ mod completion;
 pub(crate) mod msghdr;
 mod op;
 mod token;
+#[cfg(unix)]
 pub(crate) mod vectored;
 
 pub use buffer::{FixedBuf, InlineBuf, IoBuf, IoBufMut};
