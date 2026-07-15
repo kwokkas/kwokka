@@ -821,7 +821,12 @@ impl IoSeam {
         let slab = unsafe { slab.as_mut() };
         let slot = slab.slot_array_mut(key)?;
         let lens: [usize; N] = core::array::from_fn(|idx| iov.bufs()[idx].bytes_init());
-        let total: usize = lens.iter().copied().sum();
+        // Sum with `checked_add`, like `write_iovecs`: a wrapped total could
+        // otherwise pass the capacity check below and let the copy loop write
+        // past the slot payload.
+        let total = lens
+            .iter()
+            .try_fold(0usize, |sum, &len| sum.checked_add(len))?;
         if total > vectored::max_payload(N)? {
             return None;
         }
