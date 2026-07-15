@@ -36,7 +36,7 @@ fn writev_gathers_every_buffer_into_the_file() {
     };
 
     // Three source buffers with distinct bytes and distinct lengths, so a
-    // mis-ordered or short gather is visible in the concatenation. Small backing
+    // wrongly ordered or short gather is visible in the concatenation. Small
     // arrays keep the future plus its `[FixedBuf; 3]` output inside the task-slot
     // budget.
     let first = source(b"kwokka");
