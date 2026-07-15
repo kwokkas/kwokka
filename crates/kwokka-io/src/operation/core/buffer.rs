@@ -18,10 +18,7 @@
 //! initialized length, `[u8; N]` for a recv destination whose received count
 //! is threaded through the future's own return value rather than `set_init`.
 
-use std::{
-    io::{IoSlice, IoSliceMut},
-    ptr::NonNull,
-};
+use std::ptr::NonNull;
 
 /// Read-only buffer for write and send operations.
 ///
@@ -48,25 +45,6 @@ pub trait IoBuf: 'static + Unpin {
     fn registered(&self) -> Option<u16> {
         None
     }
-
-    /// Invokes `f` with the buffer expressed as a vectored slice, if supported.
-    ///
-    /// `None` for single-buffer implementors (the default); backends
-    /// fall back to [`as_ptr`][IoBuf::as_ptr] + [`bytes_init`][IoBuf::bytes_init].
-    /// `Some(R)` for vectored implementors (e.g. `IoVec<B, N>`), where
-    /// the backend writes the SQE inside the callback and returns a token.
-    ///
-    /// The callback pattern avoids self-referential structs and heap allocation:
-    /// the vectored slice is built on the caller's stack inside the closure and
-    /// never escapes. [`IoSlice`] is ABI-layout-compatible with the platform
-    /// `iovec` (std guarantee on POSIX targets), so backends may cast
-    /// `&[IoSlice<'_>]` to `*const iovec` inside the callback with an
-    /// appropriate `// SAFETY:` annotation.
-    ///
-    /// Backend-internal API -- user code does not call this directly.
-    fn with_iovec<R>(&self, _f: impl FnOnce(&[IoSlice<'_>]) -> R) -> Option<R> {
-        None
-    }
 }
 
 /// Mutable buffer for read and receive operations.
@@ -86,17 +64,6 @@ pub trait IoBufMut: IoBuf {
     /// Must only be called once the CQE confirms the kernel has written at least
     /// `n` bytes into the buffer. `n` must not exceed [`capacity`][IoBufMut::capacity].
     fn set_init(&mut self, n: usize);
-
-    /// Invokes `f` with the buffer expressed as a mutable vectored slice, if supported.
-    ///
-    /// Mutable counterpart to [`IoBuf::with_iovec`]. Used for `readv`-style
-    /// operations where the kernel writes into scattered buffers. `None`
-    /// for single-buffer implementors (default).
-    ///
-    /// Backend-internal API -- user code does not call this directly.
-    fn with_iovec_mut<R>(&mut self, _f: impl FnOnce(&mut [IoSliceMut<'_>]) -> R) -> Option<R> {
-        None
-    }
 }
 
 /// A buffer borrowed from a pinned future's inline storage.

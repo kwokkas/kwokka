@@ -89,8 +89,7 @@ mod tests {
         let op_flags = OpFlags::new()
             .with_fixed_buf(true)
             .with_zero_copy(true)
-            .with_multishot(true)
-            .with_vectored(true);
+            .with_multishot(true);
         let flags = sqe_flags(op_flags);
         assert!(flags.is_empty());
     }

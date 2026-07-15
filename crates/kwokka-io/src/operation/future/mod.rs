@@ -11,6 +11,8 @@ pub(crate) mod file;
 pub(crate) mod msg;
 pub(crate) mod provided;
 pub(crate) mod socket;
+#[cfg(unix)]
+pub(crate) mod vectored;
 pub(crate) mod zerocopy;
 
 /// Maps a raw completion result (the `io_uring` CQE `res`, the value the

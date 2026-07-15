@@ -18,7 +18,13 @@ use crate::{
     operation::{IoBuf, IoBufMut, IoRequest, SubmitResult},
 };
 #[cfg(unix)]
-use crate::{addr::SockAddr, operation::core::msghdr};
+use crate::{
+    addr::SockAddr,
+    operation::core::{
+        msghdr,
+        vectored::{self, IoVec, IoVecMut},
+    },
+};
 
 /// One seam slot per possible worker id byte.
 ///
@@ -785,6 +791,162 @@ impl IoSeam {
             }
         }
         dst.set_init(count);
+        slab.free(key);
+    }
+
+    /// Gathers `iov`'s buffers into `key`'s slot and lays out the `iovec` array
+    /// for a `writev`. Returns the array pointer and entry count for the SQE.
+    ///
+    /// Copies each buffer's initialized bytes into the slot payload region back
+    /// to back, then writes an `iovec` per buffer pointing at its slice. Returns
+    /// `None` when the seam carries no slab, `key` is stale, or the array plus
+    /// gathered bytes exceed the slot -- the caller then frees the slot and fails
+    /// the submit rather than truncate.
+    #[cfg(unix)]
+    pub fn build_writev<B: IoBuf, const N: usize>(
+        &self,
+        key: InflightSlotKey,
+        iov: &IoVec<B, N>,
+    ) -> Option<(NonNull<libc::iovec>, u32)> {
+        let mut slab = self.inflight_slab?;
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `build_send_msg`. Precondition: reached via `with_current` during a
+        // poll on this worker; the `SeamGuard` bracket keeps the referent live,
+        // and the `slot_array_mut` reborrow ends before this call returns.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // (excluded by the non-reentrant poll structure) aliases this one
+        // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let slot = slab.slot_array_mut(key)?;
+        let lens: [usize; N] = core::array::from_fn(|idx| iov.bufs()[idx].bytes_init());
+        let total: usize = lens.iter().copied().sum();
+        if total > vectored::max_payload(N)? {
+            return None;
+        }
+        let payload = vectored::payload_ptr(slot, N);
+        let mut cursor = 0;
+        for (idx, &len) in lens.iter().enumerate() {
+            // SAFETY: Invariant -- `payload` addresses `key`'s slot payload
+            // region (`vectored::payload_ptr`), valid for `max_payload(N)`
+            // writes while the slab lives and the slot stays occupied;
+            // `bufs()[idx].as_ptr()` is valid for `len` reads per the `IoBuf`
+            // contract (`iov` is a shared borrow outliving this call); the
+            // `total` check keeps `cursor + len` inside the payload region, and
+            // the slot and each buffer's own storage are always distinct
+            // allocations, so the copy never overlaps. Precondition: `total <=
+            // max_payload(N)`, checked above. Failure mode: a source whose
+            // `bytes_init` overstates its storage is unsound in its own `IoBuf`
+            // impl, not here; a cursor past the region is excluded by the check.
+            unsafe {
+                payload
+                    .add(cursor)
+                    .copy_from_nonoverlapping(iov.bufs()[idx].as_ptr(), len);
+            }
+            cursor += len;
+        }
+        let array = vectored::write_iovecs(slot, &lens)?;
+        Some((array, u32::try_from(N).ok()?))
+    }
+
+    /// Lays out a scatter `iovec` array for a `readv` over `key`'s slot. Returns
+    /// the array pointer and entry count for the SQE.
+    ///
+    /// Each entry offers one destination buffer's capacity, clamped so the whole
+    /// array plus its payload stays inside the slot. Returns `None` when the seam
+    /// carries no slab, `key` is stale, or the array alone overflows the slot.
+    #[cfg(unix)]
+    pub fn build_readv<B: IoBufMut, const N: usize>(
+        &self,
+        key: InflightSlotKey,
+        iov: &IoVecMut<B, N>,
+    ) -> Option<(NonNull<libc::iovec>, u32)> {
+        let mut slab = self.inflight_slab?;
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `build_recv_msg`. Precondition: reached via `with_current` during a
+        // poll on this worker; the `SeamGuard` bracket keeps the referent live,
+        // and the `slot_array_mut` reborrow ends before this call returns.
+        // Failure mode: a second `&mut` into the slab within the poll window
+        // (excluded by the non-reentrant poll structure) aliases this one
+        // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
+        // dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        let slot = slab.slot_array_mut(key)?;
+        let budget = vectored::max_payload(N)?;
+        let mut remaining = budget;
+        let caps: [usize; N] = core::array::from_fn(|idx| {
+            let cap = iov.bufs()[idx].capacity().min(remaining);
+            remaining -= cap;
+            cap
+        });
+        let array = vectored::write_iovecs(slot, &caps)?;
+        Some((array, u32::try_from(N).ok()?))
+    }
+
+    /// Scatters `key`'s received bytes across `dst`'s buffers and frees the slot.
+    ///
+    /// Called on the completion poll of a `readv` future with `len` the
+    /// kernel-confirmed byte count. Fills each buffer in order up to its
+    /// capacity until `len` is spent, recording each buffer's filled length with
+    /// `set_init`. The in-order walk reconstructs the split the kernel wrote:
+    /// `readv(2)` fills each `iovec` to completion before the next, so the
+    /// per-buffer capacities laid out by [`build_readv`](Self::build_readv) name
+    /// the same boundaries the harvest walks. Freeing the slot bumps its
+    /// generation, so the future's later drop pushes a cancel the slab rejects as
+    /// stale. A no-op when the seam carries no slab.
+    #[cfg(unix)]
+    pub fn harvest_vectored<B: IoBufMut, const N: usize>(
+        &self,
+        key: InflightSlotKey,
+        len: usize,
+        dst: &mut IoVecMut<B, N>,
+    ) {
+        let Some(mut slab) = self.inflight_slab else {
+            return;
+        };
+        // SAFETY: Invariant -- `slab` is the worker's `inflight_slab` field, the
+        // sole `&mut` into it for the non-reentrant poll window, exactly as in
+        // `harvest_msg_payload`. Precondition: reached via `with_current` during
+        // a poll on this worker; the `SeamGuard` bracket keeps the referent
+        // live, and the `slot_array_mut` reborrow ends before `free` takes the
+        // `&mut` again. Failure mode: a second `&mut` into the slab within the
+        // poll window (excluded by the non-reentrant poll structure) aliases
+        // this one (double-mutable-aliasing UB); a call after `SeamGuard` drops
+        // derefs a dangling pointer (the bracket excludes it).
+        let slab = unsafe { slab.as_mut() };
+        // Compute the payload budget before `payload_ptr`, which the same bound
+        // must hold for: a `count` past the slot fills the iovec array and leaves
+        // no payload, so a harvest for such an `N` is a no-op rather than an
+        // out-of-bounds read.
+        if let (Some(slot), Some(budget)) = (slab.slot_array_mut(key), vectored::max_payload(N)) {
+            let payload = vectored::payload_ptr(slot, N);
+            let mut cursor = 0;
+            let mut remaining = len.min(budget);
+            for buf in dst.bufs_mut() {
+                let count = remaining.min(buf.capacity());
+                // SAFETY: Invariant -- `payload.add(cursor)` addresses the
+                // unread tail of `key`'s slot payload region, readable once this
+                // op's CQE has arrived (the caller's contract); `buf.as_mut_ptr()`
+                // is valid for `buf.capacity()` writes per the `IoBufMut`
+                // contract, and `count <= buf.capacity()` by the `min` clamp; the
+                // payload region and `buf`'s own storage are always distinct
+                // allocations, so the copy never overlaps. Precondition: `cursor
+                // + count <= min(len, max_payload(N))`, since each step spends at
+                // most `remaining` and `remaining` starts clamped to the payload
+                // region. Failure mode: writing past `buf.capacity()` -- excluded
+                // by the clamp; reading before the CQE -- excluded by the caller
+                // polling only a completed op.
+                unsafe {
+                    buf.as_mut_ptr()
+                        .copy_from_nonoverlapping(payload.add(cursor), count);
+                }
+                buf.set_init(count);
+                cursor += count;
+                remaining -= count;
+            }
+        }
         slab.free(key);
     }
 
@@ -1571,6 +1733,98 @@ mod tests {
         let mut dst = MockBuf::seeded(b"stale");
         seam.harvest_msg_payload(key, 4, &mut dst);
         assert_eq!(dst.bytes_init(), 5, "no slab leaves the sink untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_writev_then_harvest_vectored_round_trips_the_stream() {
+        let Ok(mut slab) = InflightBufSlab::new(40, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(40, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _ptr)) = seam.allocate_slot(0x2468) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        // Gather three sources into the slot: 2 + 5 + 2 = 9 bytes, "aabbbbbcc".
+        let sources = IoVec::new([
+            MockBuf::seeded(b"aa"),
+            MockBuf::seeded(b"bbbbb"),
+            MockBuf::seeded(b"cc"),
+        ]);
+        let Some((_iovec, count)) = seam.build_writev(key, &sources) else {
+            panic!("a live slot lays out the writev array");
+        };
+        assert_eq!(count, 3, "one iovec entry per source buffer");
+        // Scatter the nine bytes back out across three eight-byte destinations:
+        // the first fills to capacity (8), the second takes the last byte (1),
+        // the third is left empty -- a mid-buffer completion, the case the even
+        // real-ring split never reaches.
+        let mut dst = IoVecMut::new([
+            MockBuf::with_capacity(8),
+            MockBuf::with_capacity(8),
+            MockBuf::with_capacity(8),
+        ]);
+        seam.harvest_vectored(key, 9, &mut dst);
+        let out = dst.into_bufs();
+        assert_eq!(
+            &out[0].data[..8],
+            b"aabbbbbc",
+            "the first buffer fills to capacity"
+        );
+        assert_eq!(out[0].bytes_init(), 8);
+        assert_eq!(
+            &out[1].data[..1],
+            b"c",
+            "the second buffer takes the remainder"
+        );
+        assert_eq!(
+            out[1].bytes_init(),
+            1,
+            "a mid-buffer completion records the short fill"
+        );
+        assert_eq!(out[2].bytes_init(), 0, "the tail buffer is left empty");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_writev_rejects_a_gather_past_the_slot() {
+        let Ok(mut slab) = InflightBufSlab::new(41, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let seam = IoSeam::new(41, None, Some(NonNull::from(&mut slab)), None);
+        let Some((key, _ptr)) = seam.allocate_slot(0x1359) else {
+            panic!("a seam carrying a slab allocates a slot");
+        };
+        // One oversized source (its `bytes_init` overstates the slot) is refused,
+        // not partially gathered -- the writev counterpart of the send-msg reject.
+        let sources = IoVec::new([MockBuf::oversized()]);
+        assert!(
+            seam.build_writev(key, &sources).is_none(),
+            "a gather past the slot capacity is refused, not truncated",
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn vectored_seam_needs_a_slab() {
+        let seam = IoSeam::new(42, None, None, None);
+        let key = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 42,
+            op_token: 0,
+        };
+        let write_sources = IoVec::new([MockBuf::seeded(b"x")]);
+        assert!(seam.build_writev(key, &write_sources).is_none());
+        let read_dsts = IoVecMut::new([MockBuf::with_capacity(8)]);
+        assert!(seam.build_readv(key, &read_dsts).is_none());
+        let mut harvest_dsts = IoVecMut::new([MockBuf::seeded(b"stale")]);
+        seam.harvest_vectored(key, 4, &mut harvest_dsts);
+        assert_eq!(
+            harvest_dsts.bufs()[0].bytes_init(),
+            5,
+            "no slab leaves the sinks untouched",
+        );
     }
 
     #[test]
