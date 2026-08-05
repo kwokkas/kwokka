@@ -11,15 +11,21 @@
 //! [`SubmitToken`]: operation::SubmitToken
 
 pub mod addr;
+#[cfg(unix)]
 pub mod boundary;
+#[cfg(unix)]
 pub mod buffer;
 pub mod capability;
+#[cfg(unix)]
 mod driver;
+#[cfg(unix)]
 pub mod operation;
 #[cfg(target_os = "linux")]
 pub mod uring;
 
 pub use addr::{AddrError, AddressFamily, SockAddr, UnixAddr};
+#[cfg(unix)]
 pub use buffer::MAX_INLINE_CAP;
 pub use capability::{CapabilityMatrix, KernelVersion};
+#[cfg(unix)]
 pub use driver::{CancelError, DriverType, IoDriver, RegisterError, wake};
