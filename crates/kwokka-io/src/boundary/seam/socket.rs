@@ -7,6 +7,11 @@ use std::{
 
 use crate::addr::AddressFamily;
 
+#[cfg(not(target_os = "macos"))]
+const SOCKET_CLOEXEC: libc::c_int = libc::SOCK_CLOEXEC;
+#[cfg(target_os = "macos")]
+const SOCKET_CLOEXEC: libc::c_int = 0;
+
 /// Adopts a nonnegative accept-completion result as an owned descriptor.
 ///
 /// Returns `None` for a negative result -- an `-errno`, not a descriptor.
@@ -15,8 +20,8 @@ use crate::addr::AddressFamily;
 /// nonnegative accept result names a descriptor the kernel just created
 /// for this process, with no other owner. Adopting any other integer
 /// asserts ownership of a descriptor this process may not own, and the
-/// returned handle closes it on drop -- an IO-safety violation
-/// (incorrect close), not a memory-safety violation.
+/// returned handle closes it on drop -- an IO-ownership violation
+/// (incorrect close), not a memory-corruption concern.
 pub fn adopt_accepted_fd(result: i32) -> Option<OwnedFd> {
     if result < 0 {
         return None;
@@ -27,8 +32,8 @@ pub fn adopt_accepted_fd(result: i32) -> Option<OwnedFd> {
     // accept-completion result per the documented contract above; the sign
     // check excludes errno results. Failure mode: adopting a value that is
     // not an accept result claims a descriptor owned elsewhere -- it closes
-    // on drop and use-after-close races follow. This is an IO-safety
-    // concern (incorrect close), not a memory-safety concern: no pointer
+    // on drop and use-after-close races follow. This is an IO-ownership
+    // concern (incorrect close), not a memory-corruption concern: no pointer
     // dereference occurs.
     Some(unsafe { OwnedFd::from_raw_fd(result) })
 }
@@ -43,7 +48,8 @@ pub fn adopt_accepted_fd(result: i32) -> Option<OwnedFd> {
 ///
 /// # Errors
 ///
-/// Returns the OS error when the `socket` syscall fails, or
+/// Returns the OS error when the `socket` syscall or the macOS `fcntl` call
+/// fails, or
 /// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix` (only IPv4 and IPv6
 /// are supported here).
 fn create_socket(family: AddressFamily, socket_type: i32) -> io::Result<OwnedFd> {
@@ -60,10 +66,10 @@ fn create_socket(family: AddressFamily, socket_type: i32) -> io::Result<OwnedFd>
     // SAFETY: Invariant -- `libc::socket` (socket.2) is an FFI call that takes
     // three integers and returns a fresh descriptor or -1; it has no pointer or
     // memory precondition. Precondition: `domain` is a valid `AF_*` constant
-    // (matched above) and `socket_type | SOCK_CLOEXEC` is a valid type per
+    // (matched above) and `socket_type | SOCKET_CLOEXEC` is a valid type per
     // socket.2. Failure mode: an unsupported argument yields -1 plus `errno`,
     // handled just below; the call itself cannot corrupt memory.
-    let raw = unsafe { libc::socket(domain, socket_type | libc::SOCK_CLOEXEC, 0) };
+    let raw = unsafe { libc::socket(domain, socket_type | SOCKET_CLOEXEC, 0) };
     if raw < 0 {
         return Err(io::Error::last_os_error());
     }
@@ -72,8 +78,29 @@ fn create_socket(family: AddressFamily, socket_type: i32) -> io::Result<OwnedFd>
     // nonnegative (checked above), so it names a real descriptor with no other
     // owner. Failure mode: adopting a negative value would claim a descriptor
     // owned elsewhere and close it on drop; the sign check excludes that. No
-    // pointer dereference occurs (IO-safety, not memory-safety).
-    Ok(unsafe { OwnedFd::from_raw_fd(raw) })
+    // pointer dereference occurs (IO-ownership, not memory corruption).
+    let socket = unsafe { OwnedFd::from_raw_fd(raw) };
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: Invariant -- `socket` owns the fresh descriptor returned by
+        // `socket`, so it remains valid for this `fcntl` call. Precondition:
+        // `socket` has not been moved or dropped before its descriptor is read.
+        // Failure mode: `fcntl` returns -1 for an invalid descriptor
+        // (`fcntl.2:115-133`), and this separate call leaves a fork/exec race
+        // until it succeeds (`open.2:198-215`), which can expose the descriptor
+        // to an exec'd child.
+        let result = unsafe {
+            libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(&socket),
+                libc::F_SETFD,
+                libc::FD_CLOEXEC,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(socket)
 }
 
 /// Creates an unconnected, close-on-exec stream socket for `family`.
@@ -84,7 +111,8 @@ fn create_socket(family: AddressFamily, socket_type: i32) -> io::Result<OwnedFd>
 ///
 /// # Errors
 ///
-/// Returns the OS error when the `socket` syscall fails, or
+/// Returns the OS error when the `socket` syscall or the macOS `fcntl` call
+/// fails, or
 /// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix` (only IPv4 and IPv6
 /// stream sockets are created).
 pub fn create_stream_socket(family: AddressFamily) -> io::Result<OwnedFd> {
@@ -99,7 +127,8 @@ pub fn create_stream_socket(family: AddressFamily) -> io::Result<OwnedFd> {
 ///
 /// # Errors
 ///
-/// Returns the OS error when the `socket` syscall fails, or
+/// Returns the OS error when the `socket` syscall or the macOS `fcntl` call
+/// fails, or
 /// [`io::ErrorKind::Unsupported`] for `AddressFamily::Unix` (only IPv4 and IPv6
 /// datagram sockets are created).
 pub fn create_datagram_socket(family: AddressFamily) -> io::Result<OwnedFd> {
@@ -113,12 +142,28 @@ mod tests {
     // A real `socket()` syscall is unsupported under miri's isolation, so this
     // runs off-miri; the Unix-rejection test below returns before any syscall
     // and stays miri-safe.
-    #[cfg(all(target_os = "linux", not(miri)))]
+    #[cfg(all(unix, not(miri)))]
     #[test]
     fn create_stream_socket_makes_an_ipv6_socket() {
         let Ok(_socket) = create_stream_socket(crate::addr::AddressFamily::Inet6) else {
             panic!("an IPv6 stream socket must be created");
         };
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn create_stream_socket_sets_close_on_exec() {
+        let Ok(socket) = create_stream_socket(crate::addr::AddressFamily::Inet6) else {
+            panic!("an IPv6 stream socket must be created");
+        };
+        // SAFETY: Invariant -- `socket` owns a live descriptor whose flags can
+        // be read without transferring ownership. Precondition: `socket` has
+        // not been moved or dropped before its descriptor is read. Failure mode:
+        // an invalid descriptor makes `fcntl` return -1 (`fcntl.2:115-133`),
+        // which the assertion below rejects before inspecting the returned bits.
+        let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(&socket), libc::F_GETFD) };
+        assert!(flags >= 0, "reading descriptor flags must succeed");
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "the socket is close-on-exec");
     }
 
     #[test]
@@ -131,7 +176,7 @@ mod tests {
 
     // A real `socket()` syscall is unsupported under miri's isolation, so this
     // runs off-miri; the Unix-rejection test below returns before any syscall.
-    #[cfg(all(target_os = "linux", not(miri)))]
+    #[cfg(all(unix, not(miri)))]
     #[test]
     fn create_datagram_socket_makes_an_ipv4_socket() {
         let Ok(_socket) = create_datagram_socket(crate::addr::AddressFamily::Inet) else {
