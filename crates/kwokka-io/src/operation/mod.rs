@@ -7,8 +7,8 @@ pub(crate) mod request;
 #[cfg(unix)]
 pub use core::vectored::{IoVec, IoVecMut};
 pub use core::{
-    Completion, CqeFlags, FixedBuf, InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, SubmitResult,
-    SubmitToken,
+    Completion, CqeFlags, FixedBuf, InlineBuf, IoBuf, IoBufMut, OpCode, OpFlags, ProvidedBuf,
+    SubmitResult, SubmitToken,
 };
 
 #[cfg(unix)]
@@ -22,5 +22,3 @@ pub use future::{
     zerocopy::SendZcFuture,
 };
 pub use request::{CommonFields, ControlPayload, IoRequest, OpPayload};
-
-pub use crate::buffer::ring::pool::ProvidedBuf;

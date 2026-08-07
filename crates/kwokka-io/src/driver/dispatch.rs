@@ -8,13 +8,12 @@
 use std::{io, time::Duration};
 
 #[cfg(target_os = "linux")]
+use crate::buffer::ring::pool::BufRingPool;
+#[cfg(target_os = "linux")]
 use crate::uring::backend::UringDriver;
 use crate::{
     CancelError, IoDriver, RegisterError,
-    buffer::{
-        registration::slot::{BufGroupId, FdSlot},
-        ring::pool::BufRingPool,
-    },
+    buffer::registration::slot::{BufGroupId, FdSlot},
     capability::CapabilityMatrix,
     operation::{Completion, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
 };
@@ -162,6 +161,7 @@ impl DriverType {
     /// lacks `buf_ring` or whose registration failed -- the same degradation
     /// [`provided_recv_group`](IoDriver::provided_recv_group) reports, so the
     /// two accessors stay in fallback parity.
+    #[cfg(target_os = "linux")]
     pub(crate) const fn provided_recv_pool(&self) -> Option<&BufRingPool> {
         match self {
             #[cfg(target_os = "linux")]

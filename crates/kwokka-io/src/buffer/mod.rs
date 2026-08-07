@@ -3,6 +3,7 @@
 pub mod multishot;
 pub mod oneshot;
 pub(crate) mod registration;
+#[cfg(target_os = "linux")]
 pub(crate) mod ring;
 pub(crate) mod storage;
 

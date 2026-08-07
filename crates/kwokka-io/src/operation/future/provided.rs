@@ -17,8 +17,7 @@ use std::io;
 
 use crate::{
     boundary::{self, IoSeam},
-    buffer::ring::pool::ProvidedBuf,
-    operation::SubmitResult,
+    operation::{ProvidedBuf, SubmitResult},
 };
 
 /// A future that receives from socket `fd` into a kernel-selected provided
@@ -150,17 +149,15 @@ mod tests {
     use core::{
         future::Future,
         pin::pin,
-        ptr::NonNull,
         task::{Context, Poll},
     };
 
     use crate::{
         boundary::{
-            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, IoSeam, ProvidedPoolGuard,
-            SeamGuard, TEST_DECODER, WakeSlot, WakerBinding, cancel::PROVIDED_RECV_CANCEL_SLOT,
-            decode_waker, register_decoder, reserve_worker_id, test_waker,
+            CANCEL_INBOX_CAPACITY, CancelInbox, CancelInboxGuard, IoSeam, SeamGuard, TEST_DECODER,
+            WakeSlot, WakerBinding, cancel::PROVIDED_RECV_CANCEL_SLOT, decode_waker,
+            register_decoder, reserve_worker_id, test_waker,
         },
-        buffer::{registration::slot::BufGroupId, ring::pool::BufRingPool},
         operation::future::provided::ProvidedRecvFuture,
     };
 
@@ -191,6 +188,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn backend_without_group_resolves_unsupported() {
+        use core::ptr::NonNull;
+
         let binding = poll_binding();
         let mut driver = crate::DriverType::Epoll(());
         let seam = IoSeam::new(
@@ -216,7 +215,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn completion_resolves_the_selected_buffer() {
+        use crate::{
+            boundary::ProvidedPoolGuard,
+            buffer::{registration::slot::BufGroupId, ring::pool::BufRingPool},
+        };
+
         let binding = poll_binding();
         let Ok(pool) = BufRingPool::new(4, 64, BufGroupId::new(0)) else {
             panic!("pool creation must succeed");

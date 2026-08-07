@@ -3,7 +3,6 @@
     clippy::redundant_pub_crate,
     reason = "pub(crate) on module-private items"
 )]
-
 pub(crate) mod abi;
 pub(crate) mod memory;
 pub(crate) mod pool;

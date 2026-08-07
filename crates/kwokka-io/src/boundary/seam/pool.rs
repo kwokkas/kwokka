@@ -1,16 +1,16 @@
 //! The per-worker provided-buffer pool registry, and reading a completed
 //! provided recv back through it.
 
+#[cfg(target_os = "linux")]
 use core::{
     ptr::{self, NonNull},
     sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 use std::io;
 
-use crate::{
-    DriverType,
-    buffer::ring::pool::{BufRingPool, ProvidedBuf},
-};
+#[cfg(target_os = "linux")]
+use crate::buffer::ring::pool::BufRingPool;
+use crate::{DriverType, operation::ProvidedBuf};
 
 /// Resolves a provided-buffer recv completion into the buffer view it names.
 ///
@@ -41,14 +41,8 @@ pub fn resolve_provided_recv(
     if result < 0 {
         return Err(io::Error::from_raw_os_error(-result));
     }
-    let len = u32::try_from(result).unwrap_or(0);
     match buf_id {
-        Some(buf_id) => Ok(ProvidedBuf::new(
-            worker_id,
-            provided_pool_epoch(worker_id),
-            buf_id,
-            len,
-        )),
+        Some(buf_id) => resolve_selected(worker_id, result, buf_id),
         None if result == 0 => Ok(ProvidedBuf::empty()),
         None => Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -57,7 +51,32 @@ pub fn resolve_provided_recv(
     }
 }
 
+#[cfg(target_os = "linux")]
+fn resolve_selected(worker_id: u8, result: i32, buf_id: u16) -> io::Result<ProvidedBuf> {
+    let len = u32::try_from(result).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "provided recv completed with an invalid byte count",
+        )
+    })?;
+    Ok(ProvidedBuf::new(
+        worker_id,
+        provided_pool_epoch(worker_id),
+        buf_id,
+        len,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_selected(_worker_id: u8, _result: i32, _buf_id: u16) -> io::Result<ProvidedBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "provided-buffer recv needs the io_uring buffer ring",
+    ))
+}
+
 /// One provided-pool slot per possible worker id byte, like [`SEAM_SLOTS`].
+#[cfg(target_os = "linux")]
 const PROVIDED_POOL_SLOTS: usize = u8::MAX as usize + 1;
 
 /// The installed provided-buffer pool for each worker, or null outside a
@@ -69,6 +88,7 @@ const PROVIDED_POOL_SLOTS: usize = u8::MAX as usize + 1;
 /// always on the owning worker thread. `AtomicPtr<BufRingPool>` is `Sync`
 /// regardless of the pointee, so the array is a sound `static` with no
 /// `unsafe impl`.
+#[cfg(target_os = "linux")]
 static PROVIDED_POOLS: [AtomicPtr<BufRingPool>; PROVIDED_POOL_SLOTS] =
     [const { AtomicPtr::new(ptr::null_mut()) }; PROVIDED_POOL_SLOTS];
 
@@ -82,6 +102,7 @@ static PROVIDED_POOLS: [AtomicPtr<BufRingPool>; PROVIDED_POOL_SLOTS] =
 /// 64-bit, so the wrap that would let a stale handle match again is
 /// effectively unreachable -- the same headroom the buffer registries use
 /// for their generations.
+#[cfg(target_os = "linux")]
 static PROVIDED_POOL_EPOCHS: [AtomicU64; PROVIDED_POOL_SLOTS] =
     [const { AtomicU64::new(0) }; PROVIDED_POOL_SLOTS];
 
@@ -97,6 +118,7 @@ static PROVIDED_POOL_EPOCHS: [AtomicU64; PROVIDED_POOL_SLOTS] =
 /// Not re-entrant: one run-loop per worker installs one guard.
 pub struct ProvidedPoolGuard {
     /// Worker slot to clear on drop.
+    #[cfg(target_os = "linux")]
     worker_id: u8,
 }
 
@@ -109,7 +131,21 @@ impl ProvidedPoolGuard {
     /// nothing; the guard's drop still clears the slot, a no-op.
     #[must_use]
     pub fn install(worker_id: u8, driver: &DriverType) -> Self {
+        Self::from_driver(worker_id, driver)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn from_driver(worker_id: u8, driver: &DriverType) -> Self {
         Self::install_pool(worker_id, driver.provided_recv_pool())
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[allow(
+        clippy::missing_const_for_fn,
+        reason = "the public wrapper must have the same non-const contract as the Linux driver path"
+    )]
+    fn from_driver(_worker_id: u8, _driver: &DriverType) -> Self {
+        Self {}
     }
 
     /// Installs `pool` for `worker_id`, bumping the slot's epoch first so a
@@ -117,6 +153,7 @@ impl ProvidedPoolGuard {
     ///
     /// Crate-visible so a test can bracket a pool without a live driver; the
     /// production path goes through [`install`](Self::install).
+    #[cfg(target_os = "linux")]
     pub(crate) fn install_pool(worker_id: u8, pool: Option<&BufRingPool>) -> Self {
         let Some(pool) = pool else {
             return Self { worker_id };
@@ -129,7 +166,10 @@ impl ProvidedPoolGuard {
 
 impl Drop for ProvidedPoolGuard {
     fn drop(&mut self) {
-        PROVIDED_POOLS[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
+        #[cfg(target_os = "linux")]
+        {
+            PROVIDED_POOLS[self.worker_id as usize].store(ptr::null_mut(), Ordering::Release);
+        }
     }
 }
 
@@ -141,6 +181,7 @@ impl Drop for ProvidedPoolGuard {
 /// refused rather than read through the wrong pool. The pointee is live for
 /// exactly the reasons the guard doc states; the caller performs the deref
 /// under that contract.
+#[cfg(target_os = "linux")]
 pub(crate) fn provided_pool(worker_id: u8, epoch: u64) -> Option<NonNull<BufRingPool>> {
     let pool = NonNull::new(PROVIDED_POOLS[worker_id as usize].load(Ordering::Acquire))?;
     if PROVIDED_POOL_EPOCHS[worker_id as usize].load(Ordering::Acquire) != epoch {
@@ -153,11 +194,13 @@ pub(crate) fn provided_pool(worker_id: u8, epoch: u64) -> Option<NonNull<BufRing
 ///
 /// Captured into each `ProvidedBuf` at construction; [`provided_pool`]
 /// re-checks it on every access.
+#[cfg(target_os = "linux")]
 pub(crate) fn provided_pool_epoch(worker_id: u8) -> u64 {
     PROVIDED_POOL_EPOCHS[worker_id as usize].load(Ordering::Acquire)
 }
 
 #[cfg(test)]
+#[cfg(target_os = "linux")]
 mod tests {
     use super::*;
     use crate::boundary::reserve_worker_id;
@@ -203,5 +246,19 @@ mod tests {
             "a poolless install does not bump the epoch",
         );
         assert!(provided_pool(worker_id, before).is_none());
+    }
+}
+
+#[cfg(test)]
+#[cfg(not(target_os = "linux"))]
+mod non_linux_tests {
+    use super::*;
+
+    #[test]
+    fn provided_recv_with_buffer_is_unsupported() {
+        let Err(error) = resolve_provided_recv(0, 1, Some(0)) else {
+            panic!("a non-Linux target cannot resolve a provided buffer");
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
     }
 }

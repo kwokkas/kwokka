@@ -18,8 +18,8 @@ use std::{io, ptr::NonNull};
 /// Allocates `len` bytes via `MAP_ANONYMOUS | MAP_PRIVATE`. The region
 /// is zero-filled by the kernel and page-aligned. Dropped via `munmap`.
 ///
-/// Used by [`BufRingPool`](crate::buffer::ring::pool::BufRingPool) for buffer storage
-/// that the kernel writes into during multishot recv/accept.
+/// Used by `BufRingPool` for buffer storage that the kernel writes into during
+/// multishot recv/accept.
 pub(crate) struct MmapRegion {
     ptr: NonNull<u8>,
     len: usize,
