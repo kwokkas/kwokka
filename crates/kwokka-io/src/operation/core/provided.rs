@@ -170,6 +170,28 @@ impl Drop for ProvidedBuf {
 mod tests {
     use super::*;
 
+    struct AssertNotSend;
+    struct AssertNotSync;
+
+    trait AmbiguousIfSend<A> {
+        fn assert() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<AssertNotSend> for T {}
+
+    trait AmbiguousIfSync<A> {
+        fn assert() {}
+    }
+
+    impl<T: ?Sized> AmbiguousIfSync<()> for T {}
+    impl<T: ?Sized + Sync> AmbiguousIfSync<AssertNotSync> for T {}
+
+    const _: fn() = || {
+        <ProvidedBuf as AmbiguousIfSend<_>>::assert();
+        <ProvidedBuf as AmbiguousIfSync<_>>::assert();
+    };
+
     #[test]
     fn provided_buf_empty_view_is_inert() {
         let view = ProvidedBuf::empty();

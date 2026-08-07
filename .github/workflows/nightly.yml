@@ -192,7 +192,7 @@ jobs:
       - uses: ./.github/actions/rust-env
       - uses: taiki-e/install-action@nextest
       - run: RUSTFLAGS="-D warnings" cargo check -p kwokka-io --all-features
-      - run: cargo nextest run -p kwokka-io boundary::seam::socket boundary::seam::pool operation::core::provided
+      - run: RUSTFLAGS="-D warnings" cargo nextest run -p kwokka-io boundary::seam::socket boundary::seam::pool operation::core::provided
 
   # Time-boxed fuzzing of the cargo-fuzz targets. cargo-fuzz drives libFuzzer
   # under ASAN; a short per-target budget catches regressions on the daily
