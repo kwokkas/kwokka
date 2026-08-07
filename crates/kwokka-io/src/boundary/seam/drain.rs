@@ -102,6 +102,7 @@ fn dispose_accept_result(result: i32) {
 /// buffer the caller will never take; this returns it to the ring exactly once
 /// so the ring does not silently shrink. A `None` id (end of stream or error)
 /// or a backend with no pool is a no-op.
+#[cfg(target_os = "linux")]
 fn recycle_provided(driver: &DriverType, buf_id: Option<u16>) {
     let Some(id) = buf_id else {
         return;
@@ -110,6 +111,9 @@ fn recycle_provided(driver: &DriverType, buf_id: Option<u16>) {
         pool.recycle(id);
     }
 }
+
+#[cfg(not(target_os = "linux"))]
+const fn recycle_provided(_driver: &DriverType, _buf_id: Option<u16>) {}
 
 /// Routes a multishot recv op's completion CQE into the worker's registry.
 ///
@@ -451,9 +455,7 @@ pub fn dispose_cancelled_op<const A: usize, const P: usize, const C: usize>(
         // The dropped recv's op still consumed a buffer; this CQE is the
         // kernel's done-with-the-bytes signal, so the id returns to the ring
         // here or never.
-        if let Some(pool) = driver.provided_recv_pool() {
-            pool.recycle(id);
-        }
+        recycle_provided(driver, Some(id));
         return true;
     }
     // A dropped connect owns no descriptor, so its belated CQE is taken by token

@@ -12,11 +12,13 @@ pub use inbox::{
     RECV_CANCEL_INBOX_CAPACITY, RecvCancelInbox,
 };
 pub(crate) use inbox::{ACCEPT_CANCEL_SLOT, CONNECT_CANCEL_SLOT, PROVIDED_RECV_CANCEL_SLOT};
-pub(crate) use token::{
-    LINK_TIMEOUT_DISCARD_USER_DATA, encode_cancel_sentinel, encode_multishot_sentinel,
-    encode_recv_multishot_sentinel, multishot_sentinel_generation, multishot_sentinel_slot,
-};
+#[cfg(target_os = "linux")]
+pub(crate) use token::LINK_TIMEOUT_DISCARD_USER_DATA;
 pub use token::{
     MSG_RING_WAKE_USER_DATA, is_cancel_sentinel, is_link_timeout_discard, is_msg_ring_wake,
     is_multishot_sentinel, is_recv_multishot_sentinel,
+};
+pub(crate) use token::{
+    encode_cancel_sentinel, encode_multishot_sentinel, encode_recv_multishot_sentinel,
+    multishot_sentinel_generation, multishot_sentinel_slot,
 };
