@@ -165,7 +165,7 @@ fn attempt_result(duplicated: Duplicated, result: isize) -> Attempt {
     if error.raw_os_error() == Some(libc::EAGAIN) {
         return Attempt::WouldBlock(duplicated.0);
     }
-    Attempt::Failed(-error.raw_os_error().unwrap_or(libc::EIO))
+    Attempt::Failed(-error.raw_os_error().map_or(libc::EIO, |errno| errno))
 }
 
 /// Adopts a nonnegative accept-completion result as an owned descriptor.
@@ -297,26 +297,43 @@ mod tests {
     use std::{
         fs::File,
         io::{Read, Write},
-        net::{TcpListener, TcpStream},
-        thread,
-        time::Duration,
+        os::{fd::FromRawFd, unix::net::UnixStream},
     };
 
     use super::*;
 
     #[cfg(all(unix, not(miri)))]
-    fn loopback_pair() -> io::Result<(TcpStream, TcpStream)> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
-        let address = listener.local_addr()?;
-        let client = TcpStream::connect(address)?;
-        let (server, _) = listener.accept()?;
-        client.set_nodelay(true)?;
-        server.set_nodelay(true)?;
-        Ok((server, client))
+    fn socket_pair() -> io::Result<(UnixStream, UnixStream)> {
+        let mut fds = [-1; 2];
+        // SAFETY: Invariant -- `fds` has room for the two descriptors a stream
+        // socket pair returns. Precondition: its pointer remains valid for this
+        // synchronous call. Failure mode: a bad pointer would let the kernel
+        // write outside the fixture; a syscall error returns -1 and errno.
+        let result = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | SOCKET_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: Invariant -- successful `socketpair` creates exactly the two
+        // descriptors stored in `fds`. Precondition: success was checked above.
+        // Failure mode: adopting another descriptor would close its real owner
+        // when the stream drops.
+        let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: Invariant -- the same successful `socketpair` call created
+        // this second descriptor. Precondition: success was checked above.
+        // Failure mode: adopting an unrelated descriptor would close its owner.
+        let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((UnixStream::from(first), UnixStream::from(second)))
     }
 
     #[cfg(all(unix, not(miri)))]
-    fn recv_attempt(stream: &TcpStream, bytes: &mut [u8]) -> io::Result<Attempt> {
+    fn recv_attempt(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<Attempt> {
         let duplicated = duplicate_fd(stream.as_raw_fd())?;
         // SAFETY: Invariant -- `bytes` remains exclusively borrowed across this
         // synchronous kernel call. Precondition: its pointer is valid for its
@@ -326,7 +343,7 @@ mod tests {
     }
 
     #[cfg(all(unix, not(miri)))]
-    fn send_attempt(stream: &TcpStream, bytes: &[u8]) -> io::Result<Attempt> {
+    fn send_attempt(stream: &UnixStream, bytes: &[u8]) -> io::Result<Attempt> {
         let duplicated = duplicate_fd(stream.as_raw_fd())?;
         // SAFETY: Invariant -- `bytes` remains borrowed across this synchronous
         // kernel call. Precondition: its pointer is valid for its full length.
@@ -336,7 +353,7 @@ mod tests {
     }
 
     #[cfg(all(unix, not(miri)))]
-    fn shrink_socket_buffers(stream: &TcpStream) -> io::Result<()> {
+    fn shrink_socket_buffers(stream: &UnixStream) -> io::Result<()> {
         let size: libc::c_int = 1;
         let Ok(size_len) = libc::socklen_t::try_from(core::mem::size_of_val(&size)) else {
             return Err(io::Error::from_raw_os_error(libc::EINVAL));
@@ -434,8 +451,8 @@ mod tests {
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn recv_attempt_on_unready_blocking_socket_would_block() {
-        let Ok((server, _client)) = loopback_pair() else {
-            panic!("a loopback pair must be created");
+        let Ok((server, _client)) = socket_pair() else {
+            panic!("a socket pair must be created");
         };
         let mut bytes = [0u8; 8];
         let Ok(result) = recv_attempt(&server, &mut bytes) else {
@@ -447,8 +464,8 @@ mod tests {
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn recv_attempt_reads_ready_socket_bytes() {
-        let Ok((server, mut client)) = loopback_pair() else {
-            panic!("a loopback pair must be created");
+        let Ok((server, mut client)) = socket_pair() else {
+            panic!("a socket pair must be created");
         };
         let payload = b"recv";
         let Ok(()) = client.write_all(payload) else {
@@ -465,8 +482,8 @@ mod tests {
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn send_attempt_writes_ready_socket_bytes() {
-        let Ok((mut server, client)) = loopback_pair() else {
-            panic!("a loopback pair must be created");
+        let Ok((mut server, client)) = socket_pair() else {
+            panic!("a socket pair must be created");
         };
         let payload = b"send";
         let Ok(result) = send_attempt(&client, payload) else {
@@ -483,8 +500,8 @@ mod tests {
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn send_attempt_on_full_socket_would_block() {
-        let Ok((server, client)) = loopback_pair() else {
-            panic!("a loopback pair must be created");
+        let Ok((server, client)) = socket_pair() else {
+            panic!("a socket pair must be created");
         };
         let Ok(()) = shrink_socket_buffers(&server) else {
             panic!("the server receive buffer must shrink");
@@ -529,8 +546,8 @@ mod tests {
             );
             return;
         }
-        let Ok((server, mut client)) = loopback_pair() else {
-            panic!("a loopback pair must be created");
+        let Ok((server, mut client)) = socket_pair() else {
+            panic!("a socket pair must be created");
         };
         drop(server);
         let mut eof = [0u8; 1];
@@ -545,16 +562,10 @@ mod tests {
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_DFL);
         }
-        let mut saw_epipe = false;
-        for _ in 0..2 {
-            let Ok(result) = send_attempt(&client, b"x") else {
-                panic!("the send attempt must return an outcome");
-            };
-            if matches!(result, Attempt::Failed(errno) if errno == -libc::EPIPE) {
-                saw_epipe = true;
-                break;
-            }
-        }
+        let Ok(result) = send_attempt(&client, b"x") else {
+            panic!("the send attempt must return an outcome");
+        };
+        let saw_epipe = matches!(result, Attempt::Failed(errno) if errno == -libc::EPIPE);
         assert!(saw_epipe, "the closed peer must eventually return EPIPE");
     }
 
@@ -590,8 +601,8 @@ mod tests {
     fn duplicate_keeps_the_socket_across_descriptor_reuse_for_1000_rounds() {
         let mut reused = 0;
         for _ in 0..1_000 {
-            let Ok((server, mut client)) = loopback_pair() else {
-                panic!("a loopback pair must be created");
+            let Ok((server, mut client)) = socket_pair() else {
+                panic!("a socket pair must be created");
             };
             let original_fd = server.as_raw_fd();
             let mut bytes = [0u8; 1];
@@ -608,36 +619,17 @@ mod tests {
             let Ok(()) = client.write_all(b"x") else {
                 panic!("the client must send through the retained description");
             };
-            let mut owned = owned;
-            let mut attempts = 0;
-            let received = loop {
-                attempts += 1;
-                // SAFETY: Invariant -- `bytes` is exclusively borrowed for this
-                // synchronous retry. Precondition: its pointer is valid for its
-                // full length. Failure mode: an invalid or aliased region lets
-                // `recv` write outside the test buffer.
-                let Ok(result) =
-                    (unsafe { attempt_recv(Duplicated(owned), bytes.as_mut_ptr(), bytes.len()) })
-                else {
-                    panic!("the duplicate receive must return an outcome");
-                };
-                match result {
-                    Attempt::Done(received) => break received,
-                    Attempt::WouldBlock(next) if attempts < 1_000 => {
-                        owned = next;
-                        #[expect(
-                            clippy::disallowed_methods,
-                            reason = "the Darwin loopback retry needs a bounded real-time wait for delivery"
-                        )]
-                        thread::sleep(Duration::from_millis(1));
-                    }
-                    Attempt::WouldBlock(_) => {
-                        panic!("the duplicate receive must complete within 1,000 attempts");
-                    }
-                    Attempt::Failed(errno) => {
-                        panic!("the duplicate receive must not fail: {errno}");
-                    }
-                }
+            // SAFETY: Invariant -- `bytes` is exclusively borrowed for this
+            // synchronous retry. Precondition: its pointer is valid for its
+            // full length. Failure mode: an invalid or aliased region lets
+            // `recv` write outside the test buffer.
+            let Ok(result) =
+                (unsafe { attempt_recv(Duplicated(owned), bytes.as_mut_ptr(), bytes.len()) })
+            else {
+                panic!("the duplicate receive must return an outcome");
+            };
+            let Attempt::Done(received) = result else {
+                panic!("the retained socket description must receive the peer byte");
             };
             assert_eq!(received, 1);
             assert_eq!(bytes, [b'x']);
