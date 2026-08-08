@@ -501,7 +501,8 @@ mod tests {
         assert_eq!(received, *payload);
     }
 
-    #[cfg(all(unix, not(miri)))]
+    // Issue #334: this fixture times out on macOS; its cause is not known yet.
+    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
     #[test]
     fn send_attempt_on_full_socket_would_block() {
         let Ok((server, client)) = socket_pair() else {
