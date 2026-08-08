@@ -302,6 +302,10 @@ mod tests {
 
     use super::*;
 
+    const FULL_SEND_CHUNK_BYTES: usize = 64 * 1024;
+    const FULL_SEND_MAX_BYTES: usize = 16 * 1024 * 1024;
+    static FULL_SEND_CHUNK: [u8; FULL_SEND_CHUNK_BYTES] = [0; FULL_SEND_CHUNK_BYTES];
+
     #[cfg(all(unix, not(miri)))]
     fn socket_pair() -> io::Result<(UnixStream, UnixStream)> {
         let mut fds = [-1; 2];
@@ -509,10 +513,9 @@ mod tests {
         let Ok(()) = shrink_socket_buffers(&client) else {
             panic!("the client send buffer must shrink");
         };
-        let bytes = [0u8; 1024];
         let mut deferred = false;
-        for _ in 0..1024 {
-            let Ok(result) = send_attempt(&client, &bytes) else {
+        for _ in 0..FULL_SEND_MAX_BYTES / FULL_SEND_CHUNK_BYTES {
+            let Ok(result) = send_attempt(&client, &FULL_SEND_CHUNK) else {
                 panic!("the send attempt must return an outcome");
             };
             if matches!(result, Attempt::WouldBlock(_)) {
@@ -521,7 +524,10 @@ mod tests {
             }
             assert!(matches!(result, Attempt::Done(_)), "a full send must defer");
         }
-        assert!(deferred, "a bounded unconsumed socket buffer must fill");
+        assert!(
+            deferred,
+            "a {FULL_SEND_MAX_BYTES}-byte unconsumed socket buffer must defer"
+        );
     }
 
     #[cfg(all(unix, not(miri)))]
