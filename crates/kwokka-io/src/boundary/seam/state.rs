@@ -13,9 +13,10 @@ use crate::{
         multishot::{
             MultishotSlab, MultishotSlotKey, NO_BUFFER, RecvMultishotSlab, RecvMultishotSlotKey,
         },
-        oneshot::inflight::{INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
+        oneshot::inflight::{DeferredOp, INFLIGHT_BUF_STRIDE, InflightBufSlab, InflightSlotKey},
     },
-    operation::{IoBuf, IoBufMut, IoRequest, SubmitResult},
+    driver::SlotSubmit,
+    operation::{IoBuf, IoBufMut, IoRequest, OpCode, OpPayload, SubmitResult, SubmitToken},
 };
 #[cfg(unix)]
 use crate::{
@@ -296,6 +297,13 @@ impl IoSeam {
     /// accounting.
     pub fn submit_read<B: IoBufMut>(&self, request: IoRequest<B>) -> Option<SubmitResult> {
         let driver = self.driver?;
+        let op_token = request.common.user_data;
+        let opcode = request.opcode;
+        let flags = request.flags;
+        let len = match &request.payload {
+            OpPayload::Buffer { buf, .. } => u32::try_from(buf.capacity()).ok(),
+            _ => None,
+        };
         // SAFETY: Invariant -- `driver` points at the worker's live driver, a
         // field disjoint from the task storage the runtime borrows across the
         // poll; `IoDriver::submit_read` takes `&self`, so this shared reborrow
@@ -309,7 +317,10 @@ impl IoSeam {
         // window and the `SeamGuard` bracket clears the seam first.
         // Failure mode: a read after the guard dropped would deref a dangling
         // driver pointer; the bracket excludes it.
-        let result = unsafe { driver.as_ref().submit_read(request) };
+        let result = match unsafe { driver.as_ref().submit_deferrable_read(request) } {
+            SlotSubmit::Resolved(result) => result,
+            SlotSubmit::Deferred(fd) => self.absorb_deferred(op_token, opcode, flags, len, fd),
+        };
         if matches!(result, SubmitResult::Submitted(_)) {
             self.submitted.fetch_add(1, Ordering::Relaxed);
         }
@@ -324,6 +335,13 @@ impl IoSeam {
     /// accounting.
     pub fn submit<B: IoBuf>(&self, request: IoRequest<B>) -> Option<SubmitResult> {
         let driver = self.driver?;
+        let op_token = request.common.user_data;
+        let opcode = request.opcode;
+        let flags = request.flags;
+        let len = match &request.payload {
+            OpPayload::Buffer { buf, .. } => u32::try_from(buf.bytes_init()).ok(),
+            _ => None,
+        };
         // SAFETY: Invariant -- `driver` points at the worker's live driver, a
         // field disjoint from the task storage the runtime borrows across the
         // poll; `IoDriver::submit` takes `&self`, so this shared reborrow
@@ -337,11 +355,53 @@ impl IoSeam {
         // window and the `SeamGuard` bracket clears the seam first.
         // Failure mode: a read after the guard dropped would deref a dangling
         // driver pointer; the bracket excludes it.
-        let result = unsafe { driver.as_ref().submit(request) };
+        let result = match unsafe { driver.as_ref().submit_deferrable(request) } {
+            SlotSubmit::Resolved(result) => result,
+            SlotSubmit::Deferred(fd) => self.absorb_deferred(op_token, opcode, flags, len, fd),
+        };
         if matches!(result, SubmitResult::Submitted(_)) {
             self.submitted.fetch_add(1, Ordering::Relaxed);
         }
         Some(result)
+    }
+
+    /// Stores a validated readiness deferral on the slot named by `op_token`.
+    fn absorb_deferred(
+        &self,
+        op_token: u64,
+        opcode: OpCode,
+        flags: crate::operation::OpFlags,
+        len: Option<u32>,
+        fd: std::os::fd::OwnedFd,
+    ) -> SubmitResult {
+        let flags_are_clear = !flags.fixed_buf
+            && !flags.fixed_fd
+            && !flags.zero_copy
+            && !flags.multishot
+            && !flags.buffer_select;
+        if !matches!(opcode, OpCode::Send | OpCode::Recv) || !flags_are_clear {
+            return SubmitResult::Unsupported;
+        }
+        let Some(len) = len else {
+            return SubmitResult::Unsupported;
+        };
+        let Some(mut slab) = self.inflight_slab else {
+            return SubmitResult::Unsupported;
+        };
+        // SAFETY: Invariant -- `slab` points to this worker's live
+        // `InflightBufSlab`, installed by the run loop for the poll window and
+        // disjoint from the driver. Precondition: `SeamGuard` and `poll_one`
+        // are non-reentrant, so `allocate_slot`, `copy_into_slot`,
+        // `harvest_into`, `free_slot`, and this completed driver-return path
+        // run to completion one at a time. The driver borrow ended before this
+        // access. Failure mode: overlapping mutable slab access would be
+        // double-mutable-aliasing UB; a call outside the guard would dereference
+        // a dangling worker pointer.
+        let slab = unsafe { slab.as_mut() };
+        if !slab.mark_deferred_by_op_token(op_token, DeferredOp { fd, len, opcode }) {
+            return SubmitResult::Unsupported;
+        }
+        SubmitResult::Submitted(SubmitToken::new(op_token))
     }
 
     /// Submits a single-shot provided-buffer recv on `fd` for the polling
@@ -471,13 +531,16 @@ impl IoSeam {
         // Precondition (why this `&mut` is unique for the window): the runtime
         // polls one task at a time per worker -- `poll_one` is not re-entrant,
         // and `SeamGuard` is not re-entrant, so at most one `IoSeam` is
-        // installed per worker at a time. `allocate_slot`, `harvest_into`, and
-        // `free_slot` are the only paths that form a `&mut InflightBufSlab`
-        // during a poll, each runs to completion before the next, and the
-        // run-loop does not touch `inflight_slab` again between forming the
-        // pointer and the seam clearing. A second runtime in the same process
-        // claims a different worker id with its own `InflightBufSlab`, so a
-        // nested `block_on` aliases nothing here.
+        // installed per worker at a time. `allocate_slot`, `copy_into_slot`,
+        // `harvest_into`, `harvest_into_buf`, `free_slot`, `build_send_msg`,
+        // `build_recv_msg`, `harvest_msg_payload`, `build_writev`,
+        // `build_readv`, `harvest_vectored`, and deferred-submit absorption
+        // are the only paths that form a `&mut InflightBufSlab` during a poll;
+        // each runs to completion before the next, and the run-loop does not
+        // touch `inflight_slab` again between forming the pointer and the seam
+        // clearing. A second runtime in the same process claims a different
+        // worker id with its own `InflightBufSlab`, so a nested `block_on`
+        // aliases nothing here.
         // Failure mode: a second `&mut` into the slab within the poll window --
         // a reentrancy path the non-reentrant poll structure excludes -- aliases
         // this one (double-mutable-aliasing UB); a call after `SeamGuard` drops
@@ -627,7 +690,7 @@ impl IoSeam {
     /// path of any buffered future (the slot was allocated but no op took
     /// ownership of its bytes). A stale key is a no-op in the slab; a seam with
     /// no slab is a no-op here.
-    pub const fn free_slot(&self, key: InflightSlotKey) {
+    pub fn free_slot(&self, key: InflightSlotKey) {
         let Some(mut slab) = self.inflight_slab else {
             return;
         };
@@ -1209,7 +1272,12 @@ impl Drop for SeamGuard {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, not(miri)))]
+    use std::{fs::File, os::fd::AsRawFd};
+
     use super::*;
+    #[cfg(all(unix, not(miri)))]
+    use crate::boundary::seam::socket::duplicate_fd;
     use crate::boundary::{
         cancel::{
             is_multishot_sentinel, is_recv_multishot_sentinel, multishot_sentinel_generation,
@@ -1423,6 +1491,94 @@ mod tests {
             seam.allocate_slot(0).is_none(),
             "a seam with no slab cannot allocate",
         );
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn deferred_submission_is_recorded_and_counted_once() {
+        let Ok(mut slab) = InflightBufSlab::new(7, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xD3FE) else {
+            panic!("the slab must allocate a slot");
+        };
+        let seam = IoSeam::new(7, None, Some(NonNull::from(&mut slab)), None);
+        let Ok(file) = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")) else {
+            panic!("the crate manifest must open");
+        };
+        let Ok(duplicated) = duplicate_fd(file.as_raw_fd()) else {
+            panic!("an open descriptor must duplicate");
+        };
+        let result = seam.absorb_deferred(
+            key.op_token,
+            OpCode::Recv,
+            crate::operation::OpFlags::new(),
+            Some(8),
+            duplicated.into_owned(),
+        );
+        assert!(
+            matches!(result, SubmitResult::Submitted(token) if token == SubmitToken::new(key.op_token))
+        );
+        let Ok(mut driver) = DriverType::for_platform(8) else {
+            panic!("the platform driver must build on this host");
+        };
+        let counting_seam = IoSeam::new(7, Some(NonNull::from(&mut driver)), None, None);
+        let result = counting_seam.submit_read(
+            IoRequest::recv(-1, MockBuf::with_capacity(8)).with_user_data(key.op_token),
+        );
+        assert!(
+            matches!(result, Some(SubmitResult::Submitted(_))),
+            "the seam reaches the production read submission path",
+        );
+        assert_eq!(
+            counting_seam.submitted(),
+            1,
+            "the production submission path raises the count once",
+        );
+        let Some(deferred) = slab.deferred(key) else {
+            panic!("the slot must own the deferred descriptor");
+        };
+        assert_eq!(deferred.opcode, OpCode::Recv);
+        assert_eq!(deferred.len, 8);
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn malformed_deferred_submissions_are_refused() {
+        let Ok(mut slab) = InflightBufSlab::new(7, 8) else {
+            panic!("mmap must succeed for the test slab");
+        };
+        let Some(key) = slab.allocate(0xD3FE) else {
+            panic!("the slab must allocate a slot");
+        };
+        let seam = IoSeam::new(7, None, Some(NonNull::from(&mut slab)), None);
+        let cases = [
+            (OpCode::Read, crate::operation::OpFlags::new()),
+            (OpCode::Write, crate::operation::OpFlags::new()),
+            (
+                OpCode::Recv,
+                crate::operation::OpFlags::new().with_fixed_fd(true),
+            ),
+        ];
+        for (opcode, flags) in cases {
+            let Ok(file) = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")) else {
+                panic!("the crate manifest must open");
+            };
+            let Ok(duplicated) = duplicate_fd(file.as_raw_fd()) else {
+                panic!("an open descriptor must duplicate");
+            };
+            assert!(matches!(
+                seam.absorb_deferred(
+                    key.op_token,
+                    opcode,
+                    flags,
+                    Some(8),
+                    duplicated.into_owned()
+                ),
+                SubmitResult::Unsupported
+            ));
+            assert!(slab.deferred(key).is_none());
+        }
     }
 
     #[test]

@@ -2,7 +2,7 @@
 
 use std::{
     io,
-    os::fd::{FromRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
 use crate::addr::AddressFamily;
@@ -11,6 +11,162 @@ use crate::addr::AddressFamily;
 const SOCKET_CLOEXEC: libc::c_int = libc::SOCK_CLOEXEC;
 #[cfg(target_os = "macos")]
 const SOCKET_CLOEXEC: libc::c_int = 0;
+
+// `recv.2:105-125` / `send.2:167-187` define this Linux value. Darwin's
+// `socket.h:624` defines its distinct value and gives it the same per-call
+// nonblocking meaning, so neither platform needs to alter the caller's fd.
+#[cfg(target_os = "linux")]
+const MSG_DONTWAIT: libc::c_int = 0x40;
+#[cfg(target_os = "macos")]
+const MSG_DONTWAIT: libc::c_int = 0x80;
+
+// `send.2:211-227` / `send.2:434-440` require this Linux flag to turn a
+// closed peer into `EPIPE` rather than a process-wide SIGPIPE. Darwin's
+// `socket.h:640` defines the corresponding per-call flag.
+#[cfg(target_os = "linux")]
+const MSG_NOSIGNAL: libc::c_int = 0x4000;
+#[cfg(target_os = "macos")]
+const MSG_NOSIGNAL: libc::c_int = 0x80000;
+
+/// A descriptor acquired for exactly one readiness attempt.
+///
+/// The private constructor makes the duplication the first and only descriptor
+/// lookup before the attempt syscall.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) struct Duplicated(OwnedFd);
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl Duplicated {
+    /// Releases the owned descriptor to the deferral record.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "consumed by the readiness retry path in #327")
+    )]
+    pub(crate) fn into_owned(self) -> OwnedFd {
+        self.0
+    }
+}
+
+/// The result of one nonblocking readiness attempt.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+)]
+pub(crate) enum Attempt {
+    /// The syscall transferred this many bytes; its duplicate was closed.
+    Done(u32),
+    /// The syscall failed with this negative errno; its duplicate was closed.
+    Failed(i32),
+    /// The operation must wait; the duplicate owns the retry descriptor.
+    WouldBlock(OwnedFd),
+}
+
+/// Duplicates `fd` with close-on-exec set by the same kernel operation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+)]
+pub(crate) fn duplicate_fd(fd: i32) -> io::Result<Duplicated> {
+    // SAFETY: Invariant -- `F_DUPFD_CLOEXEC` atomically creates a distinct
+    // descriptor for the open file description named by `fd`
+    // (`F_DUPFD.2const:38-46`; `fcntl.2:108-112` on Darwin). Precondition:
+    // `fd` names a live descriptor at this single lookup. Failure mode: an
+    // invalid or exhausted descriptor table returns -1 and `errno`, which is
+    // returned without adopting an integer that is not ours.
+    let duplicated = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicated < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: Invariant -- the successful `F_DUPFD_CLOEXEC` call above created
+    // one descriptor now owned by this process. Precondition: `duplicated` is
+    // nonnegative, checked above. Failure mode: adopting an integer not newly
+    // returned by `fcntl` would close another owner's descriptor on drop.
+    Ok(Duplicated(unsafe { OwnedFd::from_raw_fd(duplicated) }))
+}
+
+/// Attempts a receive through an already-owned duplicate without blocking.
+///
+/// # Safety
+///
+/// Invariant: `ptr` addresses the live in-flight slot for this operation.
+/// Precondition: it is valid and exclusively available for `cap` writes until
+/// this call returns. Failure mode: an invalid or aliased region lets the
+/// kernel write outside the slot, which is undefined behavior.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the seam retry boundary reports the same io::Result shape as duplication"
+)]
+pub(crate) unsafe fn attempt_recv(
+    duplicated: Duplicated,
+    ptr: *mut u8,
+    cap: usize,
+) -> io::Result<Attempt> {
+    // SAFETY: Invariant -- `duplicated` owns a live socket descriptor and the
+    // caller's unsafe contract makes `ptr` writable for `cap` bytes. Precondition:
+    // the pointer remains valid and exclusive for this synchronous syscall.
+    // Failure mode: an invalid pointer lets `recv` write invalid memory; an
+    // invalid descriptor returns -1 and is represented below.
+    let result = unsafe { libc::recv(duplicated.0.as_raw_fd(), ptr.cast(), cap, MSG_DONTWAIT) };
+    Ok(attempt_result(duplicated, result))
+}
+
+/// Attempts a send through an already-owned duplicate without blocking.
+///
+/// # Safety
+///
+/// Invariant: `ptr` addresses the live in-flight slot for this operation.
+/// Precondition: it is valid for `len` reads until this call returns. Failure
+/// mode: an invalid region lets the kernel read outside the slot, which is
+/// undefined behavior.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+)]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "the seam retry boundary reports the same io::Result shape as duplication"
+)]
+pub(crate) unsafe fn attempt_send(
+    duplicated: Duplicated,
+    ptr: *const u8,
+    len: usize,
+) -> io::Result<Attempt> {
+    // SAFETY: Invariant -- `duplicated` owns a live socket descriptor and the
+    // caller's unsafe contract makes `ptr` readable for `len` bytes. Precondition:
+    // the pointer remains valid for this synchronous syscall. Failure mode: an
+    // invalid pointer lets `send` read invalid memory; an invalid descriptor
+    // returns -1 and is represented below.
+    let result = unsafe {
+        libc::send(
+            duplicated.0.as_raw_fd(),
+            ptr.cast(),
+            len,
+            MSG_DONTWAIT | MSG_NOSIGNAL,
+        )
+    };
+    Ok(attempt_result(duplicated, result))
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn attempt_result(duplicated: Duplicated, result: isize) -> Attempt {
+    if result >= 0 {
+        return u32::try_from(result)
+            .map_or_else(|_| Attempt::Failed(-libc::EINVAL), Attempt::Done);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EAGAIN) {
+        return Attempt::WouldBlock(duplicated.0);
+    }
+    Attempt::Failed(-error.raw_os_error().map_or(libc::EIO, |errno| errno))
+}
 
 /// Adopts a nonnegative accept-completion result as an owned descriptor.
 ///
@@ -137,7 +293,111 @@ pub fn create_datagram_socket(family: AddressFamily) -> io::Result<OwnedFd> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(unix, not(miri)))]
+    use std::{
+        fs::File,
+        io::{Read, Write},
+        os::{fd::FromRawFd, unix::net::UnixStream},
+    };
+
     use super::*;
+
+    const FULL_SEND_CHUNK_BYTES: usize = 64 * 1024;
+    const FULL_SEND_MAX_BYTES: usize = 16 * 1024 * 1024;
+    static FULL_SEND_CHUNK: [u8; FULL_SEND_CHUNK_BYTES] = [0; FULL_SEND_CHUNK_BYTES];
+
+    #[cfg(all(unix, not(miri)))]
+    fn socket_pair() -> io::Result<(UnixStream, UnixStream)> {
+        let mut fds = [-1; 2];
+        // SAFETY: Invariant -- `fds` has room for the two descriptors a stream
+        // socket pair returns. Precondition: its pointer remains valid for this
+        // synchronous call. Failure mode: a bad pointer would let the kernel
+        // write outside the fixture; a syscall error returns -1 and errno.
+        let result = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_STREAM | SOCKET_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: Invariant -- successful `socketpair` creates exactly the two
+        // descriptors stored in `fds`. Precondition: success was checked above.
+        // Failure mode: adopting another descriptor would close its real owner
+        // when the stream drops.
+        let first = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        // SAFETY: Invariant -- the same successful `socketpair` call created
+        // this second descriptor. Precondition: success was checked above.
+        // Failure mode: adopting an unrelated descriptor would close its owner.
+        let second = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+        Ok((UnixStream::from(first), UnixStream::from(second)))
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    fn recv_attempt(stream: &UnixStream, bytes: &mut [u8]) -> io::Result<Attempt> {
+        let duplicated = duplicate_fd(stream.as_raw_fd())?;
+        // SAFETY: Invariant -- `bytes` remains exclusively borrowed across this
+        // synchronous kernel call. Precondition: its pointer is valid for its
+        // full length. Failure mode: an invalid or aliased region lets `recv`
+        // write outside the test buffer.
+        unsafe { attempt_recv(duplicated, bytes.as_mut_ptr(), bytes.len()) }
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    fn send_attempt(stream: &UnixStream, bytes: &[u8]) -> io::Result<Attempt> {
+        let duplicated = duplicate_fd(stream.as_raw_fd())?;
+        // SAFETY: Invariant -- `bytes` remains borrowed across this synchronous
+        // kernel call. Precondition: its pointer is valid for its full length.
+        // Failure mode: an invalid region lets `send` read outside the test
+        // buffer.
+        unsafe { attempt_send(duplicated, bytes.as_ptr(), bytes.len()) }
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    fn shrink_socket_buffers(stream: &UnixStream) -> io::Result<()> {
+        let size: libc::c_int = 1;
+        let Ok(size_len) = libc::socklen_t::try_from(core::mem::size_of_val(&size)) else {
+            return Err(io::Error::from_raw_os_error(libc::EINVAL));
+        };
+        // SAFETY: Invariant -- `stream` owns a live TCP descriptor and `size`
+        // points at one initialized `c_int`. Precondition: the pointer and its
+        // byte count remain valid for each synchronous `setsockopt` call.
+        // Failure mode: an invalid descriptor or option returns -1 and errno;
+        // an invalid pointer would let the kernel read invalid memory.
+        let send = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const size).cast(),
+                size_len,
+            )
+        };
+        if send < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: Invariant -- identical to the preceding `setsockopt` call;
+        // this call changes only the receive-buffer bound on the same live
+        // descriptor. Precondition: `size` remains initialized for `size_len`
+        // bytes. Failure mode: an invalid descriptor or pointer returns errno
+        // or lets the kernel read invalid memory, respectively.
+        let recv = unsafe {
+            libc::setsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&raw const size).cast(),
+                size_len,
+            )
+        };
+        if recv < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
 
     // A real `socket()` syscall is unsupported under miri's isolation, so this
     // runs off-miri; the Unix-rejection test below returns before any syscall
@@ -190,5 +450,200 @@ mod tests {
             panic!("a Unix family is rejected for a UDP datagram socket");
         };
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn recv_attempt_on_unready_blocking_socket_would_block() {
+        let Ok((server, _client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let mut bytes = [0u8; 8];
+        let Ok(result) = recv_attempt(&server, &mut bytes) else {
+            panic!("the receive attempt must return an outcome");
+        };
+        assert!(matches!(result, Attempt::WouldBlock(_)));
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn recv_attempt_reads_ready_socket_bytes() {
+        let Ok((server, mut client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let payload = b"recv";
+        let Ok(()) = client.write_all(payload) else {
+            panic!("the client must seed the receive buffer");
+        };
+        let mut bytes = [0u8; 8];
+        let Ok(result) = recv_attempt(&server, &mut bytes) else {
+            panic!("the receive attempt must return an outcome");
+        };
+        assert!(matches!(result, Attempt::Done(4)));
+        assert_eq!(&bytes[..payload.len()], payload);
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn send_attempt_writes_ready_socket_bytes() {
+        let Ok((mut server, client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let payload = b"send";
+        let Ok(result) = send_attempt(&client, payload) else {
+            panic!("the send attempt must return an outcome");
+        };
+        assert!(matches!(result, Attempt::Done(4)));
+        let mut received = [0u8; 4];
+        let Ok(()) = server.read_exact(&mut received) else {
+            panic!("the peer must receive the sent bytes");
+        };
+        assert_eq!(received, *payload);
+    }
+
+    // Issue #334: this fixture times out on macOS; its cause is not known yet.
+    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
+    #[test]
+    fn send_attempt_on_full_socket_would_block() {
+        let Ok((server, client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let Ok(()) = shrink_socket_buffers(&server) else {
+            panic!("the server receive buffer must shrink");
+        };
+        let Ok(()) = shrink_socket_buffers(&client) else {
+            panic!("the client send buffer must shrink");
+        };
+        let mut deferred = false;
+        for _ in 0..FULL_SEND_MAX_BYTES / FULL_SEND_CHUNK_BYTES {
+            let Ok(result) = send_attempt(&client, &FULL_SEND_CHUNK) else {
+                panic!("the send attempt must return an outcome");
+            };
+            if matches!(result, Attempt::WouldBlock(_)) {
+                deferred = true;
+                break;
+            }
+            assert!(matches!(result, Attempt::Done(_)), "a full send must defer");
+        }
+        assert!(
+            deferred,
+            "a {FULL_SEND_MAX_BYTES}-byte unconsumed socket buffer must defer"
+        );
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn send_attempt_avoids_sigpipe_with_default_disposition() {
+        const CHILD: &str = "KWOKKA_IO_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let Ok(executable) = std::env::current_exe() else {
+                panic!("the test executable path must be available");
+            };
+            let Ok(status) = std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("boundary::seam::socket::tests::send_attempt_avoids_sigpipe_with_default_disposition")
+                .env(CHILD, "1")
+                .status()
+            else {
+                panic!("the SIGPIPE fixture must start in its own process");
+            };
+            assert!(
+                status.success(),
+                "a per-call MSG_NOSIGNAL send must survive the default disposition"
+            );
+            return;
+        }
+        let Ok((server, mut client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        drop(server);
+        let mut eof = [0u8; 1];
+        let Ok(0) = client.read(&mut eof) else {
+            panic!("the closed peer must be observed before sending");
+        };
+        // SAFETY: Invariant -- this child process runs only this test, so its
+        // signal disposition has no other test consumer. Precondition: no code
+        // in this fixture sends after restoring SIGPIPE except `attempt_send`.
+        // Failure mode: changing a shared process disposition would make an
+        // unrelated send fatal; the parent launches an isolated child to avoid it.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+        let Ok(result) = send_attempt(&client, b"x") else {
+            panic!("the send attempt must return an outcome");
+        };
+        let saw_epipe = matches!(result, Attempt::Failed(errno) if errno == -libc::EPIPE);
+        assert!(saw_epipe, "the closed peer must eventually return EPIPE");
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn duplicate_outlives_original_and_is_close_on_exec() {
+        let Ok(file) = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")) else {
+            panic!("the crate manifest must open");
+        };
+        let Ok(duplicated) = duplicate_fd(file.as_raw_fd()) else {
+            panic!("an open file descriptor must duplicate");
+        };
+        // SAFETY: Invariant -- `duplicated` owns the descriptor being queried.
+        // Precondition: it remains live while `fcntl` reads its flags. Failure
+        // mode: an invalid descriptor returns -1, which the assertion rejects.
+        let flags = unsafe { libc::fcntl(duplicated.0.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0, "reading duplicate flags must succeed");
+        assert_ne!(
+            flags & libc::FD_CLOEXEC,
+            0,
+            "the duplicate is close-on-exec"
+        );
+        drop(file);
+        let mut duplicate_file: File = duplicated.into_owned().into();
+        let mut byte = [0u8; 1];
+        let Ok(1) = duplicate_file.read(&mut byte) else {
+            panic!("the duplicate must remain readable after the original drops");
+        };
+    }
+
+    #[cfg(all(unix, not(miri)))]
+    #[test]
+    fn duplicate_keeps_the_socket_across_descriptor_reuse_for_1000_rounds() {
+        let mut reused = 0;
+        for _ in 0..1_000 {
+            let Ok((server, mut client)) = socket_pair() else {
+                panic!("a socket pair must be created");
+            };
+            let original_fd = server.as_raw_fd();
+            let mut bytes = [0u8; 1];
+            let Ok(Attempt::WouldBlock(owned)) = recv_attempt(&server, &mut bytes) else {
+                panic!("an empty blocking socket must defer");
+            };
+            drop(server);
+            let Ok(taken) = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")) else {
+                panic!("an open must claim the released descriptor number");
+            };
+            if taken.as_raw_fd() == original_fd {
+                reused += 1;
+            }
+            let Ok(()) = client.write_all(b"x") else {
+                panic!("the client must send through the retained description");
+            };
+            // SAFETY: Invariant -- `bytes` is exclusively borrowed for this
+            // synchronous retry. Precondition: its pointer is valid for its
+            // full length. Failure mode: an invalid or aliased region lets
+            // `recv` write outside the test buffer.
+            let Ok(result) =
+                (unsafe { attempt_recv(Duplicated(owned), bytes.as_mut_ptr(), bytes.len()) })
+            else {
+                panic!("the duplicate receive must return an outcome");
+            };
+            let Attempt::Done(received) = result else {
+                panic!("the retained socket description must receive the peer byte");
+            };
+            assert_eq!(received, 1);
+            assert_eq!(bytes, [b'x']);
+        }
+        assert!(
+            reused > 0,
+            "the test must observe descriptor reuse in its own process"
+        );
     }
 }

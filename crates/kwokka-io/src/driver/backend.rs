@@ -22,14 +22,21 @@ use crate::{
 /// with `IORING_OP_ASYNC_CANCEL`.
 pub trait IoDriver: Send {
     /// Submit an operation where the kernel reads from the buffer (write, send).
+    ///
+    /// A direct trait call for a deferrable `Send` or `Recv` on a readiness
+    /// backend returns [`SubmitResult::Unsupported`]. Buffered futures submit
+    /// through the crate-private seam, which owns the slot needed to defer
+    /// without blocking the worker.
     fn submit<B: IoBuf>(&self, request: IoRequest<B>) -> SubmitResult;
 
     /// Submit an operation where the kernel writes to the buffer (read, recv).
     ///
-    /// Completion-based backends (`io_uring`) override this to use
-    /// read-specific opcodes. Readiness-based backends (epoll, kqueue)
-    /// forward to [`submit`](IoDriver::submit) since the read/write
-    /// distinction is handled after fd readiness, not at submission.
+    /// Completion-based backends (`io_uring`) override this to use read-specific
+    /// opcodes. A readiness backend completes `Read` and `Write` directly,
+    /// because regular files cannot be registered for readiness; it may defer
+    /// only `Recv` and `Send` through the crate-private seam path. A direct
+    /// trait call for either deferrable socket operation returns
+    /// [`SubmitResult::Unsupported`] rather than blocking or losing it.
     fn submit_read<B: IoBufMut>(&self, request: IoRequest<B>) -> SubmitResult {
         self.submit(request)
     }

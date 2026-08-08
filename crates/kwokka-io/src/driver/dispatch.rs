@@ -5,7 +5,7 @@
     reason = "pub(crate) satisfies unreachable_pub on this private module"
 )]
 
-use std::{io, time::Duration};
+use std::{io, os::fd::OwnedFd, time::Duration};
 
 #[cfg(target_os = "linux")]
 use crate::buffer::ring::pool::BufRingPool;
@@ -59,6 +59,15 @@ pub enum DriverType {
 }
 
 static STUB_CAPS: CapabilityMatrix = CapabilityMatrix::thin_fallback();
+
+/// A submit result whose deferred arm owns the descriptor for a later retry.
+pub(crate) enum SlotSubmit {
+    /// The existing uniform submit result.
+    Resolved(SubmitResult),
+    /// A readiness operation would block and transfers its duplicate.
+    #[expect(dead_code, reason = "the readiness adapter produces deferrals in #327")]
+    Deferred(OwnedFd),
+}
 
 #[allow(
     unused_variables,
@@ -155,6 +164,32 @@ impl IoDriver for DriverType {
 }
 
 impl DriverType {
+    /// Submits a write-class request through the seam-only deferral boundary.
+    #[allow(
+        unused_variables,
+        reason = "only the cfg-gated io_uring arm consumes `request`; placeholder backends refuse it"
+    )]
+    pub(crate) fn submit_deferrable<B: IoBuf>(&self, request: IoRequest<B>) -> SlotSubmit {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => SlotSubmit::Resolved(driver.submit(request)),
+            _ => SlotSubmit::Resolved(SubmitResult::Unsupported),
+        }
+    }
+
+    /// Submits a read-class request through the seam-only deferral boundary.
+    #[allow(
+        unused_variables,
+        reason = "only the cfg-gated io_uring arm consumes `request`; placeholder backends refuse it"
+    )]
+    pub(crate) fn submit_deferrable_read<B: IoBufMut>(&self, request: IoRequest<B>) -> SlotSubmit {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => SlotSubmit::Resolved(driver.submit_read(request)),
+            _ => SlotSubmit::Resolved(SubmitResult::Unsupported),
+        }
+    }
+
     /// The provided-buffer pool the `io_uring` backend registered, if any.
     ///
     /// `None` on every fallback backend, and on a uring driver whose kernel
