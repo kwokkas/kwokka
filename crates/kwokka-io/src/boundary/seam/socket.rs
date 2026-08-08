@@ -298,6 +298,8 @@ mod tests {
         fs::File,
         io::{Read, Write},
         net::{TcpListener, TcpStream},
+        thread,
+        time::Duration,
     };
 
     use super::*;
@@ -308,6 +310,8 @@ mod tests {
         let address = listener.local_addr()?;
         let client = TcpStream::connect(address)?;
         let (server, _) = listener.accept()?;
+        client.set_nodelay(true)?;
+        server.set_nodelay(true)?;
         Ok((server, client))
     }
 
@@ -619,9 +623,16 @@ mod tests {
                 };
                 match result {
                     Attempt::Done(received) => break received,
-                    Attempt::WouldBlock(next) if attempts < 100 => owned = next,
+                    Attempt::WouldBlock(next) if attempts < 1_000 => {
+                        owned = next;
+                        #[expect(
+                            clippy::disallowed_methods,
+                            reason = "the Darwin loopback retry needs a bounded real-time wait for delivery"
+                        )]
+                        thread::sleep(Duration::from_millis(1));
+                    }
                     Attempt::WouldBlock(_) => {
-                        panic!("the duplicate receive must complete within 100 attempts");
+                        panic!("the duplicate receive must complete within 1,000 attempts");
                     }
                     Attempt::Failed(errno) => {
                         panic!("the duplicate receive must not fail: {errno}");
