@@ -20,9 +20,9 @@
     reason = "pub(crate) restricts slab internals inside the now-pub inflight module"
 )]
 
-use std::io;
+use std::{io, os::fd::OwnedFd};
 
-use crate::buffer::storage::mmap::MmapRegion;
+use crate::{buffer::storage::mmap::MmapRegion, operation::OpCode};
 
 /// Per-slot byte capacity; a buffered future's `CAP` must not exceed this.
 pub(crate) const INFLIGHT_BUF_STRIDE: u32 = 4096;
@@ -64,6 +64,28 @@ pub struct InflightSlotKey {
     pub(crate) op_token: u64,
 }
 
+/// A readiness operation deferred on a live in-flight slot.
+pub(crate) struct DeferredOp {
+    /// Duplicate retained until the retry completes or the slot is reclaimed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the readiness retry path reads records in #327")
+    )]
+    pub(crate) fd: OwnedFd,
+    /// Bytes to send, or capacity available for a receive.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the readiness retry path reads records in #327")
+    )]
+    pub(crate) len: u32,
+    /// The retry direction, restricted to `Send` and `Recv`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the readiness retry path reads records in #327")
+    )]
+    pub(crate) opcode: OpCode,
+}
+
 /// Per-worker fixed-capacity in-flight buffer registry.
 ///
 /// Owns the bytes for every buffered op in flight on its worker. A slot is
@@ -92,6 +114,9 @@ pub struct InflightBufSlab {
     /// `op_token` is unique across live slots; a multishot op must never route
     /// through this slab, since one token would then post several CQEs.
     op_token: [u64; MAX_INFLIGHT_SLOTS],
+    /// Per-slot deferred readiness operation. Its presence is the one source
+    /// of truth for whether this slot owns a retry descriptor.
+    deferred: [Option<DeferredOp>; MAX_INFLIGHT_SLOTS],
     worker_id: u8,
     cap: u16,
     stride: u32,
@@ -116,6 +141,7 @@ impl InflightBufSlab {
             notif_ready: [0; BITMAP_WORDS],
             generation: [0; MAX_INFLIGHT_SLOTS],
             op_token: [0; MAX_INFLIGHT_SLOTS],
+            deferred: [const { None }; MAX_INFLIGHT_SLOTS],
             worker_id,
             cap,
             stride,
@@ -142,7 +168,7 @@ impl InflightBufSlab {
     /// Frees `key`'s slot, bumping its generation so later stale handles are
     /// rejected. A stale handle (the slot was already freed and reused) is a
     /// no-op.
-    pub(crate) const fn free(&mut self, key: InflightSlotKey) {
+    pub(crate) fn free(&mut self, key: InflightSlotKey) {
         if !self.is_live(key) {
             return;
         }
@@ -151,6 +177,7 @@ impl InflightBufSlab {
         self.retire_pending[word] &= !(1u64 << bit);
         self.notif_expected[word] &= !(1u64 << bit);
         self.notif_ready[word] &= !(1u64 << bit);
+        self.clear_deferred(key.slot);
         let generation = &mut self.generation[key.slot as usize];
         *generation = generation.wrapping_add(1);
     }
@@ -200,7 +227,12 @@ impl InflightBufSlab {
                     self.retire_pending[word] &= !(1u64 << bit);
                     self.notif_expected[word] &= !(1u64 << bit);
                     self.notif_ready[word] &= !(1u64 << bit);
-                    self.generation[slot] = self.generation[slot].wrapping_add(1);
+                    let slot_index = slot;
+                    let Ok(slot) = u16::try_from(slot) else {
+                        return false;
+                    };
+                    self.clear_deferred(slot);
+                    self.generation[slot_index] = self.generation[slot_index].wrapping_add(1);
                     return true;
                 }
             }
@@ -246,7 +278,40 @@ impl InflightBufSlab {
         self.retire_pending[word] &= !(1u64 << bit);
         self.notif_expected[word] &= !(1u64 << bit);
         self.notif_ready[word] &= !(1u64 << bit);
+        self.clear_deferred(slot);
         self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
+    }
+
+    /// Records `op` on the occupied slot named by `op_token`.
+    ///
+    /// Returns `false` when no live slot carries the token, leaving `op` to
+    /// drop with its descriptor. The runtime gives each live buffered op a
+    /// unique token, so the first match is the sole slot that may own it.
+    pub(crate) fn mark_deferred_by_op_token(&mut self, op_token: u64, op: DeferredOp) -> bool {
+        for word in 0..BITMAP_WORDS {
+            let mut occupied = self.occupied[word];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let slot = word * 64 + bit;
+                if self.op_token[slot] == op_token {
+                    self.deferred[slot] = Some(op);
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Returns the deferred operation belonging to `key`, if it is still live.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the readiness retry path reads records in #327")
+    )]
+    pub(crate) fn deferred(&self, key: InflightSlotKey) -> Option<&DeferredOp> {
+        self.is_live(key)
+            .then(|| self.deferred[key.slot as usize].as_ref())
+            .flatten()
     }
 
     /// Marks the live slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
@@ -330,7 +395,7 @@ impl InflightBufSlab {
     /// reading the slot while the kernel write is still in flight is a data
     /// race. `len` must not exceed the CQE-confirmed byte count -- bytes
     /// beyond it are zero (the initial mmap fill) or hold a prior op's data.
-    /// The slice is clamped to the stride for safety.
+    /// The slice is clamped to the stride to keep the read inside its slot.
     pub(crate) fn slot_slice(&self, key: InflightSlotKey, len: usize) -> Option<&[u8]> {
         if !self.is_live(key) {
             return None;
@@ -399,6 +464,11 @@ impl InflightBufSlab {
         None
     }
 
+    /// Releases a deferred descriptor before a slot is made available again.
+    fn clear_deferred(&mut self, slot: u16) {
+        let _ = self.deferred[slot as usize].take();
+    }
+
     /// Whether `key` names a live slot this registry owns at the matching
     /// generation.
     ///
@@ -429,13 +499,108 @@ const fn word_bit(slot: u16) -> (usize, usize) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    use std::{fs::File, os::fd::AsRawFd};
+
     use super::*;
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    use crate::boundary::seam::socket::duplicate_fd;
 
     fn slab(cap: u16) -> InflightBufSlab {
         let Ok(slab) = InflightBufSlab::new(3, cap) else {
             panic!("mmap must succeed for the test registry");
         };
         slab
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    fn deferred_op() -> DeferredOp {
+        let Ok(file) = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")) else {
+            panic!("the crate manifest must open");
+        };
+        let Ok(duplicated) = duplicate_fd(file.as_raw_fd()) else {
+            panic!("an open descriptor must duplicate");
+        };
+        DeferredOp {
+            fd: duplicated.into_owned(),
+            len: 11,
+            opcode: OpCode::Recv,
+        }
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_record_is_found_by_occupied_token() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.mark_deferred_by_op_token(0xABCD, deferred_op()));
+        let Some(deferred) = registry.deferred(key) else {
+            panic!("the occupied slot must own the record");
+        };
+        assert_eq!(deferred.len, 11);
+        assert_eq!(deferred.opcode, OpCode::Recv);
+        assert!(deferred.fd.as_raw_fd() >= 0);
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn unknown_token_drops_the_deferred_record() {
+        let mut registry = slab(8);
+        assert!(!registry.mark_deferred_by_op_token(0xABCD, deferred_op()));
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.deferred(key).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn free_clears_the_deferred_record() {
+        let mut registry = slab(8);
+        let Some(first) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.mark_deferred_by_op_token(1, deferred_op()));
+        registry.free(first);
+        let Some(second) = registry.allocate(2) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.deferred(second).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn free_by_op_token_clears_the_deferred_record() {
+        let mut registry = slab(8);
+        let Some(first) = registry.allocate(2) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.mark_deferred_by_op_token(2, deferred_op()));
+        registry.mark_retire_pending(first);
+        assert!(registry.free_by_op_token(2));
+        let Some(second) = registry.allocate(3) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.deferred(second).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn free_if_retire_pending_clears_the_deferred_record() {
+        let mut registry = slab(8);
+        let Some(first) = registry.allocate(3) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.mark_deferred_by_op_token(3, deferred_op()));
+        registry.mark_retire_pending(first);
+        let generation_low16 = u16::try_from(first.generation).map_or(0, |generation| generation);
+        registry.free_if_retire_pending(first.slot, generation_low16);
+        let Some(second) = registry.allocate(4) else {
+            panic!("allocate must succeed");
+        };
+        assert!(registry.deferred(second).is_none());
     }
 
     #[test]

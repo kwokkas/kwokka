@@ -65,6 +65,18 @@ jobs:
           name: junit
           path: target/nextest/ci/junit.xml
 
+  macos-socket:
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/rust-env
+      - uses: taiki-e/install-action@nextest
+      - run: cargo nextest run --workspace --all-features boundary::seam::socket
+
   doctest:
     needs: changes
     if: needs.changes.outputs.code == 'true'
