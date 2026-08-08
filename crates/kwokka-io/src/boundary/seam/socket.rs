@@ -604,16 +604,31 @@ mod tests {
             let Ok(()) = client.write_all(b"x") else {
                 panic!("the client must send through the retained description");
             };
-            let duplicated = Duplicated(owned);
-            // SAFETY: Invariant -- `bytes` is exclusively borrowed for this
-            // synchronous retry. Precondition: its pointer is valid for its
-            // full length. Failure mode: an invalid or aliased region lets
-            // `recv` write outside the test buffer.
-            let Ok(result) = (unsafe { attempt_recv(duplicated, bytes.as_mut_ptr(), bytes.len()) })
-            else {
-                panic!("the duplicate receive must return an outcome");
+            let mut owned = owned;
+            let mut attempts = 0;
+            let received = loop {
+                attempts += 1;
+                // SAFETY: Invariant -- `bytes` is exclusively borrowed for this
+                // synchronous retry. Precondition: its pointer is valid for its
+                // full length. Failure mode: an invalid or aliased region lets
+                // `recv` write outside the test buffer.
+                let Ok(result) =
+                    (unsafe { attempt_recv(Duplicated(owned), bytes.as_mut_ptr(), bytes.len()) })
+                else {
+                    panic!("the duplicate receive must return an outcome");
+                };
+                match result {
+                    Attempt::Done(received) => break received,
+                    Attempt::WouldBlock(next) if attempts < 100 => owned = next,
+                    Attempt::WouldBlock(_) => {
+                        panic!("the duplicate receive must complete within 100 attempts");
+                    }
+                    Attempt::Failed(errno) => {
+                        panic!("the duplicate receive must not fail: {errno}");
+                    }
+                }
             };
-            assert!(matches!(result, Attempt::Done(1)));
+            assert_eq!(received, 1);
             assert_eq!(bytes, [b'x']);
         }
         assert!(

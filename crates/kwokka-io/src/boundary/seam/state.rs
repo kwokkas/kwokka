@@ -1516,13 +1516,25 @@ mod tests {
             Some(8),
             duplicated.into_owned(),
         );
-        if matches!(result, SubmitResult::Submitted(_)) {
-            seam.submitted.fetch_add(1, Ordering::Relaxed);
-        }
         assert!(
             matches!(result, SubmitResult::Submitted(token) if token == SubmitToken::new(key.op_token))
         );
-        assert_eq!(seam.submitted(), 1, "a deferred submit counts once");
+        let Ok(mut driver) = DriverType::for_platform(8) else {
+            panic!("the platform driver must build on this host");
+        };
+        let counting_seam = IoSeam::new(7, Some(NonNull::from(&mut driver)), None, None);
+        let result = counting_seam.submit_read(
+            IoRequest::recv(-1, MockBuf::with_capacity(8)).with_user_data(key.op_token),
+        );
+        assert!(
+            matches!(result, Some(SubmitResult::Submitted(_))),
+            "the seam reaches the production read submission path",
+        );
+        assert_eq!(
+            counting_seam.submitted(),
+            1,
+            "the production submission path raises the count once",
+        );
         let Some(deferred) = slab.deferred(key) else {
             panic!("the slot must own the deferred descriptor");
         };

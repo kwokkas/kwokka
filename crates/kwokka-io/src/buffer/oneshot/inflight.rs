@@ -223,16 +223,15 @@ impl InflightBufSlab {
                 pending &= pending - 1;
                 let slot = word * 64 + bit;
                 if self.op_token[slot] == op_token && self.occupied[word] & (1u64 << bit) != 0 {
+                    let Ok(slot) = u16::try_from(slot) else {
+                        return false;
+                    };
                     self.occupied[word] &= !(1u64 << bit);
                     self.retire_pending[word] &= !(1u64 << bit);
                     self.notif_expected[word] &= !(1u64 << bit);
                     self.notif_ready[word] &= !(1u64 << bit);
-                    let slot_index = slot;
-                    let Ok(slot) = u16::try_from(slot) else {
-                        return false;
-                    };
                     self.clear_deferred(slot);
-                    self.generation[slot_index] = self.generation[slot_index].wrapping_add(1);
+                    self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
                     return true;
                 }
             }
@@ -595,7 +594,7 @@ mod tests {
         };
         assert!(registry.mark_deferred_by_op_token(3, deferred_op()));
         registry.mark_retire_pending(first);
-        let generation_low16 = u16::try_from(first.generation).map_or(0, |generation| generation);
+        let generation_low16 = (first.generation & 0xFFFF) as u16;
         registry.free_if_retire_pending(first.slot, generation_low16);
         let Some(second) = registry.allocate(4) else {
             panic!("allocate must succeed");
