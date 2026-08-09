@@ -20,7 +20,10 @@
     reason = "pub(crate) restricts slab internals inside the now-pub inflight module"
 )]
 
-use std::{io, os::fd::OwnedFd};
+use std::{
+    io,
+    os::fd::{AsRawFd, OwnedFd},
+};
 
 use crate::{buffer::storage::mmap::MmapRegion, operation::OpCode};
 
@@ -67,10 +70,6 @@ pub struct InflightSlotKey {
 /// A readiness operation deferred on a live in-flight slot.
 pub(crate) struct DeferredOp {
     /// Duplicate retained until the retry completes or the slot is reclaimed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the readiness retry path reads records in #327")
-    )]
     pub(crate) fd: OwnedFd,
     /// Bytes to send, or capacity available for a receive.
     #[cfg_attr(
@@ -313,6 +312,41 @@ impl InflightBufSlab {
             .flatten()
     }
 
+    /// Returns the live deferred slot whose record owns `fd`.
+    ///
+    /// Each live record owns a distinct duplicate, so the first matching
+    /// descriptor is its only matching slot. `None` means no live record owns
+    /// the descriptor, including after its slot was reclaimed.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the readiness event path finds records in #327")
+    )]
+    pub(crate) fn deferred_key_by_fd(&self, fd: i32) -> Option<InflightSlotKey> {
+        for word in 0..BITMAP_WORDS {
+            let mut occupied = self.occupied[word];
+            while occupied != 0 {
+                let bit = occupied.trailing_zeros() as usize;
+                occupied &= occupied - 1;
+                let slot = word * 64 + bit;
+                let Some(deferred) = self.deferred[slot].as_ref() else {
+                    continue;
+                };
+                if deferred.fd.as_raw_fd() == fd {
+                    let Ok(slot) = u16::try_from(slot) else {
+                        return None;
+                    };
+                    return Some(InflightSlotKey {
+                        slot,
+                        generation: self.generation[slot as usize],
+                        worker_id: self.worker_id,
+                        op_token: self.op_token[slot as usize],
+                    });
+                }
+            }
+        }
+        None
+    }
+
     /// Marks the live slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
     ///
     /// Called from the completion drain when a primary CQE carries
@@ -499,7 +533,7 @@ const fn word_bit(slot: u16) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
-    use std::{fs::File, os::fd::AsRawFd};
+    use std::fs::File;
 
     use super::*;
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
@@ -541,6 +575,146 @@ mod tests {
         assert_eq!(deferred.len, 11);
         assert_eq!(deferred.opcode, OpCode::Recv);
         assert!(deferred.fd.as_raw_fd() >= 0);
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_key_by_fd_finds_a_live_record() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(0xABCD) else {
+            panic!("allocate must succeed");
+        };
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+
+        let Some(found) = registry.deferred_key_by_fd(fd) else {
+            panic!("the record's descriptor must resolve to its slot");
+        };
+        assert_eq!(found, key);
+        assert!(registry.deferred(found).is_some());
+        assert!(registry.slot_ptr(found).is_some());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_key_by_fd_distinguishes_duplicate_records() {
+        let mut registry = slab(8);
+        let Some(first) = registry.allocate(1) else {
+            panic!("first allocation must succeed");
+        };
+        let Some(second) = registry.allocate(2) else {
+            panic!("second allocation must succeed");
+        };
+        let Ok(file) = File::open(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")) else {
+            panic!("the crate manifest must open");
+        };
+        let Ok(first_fd) = duplicate_fd(file.as_raw_fd()) else {
+            panic!("the first descriptor must duplicate");
+        };
+        let Ok(second_fd) = duplicate_fd(file.as_raw_fd()) else {
+            panic!("the second descriptor must duplicate");
+        };
+        let first_op = DeferredOp {
+            fd: first_fd.into_owned(),
+            len: 11,
+            opcode: OpCode::Recv,
+        };
+        let first_fd = first_op.fd.as_raw_fd();
+        let second_op = DeferredOp {
+            fd: second_fd.into_owned(),
+            len: 11,
+            opcode: OpCode::Recv,
+        };
+        let second_fd = second_op.fd.as_raw_fd();
+        assert_ne!(first_fd, second_fd);
+        assert!(registry.mark_deferred_by_op_token(first.op_token, first_op));
+        assert!(registry.mark_deferred_by_op_token(second.op_token, second_op));
+
+        assert_eq!(registry.deferred_key_by_fd(first_fd), Some(first));
+        assert_eq!(registry.deferred_key_by_fd(second_fd), Some(second));
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_key_by_fd_ignores_unknown_and_reclaimed_records() {
+        let mut registry = slab(8);
+        let unrecorded = deferred_op();
+        assert!(
+            registry
+                .deferred_key_by_fd(unrecorded.fd.as_raw_fd())
+                .is_none()
+        );
+
+        let Some(key) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+        registry.free(key);
+        assert!(registry.deferred_key_by_fd(fd).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_key_by_fd_follows_the_current_occupant() {
+        let mut registry = slab(8);
+        let Some(first) = registry.allocate(1) else {
+            panic!("first allocation must succeed");
+        };
+        let first_op = deferred_op();
+        let first_fd = first_op.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(first.op_token, first_op));
+        registry.free(first);
+        assert!(registry.deferred_key_by_fd(first_fd).is_none());
+
+        let Some(second) = registry.allocate(2) else {
+            panic!("second allocation must succeed");
+        };
+        let second_op = deferred_op();
+        let second_fd = second_op.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(second.op_token, second_op));
+        assert_eq!(registry.deferred_key_by_fd(second_fd), Some(second));
+
+        let prior = registry.deferred_key_by_fd(first_fd);
+        assert_ne!(prior, Some(first));
+        assert!(prior.is_none() || prior == Some(second));
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_key_by_fd_is_local_to_its_worker() {
+        let mut owner = slab(8);
+        let other = InflightBufSlab::new(4, 8);
+        let Ok(other) = other else {
+            panic!("mmap must succeed for the other worker registry");
+        };
+        let Some(key) = owner.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(owner.mark_deferred_by_op_token(key.op_token, deferred));
+
+        assert_eq!(owner.deferred_key_by_fd(fd), Some(key));
+        assert!(other.deferred_key_by_fd(fd).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn deferred_key_by_fd_keeps_the_record_live() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+
+        assert_eq!(registry.deferred_key_by_fd(fd), Some(key));
+        assert!(registry.deferred(key).is_some());
+        assert_eq!(registry.deferred_key_by_fd(fd), Some(key));
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
