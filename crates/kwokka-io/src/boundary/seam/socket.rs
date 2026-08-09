@@ -302,8 +302,11 @@ mod tests {
 
     use super::*;
 
+    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
     const FULL_SEND_CHUNK_BYTES: usize = 64 * 1024;
+    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
     const FULL_SEND_MAX_BYTES: usize = 16 * 1024 * 1024;
+    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
     static FULL_SEND_CHUNK: [u8; FULL_SEND_CHUNK_BYTES] = [0; FULL_SEND_CHUNK_BYTES];
 
     #[cfg(all(unix, not(miri)))]
@@ -356,7 +359,7 @@ mod tests {
         unsafe { attempt_send(duplicated, bytes.as_ptr(), bytes.len()) }
     }
 
-    #[cfg(all(unix, not(miri)))]
+    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
     fn shrink_socket_buffers(stream: &UnixStream) -> io::Result<()> {
         let size: libc::c_int = 1;
         let Ok(size_len) = libc::socklen_t::try_from(core::mem::size_of_val(&size)) else {
