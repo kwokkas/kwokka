@@ -540,7 +540,7 @@ pub fn mark_notif_expected(slab: &mut InflightBufSlab, op_token: u64) {
 /// instead, and the future frees it on its next poll through
 /// [`IoSeam::slot_notif_ready`](crate::boundary::IoSeam::slot_notif_ready).
 pub fn reclaim_notif(slab: &mut InflightBufSlab, op_token: u64) {
-    if !slab.free_by_op_token(op_token).freed {
+    if !slab.free_by_op_token(op_token).was_freed {
         slab.mark_notif_ready_by_op_token(op_token);
     }
 }

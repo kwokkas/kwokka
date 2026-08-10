@@ -78,9 +78,10 @@ pub(crate) struct DeferredOp {
 }
 
 /// The outcome of reclaiming a slot by its operation token.
+#[must_use]
 pub(crate) struct Reclaimed {
     /// Whether the matching retire-pending slot was freed.
-    pub(crate) freed: bool,
+    pub(crate) was_freed: bool,
     /// The record removed from that slot, if it owned one.
     pub(crate) deferred: Option<DeferredOp>,
 }
@@ -202,8 +203,10 @@ impl InflightBufSlab {
         self.retire_pending[word] & (1u64 << bit) != 0
     }
 
-    /// Frees the retire-pending slot whose op matches `op_token`, returning
-    /// whether a slot was freed.
+    /// Frees the retire-pending slot whose op matches `op_token`.
+    ///
+    /// Returns whether a slot was freed and its deferred record when present;
+    /// dropping that record is the ordinary case.
     ///
     /// Called from the completion drain on the original buffered op's own
     /// completion (keyed by the task token it was submitted with). That CQE is
@@ -214,9 +217,9 @@ impl InflightBufSlab {
     /// Only retire-pending slots are eligible: a slot still owned by a live
     /// future frees through its own `harvest_into` or `free_slot`, never here.
     /// The scan is a no-op when no slot is retire-pending, the common case. The
-    /// `freed` lets the `SEND_ZC` NOTIF path tell a dropped-future free (`true`)
-    /// from a still-live future (`false`, which then marks `notif_ready`). The
-    /// returned deferred record is ordinarily dropped.
+    /// `was_freed` lets the `SEND_ZC` NOTIF path tell a dropped-future free
+    /// (`true`) from a still-live future (`false`, which then marks
+    /// `notif_ready`).
     pub(crate) fn free_by_op_token(&mut self, op_token: u64) -> Reclaimed {
         for word in 0..BITMAP_WORDS {
             let mut pending = self.retire_pending[word];
@@ -227,7 +230,7 @@ impl InflightBufSlab {
                 if self.op_token[slot] == op_token && self.occupied[word] & (1u64 << bit) != 0 {
                     let Ok(slot) = u16::try_from(slot) else {
                         return Reclaimed {
-                            freed: false,
+                            was_freed: false,
                             deferred: None,
                         };
                     };
@@ -238,20 +241,23 @@ impl InflightBufSlab {
                     let deferred = self.clear_deferred(slot);
                     self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
                     return Reclaimed {
-                        freed: true,
+                        was_freed: true,
                         deferred,
                     };
                 }
             }
         }
         Reclaimed {
-            freed: false,
+            was_freed: false,
             deferred: None,
         }
     }
 
     /// Frees `slot` when it is retire-pending, occupied, at the matching
     /// truncated generation, and not awaiting a `SEND_ZC` NOTIF.
+    ///
+    /// Returns its deferred record when present; dropping that record is the
+    /// ordinary case.
     ///
     /// Called from the completion drain on a cancel completion that reported
     /// `-ENOENT`: the target op already completed and posted its one CQE before
@@ -266,8 +272,6 @@ impl InflightBufSlab {
     /// without `notif_ready` therefore refuses the free, leaving the slot for
     /// the NOTIF path; once `notif_ready` is set the buffer is released and the
     /// free proceeds.
-    /// Returns the deferred record from the reclaimed slot, if any; dropping it
-    /// is the ordinary case.
     pub(crate) fn free_if_retire_pending(
         &mut self,
         slot: u16,
@@ -842,7 +846,7 @@ mod tests {
         assert!(registry.mark_deferred_by_op_token(2, deferred));
         registry.mark_retire_pending(first);
         let reclaimed = registry.free_by_op_token(2);
-        assert!(reclaimed.freed);
+        assert!(reclaimed.was_freed);
         let Some(deferred) = reclaimed.deferred else {
             panic!("the reclaimed slot must yield its deferred record");
         };
@@ -891,7 +895,7 @@ mod tests {
         assert!(registry.free(stale).is_none(), "a stale key yields nothing");
 
         let reclaimed = registry.free_by_op_token(1);
-        assert!(!reclaimed.freed, "an unknown token frees no slot");
+        assert!(!reclaimed.was_freed, "an unknown token frees no slot");
         assert!(
             reclaimed.deferred.is_none(),
             "an unknown token yields no record"
@@ -1179,12 +1183,12 @@ mod tests {
         };
         // Live (not retire-pending): nothing to free, so it reports false.
         let reclaimed = registry.free_by_op_token(0xABCD);
-        assert!(!reclaimed.freed, "a live slot is not freed");
+        assert!(!reclaimed.was_freed, "a live slot is not freed");
         assert!(reclaimed.deferred.is_none(), "a live slot yields no record");
         registry.mark_retire_pending(key);
         let reclaimed = registry.free_by_op_token(0xABCD);
         assert!(
-            reclaimed.freed,
+            reclaimed.was_freed,
             "a retire-pending slot is freed and reported"
         );
         assert!(
@@ -1294,7 +1298,7 @@ mod tests {
         registry.mark_retire_pending(key);
         // NOTIF arrives: the dropped future's slot frees by op token.
         assert!(
-            registry.free_by_op_token(0xABCD).freed,
+            registry.free_by_op_token(0xABCD).was_freed,
             "the NOTIF frees the slot"
         );
         let Some(next) = registry.allocate(0) else {
@@ -1334,7 +1338,7 @@ mod tests {
         registry.mark_notif_expected_by_op_token(0xABCD);
         // NOTIF on a live future: not retire-pending, so it marks ready.
         assert!(
-            !registry.free_by_op_token(0xABCD).freed,
+            !registry.free_by_op_token(0xABCD).was_freed,
             "a live future frees nothing here",
         );
         registry.mark_notif_ready_by_op_token(0xABCD);
