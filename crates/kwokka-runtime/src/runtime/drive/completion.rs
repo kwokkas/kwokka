@@ -13,7 +13,6 @@
 
 use kwokka_core::slab::SlabKey;
 use kwokka_io::{
-    IoDriver,
     boundary::{
         dispose_cancelled_op, is_cancel_sentinel, is_link_timeout_discard, is_msg_ring_wake,
         is_multishot_sentinel, is_recv_multishot_sentinel, mark_notif_expected,
@@ -60,9 +59,10 @@ pub(crate) fn drain_completions(shard: &mut WorkerShard, wake_fd: i32) {
     // would otherwise starve its completions.
     let _ = shard.driver.flush_deferred();
     let mut completions = [Completion::default(); COMPLETION_BATCH];
-    let count = shard
-        .driver
-        .poll_completions(COMPLETION_BATCH, &mut completions);
+    let count =
+        shard
+            .driver
+            .drain_ready(&mut shard.inflight_slab, COMPLETION_BATCH, &mut completions);
     for completion in &completions[..count] {
         let user_data = completion.token.user_data();
         if user_data == wake::WAKE_FD_USER_DATA {

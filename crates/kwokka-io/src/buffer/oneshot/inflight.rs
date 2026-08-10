@@ -72,16 +72,8 @@ pub(crate) struct DeferredOp {
     /// Duplicate retained until the retry completes or the slot is reclaimed.
     pub(crate) fd: OwnedFd,
     /// Bytes to send, or capacity available for a receive.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the readiness retry path reads records in #327")
-    )]
     pub(crate) len: u32,
     /// The retry direction, restricted to `Send` and `Recv`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the readiness retry path reads records in #327")
-    )]
     pub(crate) opcode: OpCode,
 }
 
@@ -302,10 +294,7 @@ impl InflightBufSlab {
     }
 
     /// Returns the deferred operation belonging to `key`, if it is still live.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the readiness retry path reads records in #327")
-    )]
+    #[cfg(test)]
     pub(crate) fn deferred(&self, key: InflightSlotKey) -> Option<&DeferredOp> {
         self.is_live(key)
             .then(|| self.deferred[key.slot as usize].as_ref())
@@ -317,10 +306,6 @@ impl InflightBufSlab {
     /// Each live record owns a distinct duplicate, so the first matching
     /// descriptor is its only matching slot. `None` means no live record owns
     /// the descriptor, including after its slot was reclaimed.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the readiness event path finds records in #327")
-    )]
     pub(crate) fn deferred_key_by_fd(&self, fd: i32) -> Option<InflightSlotKey> {
         for word in 0..BITMAP_WORDS {
             let mut occupied = self.occupied[word];
@@ -345,6 +330,29 @@ impl InflightBufSlab {
             }
         }
         None
+    }
+
+    /// Returns the retained descriptor, slot bytes, and opcode for a retry.
+    pub(crate) fn retry_parts(
+        &mut self,
+        key: InflightSlotKey,
+    ) -> Option<(&OwnedFd, &mut [u8], OpCode)> {
+        if !self.is_live(key) {
+            return None;
+        }
+        let deferred = self.deferred[key.slot as usize].as_ref()?;
+        let len = deferred.len.min(self.stride) as usize;
+        let offset = key.slot as usize * self.stride as usize;
+        let bytes = &mut self.storage.as_mut_slice()[offset..offset + len];
+        Some((&deferred.fd, bytes, deferred.opcode))
+    }
+
+    /// Removes a deferred record without reclaiming its slot or bytes.
+    pub(crate) fn retire_deferred(&mut self, key: InflightSlotKey) -> bool {
+        if !self.is_live(key) {
+            return false;
+        }
+        self.deferred[key.slot as usize].take().is_some()
     }
 
     /// Marks the live slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
@@ -715,6 +723,44 @@ mod tests {
         assert_eq!(registry.deferred_key_by_fd(fd), Some(key));
         assert!(registry.deferred(key).is_some());
         assert_eq!(registry.deferred_key_by_fd(fd), Some(key));
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn retry_parts_borrows_the_record_and_truncates_the_slot() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let mut deferred = deferred_op();
+        deferred.len = u32::MAX;
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+        let Some((fd, bytes, opcode)) = registry.retry_parts(key) else {
+            panic!("a live deferred slot supplies retry parts");
+        };
+        assert!(fd.as_raw_fd() >= 0);
+        assert_eq!(bytes.len(), 4096);
+        assert_eq!(opcode, OpCode::Recv);
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn retire_deferred_keeps_the_slot_and_bytes_live() {
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let Some(bytes) = registry.slot_array_mut(key) else {
+            panic!("a live slot supplies its bytes");
+        };
+        bytes[0] = b'x';
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+        assert!(registry.retire_deferred(key));
+        assert!(registry.deferred_key_by_fd(fd).is_none());
+        assert!(registry.slot_array(key).is_some());
+        assert_eq!(registry.slot_array(key).map(|bytes| bytes[0]), Some(b'x'));
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]

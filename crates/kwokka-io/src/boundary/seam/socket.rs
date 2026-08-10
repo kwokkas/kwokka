@@ -1,5 +1,7 @@
 //! Creating and adopting the file descriptors the seam hands out.
 
+#[cfg(all(test, unix, not(miri), not(target_os = "macos")))]
+use std::os::unix::net::UnixStream;
 use std::{
     io,
     os::fd::{AsRawFd, FromRawFd, OwnedFd},
@@ -40,7 +42,7 @@ impl Duplicated {
     /// Releases the owned descriptor to the deferral record.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "consumed by the readiness retry path in #327")
+        expect(dead_code, reason = "consumed by the readiness submit path in #330")
     )]
     pub(crate) fn into_owned(self) -> OwnedFd {
         self.0
@@ -51,7 +53,7 @@ impl Duplicated {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+    expect(dead_code, reason = "consumed by the readiness submit path in #330")
 )]
 pub(crate) enum Attempt {
     /// The syscall transferred this many bytes; its duplicate was closed.
@@ -62,11 +64,22 @@ pub(crate) enum Attempt {
     WouldBlock(OwnedFd),
 }
 
+/// The result of retrying a deferred readiness operation.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) enum Retry {
+    /// The syscall transferred this many bytes.
+    Done(u32),
+    /// The syscall failed with this negative errno.
+    Failed(i32),
+    /// The operation must keep waiting on its retained descriptor.
+    WouldBlock,
+}
+
 /// Duplicates `fd` with close-on-exec set by the same kernel operation.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+    expect(dead_code, reason = "consumed by the readiness submit path in #330")
 )]
 pub(crate) fn duplicate_fd(fd: i32) -> io::Result<Duplicated> {
     // SAFETY: Invariant -- `F_DUPFD_CLOEXEC` atomically creates a distinct
@@ -97,7 +110,7 @@ pub(crate) fn duplicate_fd(fd: i32) -> io::Result<Duplicated> {
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+    expect(dead_code, reason = "consumed by the readiness submit path in #330")
 )]
 #[allow(
     clippy::unnecessary_wraps,
@@ -128,7 +141,7 @@ pub(crate) unsafe fn attempt_recv(
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by the readiness retry path in #327")
+    expect(dead_code, reason = "consumed by the readiness submit path in #330")
 )]
 #[allow(
     clippy::unnecessary_wraps,
@@ -166,6 +179,66 @@ fn attempt_result(duplicated: Duplicated, result: isize) -> Attempt {
         return Attempt::WouldBlock(duplicated.0);
     }
     Attempt::Failed(-error.raw_os_error().map_or(libc::EIO, |errno| errno))
+}
+
+/// Retries a deferred receive without blocking.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn retry_recv(fd: &OwnedFd, buf: &mut [u8]) -> Retry {
+    // SAFETY: Invariant -- `fd` owns the deferred operation's live socket and
+    // `buf` is the slot exclusively borrowed for this synchronous retry.
+    // Precondition: both references remain valid for the call. Failure mode:
+    // an invalid descriptor reports errno; an invalid buffer would let `recv`
+    // write outside the slot.
+    let result = unsafe {
+        libc::recv(
+            fd.as_raw_fd(),
+            buf.as_mut_ptr().cast(),
+            buf.len(),
+            MSG_DONTWAIT,
+        )
+    };
+    retry_result(result)
+}
+
+/// Retries a deferred send without blocking.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) fn retry_send(fd: &OwnedFd, buf: &[u8]) -> Retry {
+    // SAFETY: Invariant -- `fd` owns the deferred operation's live socket and
+    // `buf` is the slot borrowed for this synchronous retry. Precondition:
+    // both references remain valid for the call. Failure mode: an invalid
+    // descriptor reports errno; an invalid buffer would let `send` read past it.
+    let result = unsafe {
+        libc::send(
+            fd.as_raw_fd(),
+            buf.as_ptr().cast(),
+            buf.len(),
+            MSG_DONTWAIT | MSG_NOSIGNAL,
+        )
+    };
+    retry_result(result)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn retry_result(result: isize) -> Retry {
+    if result >= 0 {
+        return u32::try_from(result).map_or_else(|_| Retry::Failed(-libc::EINVAL), Retry::Done);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(libc::EAGAIN) {
+        return Retry::WouldBlock;
+    }
+    Retry::Failed(-error.raw_os_error().map_or(libc::EIO, |errno| errno))
+}
+
+#[cfg(test)]
+pub(crate) fn restore_sigpipe_default_for_test() {
+    // SAFETY: Invariant -- the caller runs in an isolated test child, so no
+    // unrelated test shares this disposition. Precondition: its only later
+    // send is the MSG_NOSIGNAL assertion. Failure mode: changing SIGPIPE in a
+    // shared process would make an unrelated socket send terminate it.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
 }
 
 /// Adopts a nonnegative accept-completion result as an owned descriptor.
@@ -291,6 +364,49 @@ pub fn create_datagram_socket(family: AddressFamily) -> io::Result<OwnedFd> {
     create_socket(family, libc::SOCK_DGRAM)
 }
 
+#[cfg(all(test, unix, not(miri), not(target_os = "macos")))]
+pub(crate) fn shrink_socket_buffers(stream: &UnixStream) -> io::Result<()> {
+    let size: libc::c_int = 1;
+    let Ok(size_len) = libc::socklen_t::try_from(core::mem::size_of_val(&size)) else {
+        return Err(io::Error::from_raw_os_error(libc::EINVAL));
+    };
+    // SAFETY: Invariant -- `stream` owns a live socket descriptor and `size`
+    // points at one initialized `c_int`. Precondition: the pointer and its
+    // byte count remain valid for each synchronous `setsockopt` call.
+    // Failure mode: an invalid descriptor or option returns -1 and errno;
+    // an invalid pointer would let the kernel read invalid memory.
+    let send = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            (&raw const size).cast(),
+            size_len,
+        )
+    };
+    if send < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: Invariant -- identical to the preceding `setsockopt` call;
+    // this call changes only the receive-buffer bound on the same live
+    // descriptor. Precondition: `size` remains initialized for `size_len`
+    // bytes. Failure mode: an invalid descriptor or pointer returns errno
+    // or lets the kernel read invalid memory, respectively.
+    let recv = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            (&raw const size).cast(),
+            size_len,
+        )
+    };
+    if recv < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(all(unix, not(miri)))]
@@ -357,49 +473,6 @@ mod tests {
         // Failure mode: an invalid region lets `send` read outside the test
         // buffer.
         unsafe { attempt_send(duplicated, bytes.as_ptr(), bytes.len()) }
-    }
-
-    #[cfg(all(unix, not(miri), not(target_os = "macos")))]
-    fn shrink_socket_buffers(stream: &UnixStream) -> io::Result<()> {
-        let size: libc::c_int = 1;
-        let Ok(size_len) = libc::socklen_t::try_from(core::mem::size_of_val(&size)) else {
-            return Err(io::Error::from_raw_os_error(libc::EINVAL));
-        };
-        // SAFETY: Invariant -- `stream` owns a live TCP descriptor and `size`
-        // points at one initialized `c_int`. Precondition: the pointer and its
-        // byte count remain valid for each synchronous `setsockopt` call.
-        // Failure mode: an invalid descriptor or option returns -1 and errno;
-        // an invalid pointer would let the kernel read invalid memory.
-        let send = unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_SNDBUF,
-                (&raw const size).cast(),
-                size_len,
-            )
-        };
-        if send < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: Invariant -- identical to the preceding `setsockopt` call;
-        // this call changes only the receive-buffer bound on the same live
-        // descriptor. Precondition: `size` remains initialized for `size_len`
-        // bytes. Failure mode: an invalid descriptor or pointer returns errno
-        // or lets the kernel read invalid memory, respectively.
-        let recv = unsafe {
-            libc::setsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&raw const size).cast(),
-                size_len,
-            )
-        };
-        if recv < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     // A real `socket()` syscall is unsupported under miri's isolation, so this
@@ -486,6 +559,41 @@ mod tests {
         assert_eq!(&bytes[..payload.len()], payload);
     }
 
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn retry_recv_reads_ready_socket_bytes_without_consuming_the_descriptor() {
+        let Ok((server, mut client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let Ok(duplicated) = duplicate_fd(server.as_raw_fd()) else {
+            panic!("the receive descriptor must duplicate");
+        };
+        let fd = duplicated.into_owned();
+        let Ok(()) = client.write_all(b"recv") else {
+            panic!("the client must seed the receive buffer");
+        };
+        let mut bytes = [0u8; 4];
+        assert!(matches!(retry_recv(&fd, &mut bytes), Retry::Done(4)));
+        assert_eq!(bytes, *b"recv");
+        assert!(fd.as_raw_fd() >= 0);
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn retry_recv_on_unready_socket_would_block() {
+        let Ok((server, _client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let Ok(duplicated) = duplicate_fd(server.as_raw_fd()) else {
+            panic!("the receive descriptor must duplicate");
+        };
+        let mut bytes = [0u8; 4];
+        assert!(matches!(
+            retry_recv(&duplicated.into_owned(), &mut bytes),
+            Retry::WouldBlock
+        ));
+    }
+
     #[cfg(all(unix, not(miri)))]
     #[test]
     fn send_attempt_writes_ready_socket_bytes() {
@@ -504,6 +612,25 @@ mod tests {
         assert_eq!(received, *payload);
     }
 
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn retry_send_writes_ready_socket_bytes_without_consuming_the_descriptor() {
+        let Ok((mut server, client)) = socket_pair() else {
+            panic!("a socket pair must be created");
+        };
+        let Ok(duplicated) = duplicate_fd(client.as_raw_fd()) else {
+            panic!("the send descriptor must duplicate");
+        };
+        let fd = duplicated.into_owned();
+        assert!(matches!(retry_send(&fd, b"send"), Retry::Done(4)));
+        let mut received = [0u8; 4];
+        let Ok(()) = server.read_exact(&mut received) else {
+            panic!("the peer must receive the sent bytes");
+        };
+        assert_eq!(received, *b"send");
+        assert!(fd.as_raw_fd() >= 0);
+    }
+
     // Issue #334: this fixture times out on macOS; its cause is not known yet.
     #[cfg(all(unix, not(miri), not(target_os = "macos")))]
     #[test]
@@ -511,10 +638,10 @@ mod tests {
         let Ok((server, client)) = socket_pair() else {
             panic!("a socket pair must be created");
         };
-        let Ok(()) = shrink_socket_buffers(&server) else {
+        let Ok(()) = super::shrink_socket_buffers(&server) else {
             panic!("the server receive buffer must shrink");
         };
-        let Ok(()) = shrink_socket_buffers(&client) else {
+        let Ok(()) = super::shrink_socket_buffers(&client) else {
             panic!("the client send buffer must shrink");
         };
         let mut deferred = false;

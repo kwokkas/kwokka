@@ -52,6 +52,8 @@ pub trait IoDriver: Send {
     /// A `NOTIF` CQE from a `SEND_ZC` two-stage completion is appended to
     /// `out` with `CqeFlags::NOTIF` set; the runtime completion drain absorbs
     /// it to release the send buffer, so user code never sees it.
+    /// Readiness backends return zero here; their run-loop batch path is
+    /// [`DriverType::drain_ready`](crate::DriverType::drain_ready).
     fn poll_completions(&self, max: usize, out: &mut [Completion]) -> usize;
 
     /// Capability snapshot detected at ring setup.
