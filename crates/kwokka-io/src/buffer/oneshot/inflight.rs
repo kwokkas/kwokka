@@ -77,6 +77,15 @@ pub(crate) struct DeferredOp {
     pub(crate) opcode: OpCode,
 }
 
+/// The outcome of reclaiming a slot by its operation token.
+#[must_use]
+pub(crate) struct Reclaimed {
+    /// Whether the matching retire-pending slot was freed.
+    pub(crate) was_freed: bool,
+    /// The record removed from that slot, if it owned one.
+    pub(crate) deferred: Option<DeferredOp>,
+}
+
 /// Per-worker fixed-capacity in-flight buffer registry.
 ///
 /// Owns the bytes for every buffered op in flight on its worker. A slot is
@@ -158,19 +167,21 @@ impl InflightBufSlab {
 
     /// Frees `key`'s slot, bumping its generation so later stale handles are
     /// rejected. A stale handle (the slot was already freed and reused) is a
-    /// no-op.
-    pub(crate) fn free(&mut self, key: InflightSlotKey) {
+    /// no-op. Returns its deferred record when present; dropping that record is
+    /// the ordinary case.
+    pub(crate) const fn free(&mut self, key: InflightSlotKey) -> Option<DeferredOp> {
         if !self.is_live(key) {
-            return;
+            return None;
         }
         let (word, bit) = word_bit(key.slot);
         self.occupied[word] &= !(1u64 << bit);
         self.retire_pending[word] &= !(1u64 << bit);
         self.notif_expected[word] &= !(1u64 << bit);
         self.notif_ready[word] &= !(1u64 << bit);
-        self.clear_deferred(key.slot);
+        let deferred = self.clear_deferred(key.slot);
         let generation = &mut self.generation[key.slot as usize];
         *generation = generation.wrapping_add(1);
+        deferred
     }
 
     /// Marks `key`'s slot retire-pending. A stale handle is a no-op.
@@ -192,8 +203,10 @@ impl InflightBufSlab {
         self.retire_pending[word] & (1u64 << bit) != 0
     }
 
-    /// Frees the retire-pending slot whose op matches `op_token`, returning
-    /// whether a slot was freed.
+    /// Frees the retire-pending slot whose op matches `op_token`.
+    ///
+    /// Returns whether a slot was freed and its deferred record when present;
+    /// dropping that record is the ordinary case.
     ///
     /// Called from the completion drain on the original buffered op's own
     /// completion (keyed by the task token it was submitted with). That CQE is
@@ -204,9 +217,10 @@ impl InflightBufSlab {
     /// Only retire-pending slots are eligible: a slot still owned by a live
     /// future frees through its own `harvest_into` or `free_slot`, never here.
     /// The scan is a no-op when no slot is retire-pending, the common case. The
-    /// `bool` lets the `SEND_ZC` NOTIF path tell a dropped-future free (`true`)
-    /// from a still-live future (`false`, which then marks `notif_ready`).
-    pub(crate) fn free_by_op_token(&mut self, op_token: u64) -> bool {
+    /// `was_freed` lets the `SEND_ZC` NOTIF path tell a dropped-future free
+    /// (`true`) from a still-live future (`false`, which then marks
+    /// `notif_ready`).
+    pub(crate) fn free_by_op_token(&mut self, op_token: u64) -> Reclaimed {
         for word in 0..BITMAP_WORDS {
             let mut pending = self.retire_pending[word];
             while pending != 0 {
@@ -215,23 +229,35 @@ impl InflightBufSlab {
                 let slot = word * 64 + bit;
                 if self.op_token[slot] == op_token && self.occupied[word] & (1u64 << bit) != 0 {
                     let Ok(slot) = u16::try_from(slot) else {
-                        return false;
+                        return Reclaimed {
+                            was_freed: false,
+                            deferred: None,
+                        };
                     };
                     self.occupied[word] &= !(1u64 << bit);
                     self.retire_pending[word] &= !(1u64 << bit);
                     self.notif_expected[word] &= !(1u64 << bit);
                     self.notif_ready[word] &= !(1u64 << bit);
-                    self.clear_deferred(slot);
+                    let deferred = self.clear_deferred(slot);
                     self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
-                    return true;
+                    return Reclaimed {
+                        was_freed: true,
+                        deferred,
+                    };
                 }
             }
         }
-        false
+        Reclaimed {
+            was_freed: false,
+            deferred: None,
+        }
     }
 
     /// Frees `slot` when it is retire-pending, occupied, at the matching
     /// truncated generation, and not awaiting a `SEND_ZC` NOTIF.
+    ///
+    /// Returns its deferred record when present; dropping that record is the
+    /// ordinary case.
     ///
     /// Called from the completion drain on a cancel completion that reported
     /// `-ENOENT`: the target op already completed and posted its one CQE before
@@ -246,9 +272,13 @@ impl InflightBufSlab {
     /// without `notif_ready` therefore refuses the free, leaving the slot for
     /// the NOTIF path; once `notif_ready` is set the buffer is released and the
     /// free proceeds.
-    pub(crate) fn free_if_retire_pending(&mut self, slot: u16, generation_low16: u16) {
+    pub(crate) fn free_if_retire_pending(
+        &mut self,
+        slot: u16,
+        generation_low16: u16,
+    ) -> Option<DeferredOp> {
         if slot >= self.cap {
-            return;
+            return None;
         }
         let (word, bit) = word_bit(slot);
         let is_occupied = self.occupied[word] & (1u64 << bit) != 0;
@@ -262,14 +292,15 @@ impl InflightBufSlab {
             || !matches_generation
             || (is_notif_expected && !is_notif_ready)
         {
-            return;
+            return None;
         }
         self.occupied[word] &= !(1u64 << bit);
         self.retire_pending[word] &= !(1u64 << bit);
         self.notif_expected[word] &= !(1u64 << bit);
         self.notif_ready[word] &= !(1u64 << bit);
-        self.clear_deferred(slot);
+        let deferred = self.clear_deferred(slot);
         self.generation[slot as usize] = self.generation[slot as usize].wrapping_add(1);
+        deferred
     }
 
     /// Records `op` on the occupied slot named by `op_token`.
@@ -348,11 +379,13 @@ impl InflightBufSlab {
     }
 
     /// Removes a deferred record without reclaiming its slot or bytes.
-    pub(crate) fn retire_deferred(&mut self, key: InflightSlotKey) -> bool {
+    ///
+    /// Returns the record when present; dropping it is the ordinary case.
+    pub(crate) const fn retire_deferred(&mut self, key: InflightSlotKey) -> Option<DeferredOp> {
         if !self.is_live(key) {
-            return false;
+            return None;
         }
-        self.deferred[key.slot as usize].take().is_some()
+        self.deferred[key.slot as usize].take()
     }
 
     /// Marks the live slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
@@ -505,9 +538,9 @@ impl InflightBufSlab {
         None
     }
 
-    /// Releases a deferred descriptor before a slot is made available again.
-    fn clear_deferred(&mut self, slot: u16) {
-        let _ = self.deferred[slot as usize].take();
+    /// Removes a deferred record before a slot is made available again.
+    const fn clear_deferred(&mut self, slot: u16) -> Option<DeferredOp> {
+        self.deferred[slot as usize].take()
     }
 
     /// Whether `key` names a live slot this registry owns at the matching
@@ -541,7 +574,7 @@ const fn word_bit(slot: u16) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
-    use std::fs::File;
+    use std::{fs::File, os::unix::net::UnixStream};
 
     use super::*;
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
@@ -660,7 +693,7 @@ mod tests {
         let deferred = deferred_op();
         let fd = deferred.fd.as_raw_fd();
         assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
-        registry.free(key);
+        let _ = registry.free(key);
         assert!(registry.deferred_key_by_fd(fd).is_none());
     }
 
@@ -674,7 +707,7 @@ mod tests {
         let first_op = deferred_op();
         let first_fd = first_op.fd.as_raw_fd();
         assert!(registry.mark_deferred_by_op_token(first.op_token, first_op));
-        registry.free(first);
+        let _ = registry.free(first);
         assert!(registry.deferred_key_by_fd(first_fd).is_none());
 
         let Some(second) = registry.allocate(2) else {
@@ -757,7 +790,12 @@ mod tests {
         let deferred = deferred_op();
         let fd = deferred.fd.as_raw_fd();
         assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
-        assert!(registry.retire_deferred(key));
+        let Some(retired) = registry.retire_deferred(key) else {
+            panic!("the live slot must yield its deferred record");
+        };
+        assert_eq!(retired.fd.as_raw_fd(), fd);
+        assert_eq!(retired.len, 11);
+        assert_eq!(retired.opcode, OpCode::Recv);
         assert!(registry.deferred_key_by_fd(fd).is_none());
         assert!(registry.slot_array(key).is_some());
         assert_eq!(registry.slot_array(key).map(|bytes| bytes[0]), Some(b'x'));
@@ -776,13 +814,20 @@ mod tests {
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn free_clears_the_deferred_record() {
+    fn free_yields_the_deferred_record() {
         let mut registry = slab(8);
         let Some(first) = registry.allocate(1) else {
             panic!("allocate must succeed");
         };
-        assert!(registry.mark_deferred_by_op_token(1, deferred_op()));
-        registry.free(first);
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(1, deferred));
+        let Some(deferred) = registry.free(first) else {
+            panic!("the reclaimed slot must yield its deferred record");
+        };
+        assert_eq!(deferred.fd.as_raw_fd(), fd);
+        assert_eq!(deferred.len, 11);
+        assert_eq!(deferred.opcode, OpCode::Recv);
         let Some(second) = registry.allocate(2) else {
             panic!("allocate must succeed");
         };
@@ -796,9 +841,18 @@ mod tests {
         let Some(first) = registry.allocate(2) else {
             panic!("allocate must succeed");
         };
-        assert!(registry.mark_deferred_by_op_token(2, deferred_op()));
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(2, deferred));
         registry.mark_retire_pending(first);
-        assert!(registry.free_by_op_token(2));
+        let reclaimed = registry.free_by_op_token(2);
+        assert!(reclaimed.was_freed);
+        let Some(deferred) = reclaimed.deferred else {
+            panic!("the reclaimed slot must yield its deferred record");
+        };
+        assert_eq!(deferred.fd.as_raw_fd(), fd);
+        assert_eq!(deferred.len, 11);
+        assert_eq!(deferred.opcode, OpCode::Recv);
         let Some(second) = registry.allocate(3) else {
             panic!("allocate must succeed");
         };
@@ -812,14 +866,54 @@ mod tests {
         let Some(first) = registry.allocate(3) else {
             panic!("allocate must succeed");
         };
-        assert!(registry.mark_deferred_by_op_token(3, deferred_op()));
+        let deferred = deferred_op();
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(3, deferred));
         registry.mark_retire_pending(first);
         let generation_low16 = (first.generation & 0xFFFF) as u16;
-        registry.free_if_retire_pending(first.slot, generation_low16);
+        let Some(deferred) = registry.free_if_retire_pending(first.slot, generation_low16) else {
+            panic!("the reclaimed slot must yield its deferred record");
+        };
+        assert_eq!(deferred.fd.as_raw_fd(), fd);
+        assert_eq!(deferred.len, 11);
+        assert_eq!(deferred.opcode, OpCode::Recv);
         let Some(second) = registry.allocate(4) else {
             panic!("allocate must succeed");
         };
         assert!(registry.deferred(second).is_none());
+    }
+
+    #[test]
+    fn reclaiming_nothing_yields_nothing() {
+        let mut registry = slab(8);
+        let stale = InflightSlotKey {
+            slot: 0,
+            generation: 0,
+            worker_id: 3,
+            op_token: 1,
+        };
+        assert!(registry.free(stale).is_none(), "a stale key yields nothing");
+
+        let reclaimed = registry.free_by_op_token(1);
+        assert!(!reclaimed.was_freed, "an unknown token frees no slot");
+        assert!(
+            reclaimed.deferred.is_none(),
+            "an unknown token yields no record"
+        );
+
+        let Some(key) = registry.allocate(2) else {
+            panic!("allocate must succeed");
+        };
+        registry.mark_retire_pending(key);
+        assert_eq!(key.generation, 0, "a new slot has generation zero");
+        assert!(
+            registry.free_if_retire_pending(key.slot, 1).is_none(),
+            "a generation mismatch yields nothing",
+        );
+        assert!(
+            registry.free_if_retire_pending(key.slot, 0).is_none(),
+            "a reclaimed slot with no record yields nothing",
+        );
     }
 
     #[test]
@@ -854,7 +948,7 @@ mod tests {
         let Some(first) = registry.allocate(0) else {
             panic!("allocate must succeed");
         };
-        registry.free(first);
+        let _ = registry.free(first);
         let Some(second) = registry.allocate(0) else {
             panic!("allocate must succeed");
         };
@@ -868,7 +962,7 @@ mod tests {
         let Some(stale) = registry.allocate(0) else {
             panic!("allocate must succeed");
         };
-        registry.free(stale);
+        let _ = registry.free(stale);
         let Some(fresh) = registry.allocate(0) else {
             panic!("allocate must succeed");
         };
@@ -878,7 +972,7 @@ mod tests {
             registry.slot_slice(stale, 4).is_none(),
             "stale slice is rejected"
         );
-        registry.free(stale);
+        let _ = registry.free(stale);
         registry.mark_retire_pending(stale);
         assert!(
             !registry.is_retire_pending(fresh.slot),
@@ -899,7 +993,7 @@ mod tests {
         assert!(!registry.is_retire_pending(key.slot));
         registry.mark_retire_pending(key);
         assert!(registry.is_retire_pending(key.slot));
-        registry.free(key);
+        let _ = registry.free(key);
         assert!(!registry.is_retire_pending(key.slot), "free clears the bit");
     }
 
@@ -1018,7 +1112,7 @@ mod tests {
             panic!("allocate must succeed");
         };
         registry.mark_retire_pending(key);
-        registry.free_by_op_token(0xABCD);
+        let _ = registry.free_by_op_token(0xABCD);
         let Some(next) = registry.allocate(0) else {
             panic!("the freed slot reallocates");
         };
@@ -1038,7 +1132,7 @@ mod tests {
         };
         // Not retire-pending: a live future still owns the slot, so its op
         // completion must not free it here -- only its own harvest/free may.
-        registry.free_by_op_token(0xABCD);
+        let _ = registry.free_by_op_token(0xABCD);
         assert!(
             registry.slot_ptr(key).is_some(),
             "a slot not yet retire-pending survives its op completion",
@@ -1052,7 +1146,7 @@ mod tests {
             panic!("allocate must succeed");
         };
         registry.mark_retire_pending(key);
-        registry.free_by_op_token(0x1234);
+        let _ = registry.free_by_op_token(0x1234);
         assert!(
             registry.is_retire_pending(key.slot),
             "a foreign op token leaves the slot marked, not freed",
@@ -1067,10 +1161,10 @@ mod tests {
             panic!("allocate must succeed");
         };
         registry.mark_retire_pending(key);
-        registry.free_by_op_token(0xABCD);
+        let _ = registry.free_by_op_token(0xABCD);
         // The op's CQE cannot arrive twice, but a defensive second call finds
         // the slot cleared (bit gone), so it is a no-op.
-        registry.free_by_op_token(0xABCD);
+        let _ = registry.free_by_op_token(0xABCD);
         let Some(next) = registry.allocate(0) else {
             panic!("the freed slot reallocates");
         };
@@ -1088,14 +1182,83 @@ mod tests {
             panic!("allocate must succeed");
         };
         // Live (not retire-pending): nothing to free, so it reports false.
-        assert!(
-            !registry.free_by_op_token(0xABCD),
-            "a live slot is not freed",
-        );
+        let reclaimed = registry.free_by_op_token(0xABCD);
+        assert!(!reclaimed.was_freed, "a live slot is not freed");
+        assert!(reclaimed.deferred.is_none(), "a live slot yields no record");
         registry.mark_retire_pending(key);
+        let reclaimed = registry.free_by_op_token(0xABCD);
         assert!(
-            registry.free_by_op_token(0xABCD),
-            "a retire-pending slot is freed and reported",
+            reclaimed.was_freed,
+            "a retire-pending slot is freed and reported"
+        );
+        assert!(
+            reclaimed.deferred.is_none(),
+            "a freed slot without a record yields none",
+        );
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn dropping_a_reclaimed_record_closes_its_descriptor() {
+        let Ok((socket, _peer)) = UnixStream::pair() else {
+            panic!("a socket pair must open");
+        };
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let Ok(duplicated) = duplicate_fd(socket.as_raw_fd()) else {
+            panic!("the socket descriptor must duplicate");
+        };
+        let deferred = DeferredOp {
+            fd: duplicated.into_owned(),
+            len: 11,
+            opcode: OpCode::Recv,
+        };
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+        let _ = registry.free(key);
+        assert!(
+            duplicate_fd(fd).is_err(),
+            "dropping the reclaimed record closes its descriptor",
+        );
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn holding_a_reclaimed_record_keeps_its_descriptor_open() {
+        let Ok((socket, _peer)) = UnixStream::pair() else {
+            panic!("a socket pair must open");
+        };
+        let mut registry = slab(8);
+        let Some(key) = registry.allocate(1) else {
+            panic!("allocate must succeed");
+        };
+        let Ok(duplicated) = duplicate_fd(socket.as_raw_fd()) else {
+            panic!("the socket descriptor must duplicate");
+        };
+        let deferred = DeferredOp {
+            fd: duplicated.into_owned(),
+            len: 11,
+            opcode: OpCode::Recv,
+        };
+        let fd = deferred.fd.as_raw_fd();
+        assert!(registry.mark_deferred_by_op_token(key.op_token, deferred));
+        let Some(deferred) = registry.free(key) else {
+            panic!("the reclaimed slot must yield its deferred record");
+        };
+        assert!(
+            registry.allocate(2).is_some(),
+            "the reclaimed slot is reusable"
+        );
+        assert!(
+            duplicate_fd(fd).is_ok(),
+            "the held record keeps its socket descriptor open",
+        );
+        drop(deferred);
+        assert!(
+            duplicate_fd(fd).is_err(),
+            "giving up the record closes its descriptor",
         );
     }
 
@@ -1114,7 +1277,7 @@ mod tests {
             registry.is_notif_ready(key),
             "the notif mark is visible by key",
         );
-        registry.free(key);
+        let _ = registry.free(key);
         assert!(
             !registry.is_notif_ready(key),
             "free clears the notif flag and the stale key reads false",
@@ -1135,7 +1298,7 @@ mod tests {
         registry.mark_retire_pending(key);
         // NOTIF arrives: the dropped future's slot frees by op token.
         assert!(
-            registry.free_by_op_token(0xABCD),
+            registry.free_by_op_token(0xABCD).was_freed,
             "the NOTIF frees the slot"
         );
         let Some(next) = registry.allocate(0) else {
@@ -1155,7 +1318,7 @@ mod tests {
         registry.mark_notif_expected_by_op_token(0xABCD);
         registry.mark_retire_pending(key);
         let generation_low16 = (key.generation & 0xFFFF) as u16;
-        registry.free_if_retire_pending(key.slot, generation_low16);
+        let _ = registry.free_if_retire_pending(key.slot, generation_low16);
         assert!(
             registry.slot_ptr(key).is_some(),
             "the slot survives an -ENOENT before its NOTIF",
@@ -1175,14 +1338,14 @@ mod tests {
         registry.mark_notif_expected_by_op_token(0xABCD);
         // NOTIF on a live future: not retire-pending, so it marks ready.
         assert!(
-            !registry.free_by_op_token(0xABCD),
+            !registry.free_by_op_token(0xABCD).was_freed,
             "a live future frees nothing here",
         );
         registry.mark_notif_ready_by_op_token(0xABCD);
         // Future drops now; the cancel marks retire-pending and returns -ENOENT.
         registry.mark_retire_pending(key);
         let generation_low16 = (key.generation & 0xFFFF) as u16;
-        registry.free_if_retire_pending(key.slot, generation_low16);
+        let _ = registry.free_if_retire_pending(key.slot, generation_low16);
         let Some(next) = registry.allocate(0) else {
             panic!("the freed slot reallocates once notif-ready");
         };

@@ -107,9 +107,7 @@ pub(crate) fn synthesize(slab: &mut InflightBufSlab, fd: i32) -> Option<Completi
         Retry::Failed(error) => error,
         Retry::WouldBlock => return None,
     };
-    if !slab.retire_deferred(key) {
-        return None;
-    }
+    let _ = slab.retire_deferred(key)?;
     Some(Completion {
         token: SubmitToken::new(key.op_token),
         result,
