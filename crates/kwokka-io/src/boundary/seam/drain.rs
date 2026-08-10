@@ -487,7 +487,8 @@ pub fn dispose_cancelled_op<const A: usize, const P: usize, const C: usize>(
 /// that op, so this is a no-op and the future frees through its own harvest
 /// path instead.
 pub fn reclaim_dropped_slot(slab: &mut InflightBufSlab, op_token: u64) {
-    slab.free_by_op_token(op_token);
+    let reclaimed = slab.free_by_op_token(op_token);
+    drop(reclaimed.deferred);
 }
 
 /// Reclaims a slot on a cancel completion whose target op is already gone.
@@ -512,7 +513,7 @@ pub fn reclaim_cancel_completion(slab: &mut InflightBufSlab, sentinel_user_data:
     }
     let slot = (sentinel_user_data & 0xFFFF) as u16;
     let generation_low16 = ((sentinel_user_data >> 16) & 0xFFFF) as u16;
-    slab.free_if_retire_pending(slot, generation_low16);
+    let _ = slab.free_if_retire_pending(slot, generation_low16);
 }
 
 /// Marks the slot for `op_token` as awaiting its `SEND_ZC` NOTIF.
@@ -539,7 +540,7 @@ pub fn mark_notif_expected(slab: &mut InflightBufSlab, op_token: u64) {
 /// instead, and the future frees it on its next poll through
 /// [`IoSeam::slot_notif_ready`](crate::boundary::IoSeam::slot_notif_ready).
 pub fn reclaim_notif(slab: &mut InflightBufSlab, op_token: u64) {
-    if !slab.free_by_op_token(op_token) {
+    if !slab.free_by_op_token(op_token).freed {
         slab.mark_notif_ready_by_op_token(op_token);
     }
 }

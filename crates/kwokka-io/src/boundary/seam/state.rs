@@ -634,7 +634,7 @@ impl IoSeam {
             let count = src.len().min(dst.len());
             dst[..count].copy_from_slice(&src[..count]);
         }
-        slab.free(key);
+        let _ = slab.free(key);
     }
 
     /// Copies `key`'s completed slot bytes into `dst` and frees the slot,
@@ -680,7 +680,7 @@ impl IoSeam {
             }
         }
         dst.set_init(count);
-        slab.free(key);
+        let _ = slab.free(key);
     }
 
     /// Frees `key`'s slot without reading it.
@@ -703,7 +703,7 @@ impl IoSeam {
         // (double-mutable-aliasing UB); a call after `SeamGuard` drops derefs a
         // dangling pointer (the bracket excludes it).
         let slab = unsafe { slab.as_mut() };
-        slab.free(key);
+        let _ = slab.free(key);
     }
 
     /// Lays out a `sendmsg` header for `key`'s slot and returns the `msghdr`
@@ -854,7 +854,7 @@ impl IoSeam {
             }
         }
         dst.set_init(count);
-        slab.free(key);
+        let _ = slab.free(key);
     }
 
     /// Gathers `iov`'s buffers into `key`'s slot and lays out the `iovec` array
@@ -1015,7 +1015,7 @@ impl IoSeam {
                 remaining -= count;
             }
         }
-        slab.free(key);
+        let _ = slab.free(key);
     }
 
     /// Whether `key`'s in-flight slot has seen its `SEND_ZC` NOTIF.
