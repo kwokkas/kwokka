@@ -1,6 +1,6 @@
 [package]
 name = "kwokka-core"
-version = "0.0.1"
+version = "0.0.2"
 description = "foundational types shared across the kwokka workspace"
 readme = "README.md"
 edition.workspace = true
