@@ -1,6 +1,6 @@
 [package]
 name = "kwokka-net"
-version = "0.0.2"
+version = "0.0.3"
 description = "TCP networking for the kwokka runtime"
 readme = "README.md"
 edition.workspace = true

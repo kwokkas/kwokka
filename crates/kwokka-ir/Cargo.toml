@@ -1,6 +1,6 @@
 [package]
 name = "kwokka-ir"
-version = "0.0.1"
+version = "0.0.2"
 description = "language-neutral typed IR for kwokka orchestration specs"
 readme = "README.md"
 edition.workspace = true
