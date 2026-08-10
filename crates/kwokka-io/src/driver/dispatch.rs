@@ -7,6 +7,8 @@
 
 use std::{io, os::fd::OwnedFd, time::Duration};
 
+#[cfg(unix)]
+use crate::buffer::oneshot::inflight::InflightBufSlab;
 #[cfg(target_os = "linux")]
 use crate::buffer::ring::pool::BufRingPool;
 #[cfg(target_os = "linux")]
@@ -15,7 +17,12 @@ use crate::{
     CancelError, IoDriver, RegisterError,
     buffer::registration::slot::{BufGroupId, FdSlot},
     capability::CapabilityMatrix,
-    operation::{Completion, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
+    operation::{Completion, CqeFlags, IoBuf, IoBufMut, IoRequest, SubmitResult, SubmitToken},
+};
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+use crate::{
+    boundary::seam::socket::{Retry, retry_recv, retry_send},
+    operation::OpCode,
 };
 
 /// Enum dispatch over the available platform backends.
@@ -65,8 +72,50 @@ pub(crate) enum SlotSubmit {
     /// The existing uniform submit result.
     Resolved(SubmitResult),
     /// A readiness operation would block and transfers its duplicate.
-    #[expect(dead_code, reason = "the readiness adapter produces deferrals in #327")]
+    #[expect(
+        dead_code,
+        reason = "the readiness submit path produces deferrals in #330"
+    )]
     Deferred(OwnedFd),
+}
+
+/// Retries the deferred operation whose retained descriptor is `fd`.
+///
+/// A short transfer is terminal and reported as its syscall count: the
+/// completion model permits one completion per token, so it cannot be re-armed.
+/// Readiness backends have no provided-buffer analogue, so synthetic
+/// completions carry empty flags and no buffer id.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "called by readiness event sources in #330")
+)]
+pub(crate) fn synthesize(slab: &mut InflightBufSlab, fd: i32) -> Option<Completion> {
+    let key = slab.deferred_key_by_fd(fd)?;
+    let retry = {
+        let (fd, bytes, opcode) = slab.retry_parts(key)?;
+        match opcode {
+            OpCode::Recv => retry_recv(fd, bytes),
+            OpCode::Send => retry_send(fd, bytes),
+            // `absorb_deferred` accepts only these two opcodes. Keeping an
+            // unexpected record intact avoids widening that acceptance set.
+            _ => return None,
+        }
+    };
+    let result = match retry {
+        Retry::Done(bytes) => i32::try_from(bytes).map_or(-libc::EINVAL, |bytes| bytes),
+        Retry::Failed(error) => error,
+        Retry::WouldBlock => return None,
+    };
+    if !slab.retire_deferred(key) {
+        return None;
+    }
+    Some(Completion {
+        token: SubmitToken::new(key.op_token),
+        result,
+        flags: CqeFlags::default(),
+        buf_id: None,
+    })
 }
 
 #[allow(
@@ -164,6 +213,32 @@ impl IoDriver for DriverType {
 }
 
 impl DriverType {
+    /// Drains native or readiness-synthesized completions for the run loop.
+    ///
+    /// The `io_uring` arm forwards to [`IoDriver::poll_completions`]. Readiness
+    /// arms return zero until their event sources are installed.
+    ///
+    /// Kept off the [`IoDriver`](crate::IoDriver) trait like [`park`](Self::park):
+    /// readiness synthesis is run-loop plumbing, not part of the uniform completion
+    /// API.
+    #[doc(hidden)]
+    #[allow(
+        unused_variables,
+        reason = "readiness backends gain an event source in #330; until then only the uring arm consumes the batch"
+    )]
+    pub fn drain_ready(
+        &self,
+        slab: &mut InflightBufSlab,
+        max: usize,
+        out: &mut [Completion],
+    ) -> usize {
+        match self {
+            #[cfg(target_os = "linux")]
+            Self::Uring(driver) => driver.poll_completions(max, out),
+            _ => 0,
+        }
+    }
+
     /// Submits a write-class request through the seam-only deferral boundary.
     #[allow(
         unused_variables,
@@ -388,7 +463,272 @@ impl DriverType {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    use std::{
+        io::{Read, Write},
+        os::{fd::AsRawFd, unix::net::UnixStream},
+    };
+
     use super::*;
+    #[cfg(all(target_os = "linux", not(miri)))]
+    use crate::boundary::seam::socket::shrink_socket_buffers;
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    use crate::{
+        boundary::seam::socket::{duplicate_fd, restore_sigpipe_default_for_test},
+        buffer::oneshot::inflight::{DeferredOp, InflightBufSlab},
+    };
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    fn slab() -> InflightBufSlab {
+        let Ok(slab) = InflightBufSlab::new(1, 8) else {
+            panic!("mmap must succeed for the retry slab");
+        };
+        slab
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    fn defer(
+        slab: &mut InflightBufSlab,
+        fd: i32,
+        token: u64,
+        len: u32,
+        opcode: OpCode,
+    ) -> (crate::buffer::oneshot::inflight::InflightSlotKey, i32) {
+        let Some(key) = slab.allocate(token) else {
+            panic!("the retry slot must allocate");
+        };
+        let Ok(duplicated) = duplicate_fd(fd) else {
+            panic!("the retry descriptor must duplicate");
+        };
+        let deferred = DeferredOp {
+            fd: duplicated.into_owned(),
+            len,
+            opcode,
+        };
+        let retry_fd = deferred.fd.as_raw_fd();
+        assert!(slab.mark_deferred_by_op_token(token, deferred));
+        (key, retry_fd)
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn synthesize_recv_completes_once_and_preserves_slot_bytes() {
+        let Ok((server, mut client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        let mut slab = slab();
+        let (key, retry_fd) = defer(&mut slab, server.as_raw_fd(), 41, 4, OpCode::Recv);
+        let Ok(()) = client.write_all(b"recv") else {
+            panic!("the peer must make the receive descriptor ready");
+        };
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("a ready receive must synthesize a completion");
+        };
+        assert_eq!(completion.token.user_data(), 41);
+        assert_eq!(completion.result, 4);
+        assert_eq!(slab.slot_slice(key, 4), Some(&b"recv"[..]));
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+        assert!(slab.deferred_key_by_fd(retry_fd).is_none());
+        assert!(slab.slot_array(key).is_some());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn synthesize_send_completes_once_and_peer_receives_bytes() {
+        let Ok((mut server, client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        let mut slab = slab();
+        let (key, retry_fd) = defer(&mut slab, client.as_raw_fd(), 42, 4, OpCode::Send);
+        let Some(bytes) = slab.slot_array_mut(key) else {
+            panic!("the send slot must be writable");
+        };
+        bytes[..4].copy_from_slice(b"send");
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("a ready send must synthesize a completion");
+        };
+        assert_eq!(completion.token.user_data(), 42);
+        assert_eq!(completion.result, 4);
+        let mut received = [0u8; 4];
+        let Ok(()) = server.read_exact(&mut received) else {
+            panic!("the peer must receive the retry bytes");
+        };
+        assert_eq!(received, *b"send");
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn synthesize_unready_recv_keeps_its_record() {
+        let Ok((server, _client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        let mut slab = slab();
+        let (key, retry_fd) = defer(&mut slab, server.as_raw_fd(), 43, 4, OpCode::Recv);
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+        assert_eq!(slab.deferred_key_by_fd(retry_fd), Some(key));
+        assert!(slab.deferred(key).is_some());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn synthesize_ignores_unowned_and_reclaimed_descriptors() {
+        let Ok((server, _client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        let mut slab = slab();
+        assert!(synthesize(&mut slab, server.as_raw_fd()).is_none());
+
+        let (key, retry_fd) = defer(&mut slab, server.as_raw_fd(), 46, 1, OpCode::Recv);
+        slab.free(key);
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn synthesize_send_avoids_sigpipe_with_default_disposition() {
+        const CHILD: &str = "KWOKKA_IO_SYNTHESIS_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let Ok(executable) = std::env::current_exe() else {
+                panic!("the test executable path must be available");
+            };
+            let Ok(status) = std::process::Command::new(executable)
+                .arg("--exact")
+                .arg("driver::dispatch::tests::synthesize_send_avoids_sigpipe_with_default_disposition")
+                .env(CHILD, "1")
+                .status()
+            else {
+                panic!("the SIGPIPE fixture must start in its own process");
+            };
+            assert!(
+                status.success(),
+                "the isolated retry send must survive SIGPIPE"
+            );
+            return;
+        }
+        let Ok((server, mut client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        drop(server);
+        let mut eof = [0u8; 1];
+        let Ok(0) = client.read(&mut eof) else {
+            panic!("the closed peer must be observed before sending");
+        };
+        let mut slab = slab();
+        let (key, retry_fd) = defer(&mut slab, client.as_raw_fd(), 44, 1, OpCode::Send);
+        let Some(bytes) = slab.slot_array_mut(key) else {
+            panic!("the send slot must be writable");
+        };
+        bytes[0] = b'x';
+        restore_sigpipe_default_for_test();
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("the closed peer must produce a completion");
+        };
+        assert_eq!(completion.result, -libc::EPIPE);
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+    }
+
+    #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
+    #[test]
+    fn synthesize_reports_a_short_receive_count() {
+        let Ok((server, mut client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        let mut slab = slab();
+        let (_key, retry_fd) = defer(&mut slab, server.as_raw_fd(), 45, 2, OpCode::Recv);
+        let Ok(()) = client.write_all(b"more") else {
+            panic!("the peer must make the receive descriptor ready");
+        };
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("a ready receive must synthesize a completion");
+        };
+        assert_eq!(completion.result, 2);
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+    }
+
+    // The constrained-buffer fixture is only deterministic on Linux.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn synthesize_reports_a_short_send_count_and_retires_the_record() {
+        let Ok((mut server, client)) = UnixStream::pair() else {
+            panic!("a socket pair must be created");
+        };
+        let Ok(()) = shrink_socket_buffers(&server) else {
+            panic!("the peer receive buffer must shrink");
+        };
+        let Ok(()) = shrink_socket_buffers(&client) else {
+            panic!("the send buffer must shrink");
+        };
+        let Ok(filler) = duplicate_fd(client.as_raw_fd()) else {
+            panic!("the queue-filling descriptor must duplicate");
+        };
+        let filler = filler.into_owned();
+        let mut full = false;
+        for _ in 0..4096 {
+            match retry_send(&filler, b"x") {
+                Retry::Done(_) => {}
+                Retry::WouldBlock => {
+                    full = true;
+                    break;
+                }
+                Retry::Failed(error) => panic!("the queue-filling send failed: {error}"),
+            }
+        }
+        assert!(full, "the constrained peer queue must fill");
+        let mut slab = slab();
+        let (key, retry_fd) = defer(&mut slab, client.as_raw_fd(), 47, 4096, OpCode::Send);
+        let Some(bytes) = slab.slot_array_mut(key) else {
+            panic!("the send slot must be writable");
+        };
+        bytes.fill(b'x');
+
+        let mut released = [0u8; 1];
+        let completion = (0..256).find_map(|_| {
+            let Ok(()) = server.read_exact(&mut released) else {
+                panic!("the peer must release a queued byte");
+            };
+            synthesize(&mut slab, retry_fd)
+        });
+        let Some(completion) = completion else {
+            panic!("the constrained peer must accept a partial write after 256 reads");
+        };
+        assert!(completion.result > 0);
+        assert!(completion.result < 4096);
+        assert!(synthesize(&mut slab, retry_fd).is_none());
+        assert!(slab.deferred_key_by_fd(retry_fd).is_none());
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn drain_ready_returns_zero_for_the_placeholder_epoll_backend() {
+        let mut slab = slab();
+        let mut completions = [Completion::default(); 1];
+        assert_eq!(
+            DriverType::Epoll(()).drain_ready(&mut slab, 1, &mut completions),
+            0
+        );
+    }
+
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn drain_ready_forwards_the_uring_batch_contract() {
+        let Ok(uring_driver) = UringDriver::new(32) else {
+            panic!("the uring test ring must be created");
+        };
+        let driver = DriverType::Uring(uring_driver);
+        let mut slab = slab();
+        let mut completions = [Completion::default(); 1];
+
+        assert!(matches!(
+            driver.submit_internal(IoRequest::<()>::timeout(1_000_000).with_user_data(0xBEEF)),
+            SubmitResult::Submitted(_)
+        ));
+        let Ok(_) = driver.park(None) else {
+            panic!("the submitted timeout must complete");
+        };
+
+        assert_eq!(driver.drain_ready(&mut slab, 1, &mut completions), 1);
+        assert_eq!(completions[0].token.user_data(), 0xBEEF);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
