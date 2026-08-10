@@ -90,7 +90,7 @@ pub(crate) enum SlotSubmit {
     not(test),
     expect(dead_code, reason = "called by readiness event sources in #330")
 )]
-pub(crate) fn synthesise(slab: &mut InflightBufSlab, fd: i32) -> Option<Completion> {
+pub(crate) fn synthesize(slab: &mut InflightBufSlab, fd: i32) -> Option<Completion> {
     let key = slab.deferred_key_by_fd(fd)?;
     let retry = {
         let (fd, bytes, opcode) = slab.retry_parts(key)?;
@@ -213,7 +213,7 @@ impl IoDriver for DriverType {
 }
 
 impl DriverType {
-    /// Drains native or readiness-synthesised completions for the run loop.
+    /// Drains native or readiness-synthesized completions for the run loop.
     ///
     /// The `io_uring` arm forwards to [`IoDriver::poll_completions`]. Readiness
     /// arms return zero until their event sources are installed.
@@ -511,7 +511,7 @@ mod tests {
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn synthesise_recv_completes_once_and_preserves_slot_bytes() {
+    fn synthesize_recv_completes_once_and_preserves_slot_bytes() {
         let Ok((server, mut client)) = UnixStream::pair() else {
             panic!("a socket pair must be created");
         };
@@ -520,20 +520,20 @@ mod tests {
         let Ok(()) = client.write_all(b"recv") else {
             panic!("the peer must make the receive descriptor ready");
         };
-        let Some(completion) = synthesise(&mut slab, retry_fd) else {
-            panic!("a ready receive must synthesise a completion");
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("a ready receive must synthesize a completion");
         };
         assert_eq!(completion.token.user_data(), 41);
         assert_eq!(completion.result, 4);
         assert_eq!(slab.slot_slice(key, 4), Some(&b"recv"[..]));
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
         assert!(slab.deferred_key_by_fd(retry_fd).is_none());
         assert!(slab.slot_array(key).is_some());
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn synthesise_send_completes_once_and_peer_receives_bytes() {
+    fn synthesize_send_completes_once_and_peer_receives_bytes() {
         let Ok((mut server, client)) = UnixStream::pair() else {
             panic!("a socket pair must be created");
         };
@@ -543,8 +543,8 @@ mod tests {
             panic!("the send slot must be writable");
         };
         bytes[..4].copy_from_slice(b"send");
-        let Some(completion) = synthesise(&mut slab, retry_fd) else {
-            panic!("a ready send must synthesise a completion");
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("a ready send must synthesize a completion");
         };
         assert_eq!(completion.token.user_data(), 42);
         assert_eq!(completion.result, 4);
@@ -553,39 +553,39 @@ mod tests {
             panic!("the peer must receive the retry bytes");
         };
         assert_eq!(received, *b"send");
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn synthesise_unready_recv_keeps_its_record() {
+    fn synthesize_unready_recv_keeps_its_record() {
         let Ok((server, _client)) = UnixStream::pair() else {
             panic!("a socket pair must be created");
         };
         let mut slab = slab();
         let (key, retry_fd) = defer(&mut slab, server.as_raw_fd(), 43, 4, OpCode::Recv);
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
         assert_eq!(slab.deferred_key_by_fd(retry_fd), Some(key));
         assert!(slab.deferred(key).is_some());
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn synthesise_ignores_unowned_and_reclaimed_descriptors() {
+    fn synthesize_ignores_unowned_and_reclaimed_descriptors() {
         let Ok((server, _client)) = UnixStream::pair() else {
             panic!("a socket pair must be created");
         };
         let mut slab = slab();
-        assert!(synthesise(&mut slab, server.as_raw_fd()).is_none());
+        assert!(synthesize(&mut slab, server.as_raw_fd()).is_none());
 
         let (key, retry_fd) = defer(&mut slab, server.as_raw_fd(), 46, 1, OpCode::Recv);
         slab.free(key);
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn synthesise_send_avoids_sigpipe_with_default_disposition() {
+    fn synthesize_send_avoids_sigpipe_with_default_disposition() {
         const CHILD: &str = "KWOKKA_IO_SYNTHESIS_SIGPIPE_CHILD";
         if std::env::var_os(CHILD).is_none() {
             let Ok(executable) = std::env::current_exe() else {
@@ -593,7 +593,7 @@ mod tests {
             };
             let Ok(status) = std::process::Command::new(executable)
                 .arg("--exact")
-                .arg("driver::dispatch::tests::synthesise_send_avoids_sigpipe_with_default_disposition")
+                .arg("driver::dispatch::tests::synthesize_send_avoids_sigpipe_with_default_disposition")
                 .env(CHILD, "1")
                 .status()
             else {
@@ -620,16 +620,16 @@ mod tests {
         };
         bytes[0] = b'x';
         restore_sigpipe_default_for_test();
-        let Some(completion) = synthesise(&mut slab, retry_fd) else {
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
             panic!("the closed peer must produce a completion");
         };
         assert_eq!(completion.result, -libc::EPIPE);
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
     }
 
     #[cfg(all(any(target_os = "linux", target_os = "macos"), not(miri)))]
     #[test]
-    fn synthesise_reports_a_short_receive_count() {
+    fn synthesize_reports_a_short_receive_count() {
         let Ok((server, mut client)) = UnixStream::pair() else {
             panic!("a socket pair must be created");
         };
@@ -638,17 +638,17 @@ mod tests {
         let Ok(()) = client.write_all(b"more") else {
             panic!("the peer must make the receive descriptor ready");
         };
-        let Some(completion) = synthesise(&mut slab, retry_fd) else {
-            panic!("a ready receive must synthesise a completion");
+        let Some(completion) = synthesize(&mut slab, retry_fd) else {
+            panic!("a ready receive must synthesize a completion");
         };
         assert_eq!(completion.result, 2);
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
     }
 
     // The constrained-buffer fixture is only deterministic on Linux.
     #[cfg(all(target_os = "linux", not(miri)))]
     #[test]
-    fn synthesise_reports_a_short_send_count_and_retires_the_record() {
+    fn synthesize_reports_a_short_send_count_and_retires_the_record() {
         let Ok((mut server, client)) = UnixStream::pair() else {
             panic!("a socket pair must be created");
         };
@@ -674,11 +674,6 @@ mod tests {
             }
         }
         assert!(full, "the constrained peer queue must fill");
-        let mut released = [0u8; 1];
-        let Ok(()) = server.read_exact(&mut released) else {
-            panic!("the peer must release space for one write");
-        };
-
         let mut slab = slab();
         let (key, retry_fd) = defer(&mut slab, client.as_raw_fd(), 47, 4096, OpCode::Send);
         let Some(bytes) = slab.slot_array_mut(key) else {
@@ -686,12 +681,19 @@ mod tests {
         };
         bytes.fill(b'x');
 
-        let Some(completion) = synthesise(&mut slab, retry_fd) else {
-            panic!("the constrained peer must accept a partial write");
+        let mut released = [0u8; 1];
+        let completion = (0..256).find_map(|_| {
+            let Ok(()) = server.read_exact(&mut released) else {
+                panic!("the peer must release a queued byte");
+            };
+            synthesize(&mut slab, retry_fd)
+        });
+        let Some(completion) = completion else {
+            panic!("the constrained peer must accept a partial write after 256 reads");
         };
         assert!(completion.result > 0);
         assert!(completion.result < 4096);
-        assert!(synthesise(&mut slab, retry_fd).is_none());
+        assert!(synthesize(&mut slab, retry_fd).is_none());
         assert!(slab.deferred_key_by_fd(retry_fd).is_none());
     }
 
